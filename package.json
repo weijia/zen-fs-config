@@ -1,0 +1,51 @@
+{
+  "name": "zen-fs-config",
+  "version": "0.1.0",
+  "description": "Distributed config management library built on ZenFS, zen-fs-cache, and zen-fs-sync",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "DESIGN.md"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "zenfs",
+    "config",
+    "distributed",
+    "sync",
+    "filesystem",
+    "configuration-management"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weijia/zen-fs-config.git"
+  },
+  "peerDependencies": {
+    "@zenfs/core": ">=2.3.0",
+    "zen-fs-cache": ">=1.0.0",
+    "zen-fs-sync": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@zenfs/core": "^2.5.7",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "zen-fs-cache": "^1.0.1",
+    "zen-fs-sync": "^0.1.0"
+  }
+}
