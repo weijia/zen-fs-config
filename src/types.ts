@@ -197,10 +197,10 @@ export interface IConfigRepo {
   setConfig(path: string, data: unknown): void;
 
   /** Read node-local config. */
-  getNodeConfig<T = unknown>(nodeId: string, path: string): T;
+  getNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
 
   /** Write node-local config (no auto-sync). */
-  setNodeConfig(nodeId: string, path: string, data: unknown): void;
+  setNodeConfig(nodeId: string, path: string, data: unknown): Promise<void>;
 
   /** Publish node-local config to sync backends (one-time, for debugging). */
   publishNodeConfig(nodeId: string, options?: {
@@ -208,7 +208,7 @@ export interface IConfigRepo {
   }): Promise<SyncResult>;
 
   /** Peek at another node's published config (read-only). */
-  peekNodeConfig<T = unknown>(nodeId: string, path: string): T;
+  peekNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
 
   /** Manually flush all pending sync operations. */
   flush(): Promise<SyncResult[]>;

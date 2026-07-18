@@ -6,6 +6,19 @@
  * See DESIGN.md for full architecture and design documentation.
  */
 
+// Factory & main class
+export { createConfigRepo, ConfigRepo } from './config-repo';
+
+// Backend registry
+export { registerBackend, createBackend, hasBackend, listBackends } from './backend-registry';
+export type { BackendFactory, BackendInstance } from './backend-registry';
+
+// Serializers
+export { createSerializerChain, configKeyToFilePath, getExtension } from './serializer';
+
+// Version management
+export { versionPathFor, sha256, readVersion, writeVersion, incrementVersion, verifyOrRepairVersion } from './version';
+
 // All types
 export type {
   BackendDescriptor,

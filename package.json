@@ -43,8 +43,8 @@
   },
   "devDependencies": {
     "@zenfs/core": "^2.5.7",
-    "tsup": "^8.0.0",
-    "typescript": "^5.5.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
     "zen-fs-cache": "^1.0.1",
     "zen-fs-sync": "^0.1.0"
   }
