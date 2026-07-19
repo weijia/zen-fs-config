@@ -87,77 +87,21 @@ export function listBackends(): string[] {
  * To support multiple InMemory instances, we use a counter to create
  * unique Port channels.
  */
-let inMemoryCounter = 0;
-
-registerBackend('InMemory', async (options) => {
-  const zenfs = await import('@zenfs/core');
-  const { InMemory } = zenfs;
-
-  const maxSize = (options.maxSize as number) ?? 100 * 1024 * 1024;
-  const label = (options.label as string) ?? `zen-fs-config-${++inMemoryCounter}`;
-
-  // configureSingle sets up the global ZenFS VFS with the given backend.
-  // It returns void — the configured fs is accessed via the `fs` re-export.
-  await zenfs.configureSingle({ backend: InMemory, maxSize, label });
-
-  // fs.promises has Node.js-style async API: readFile, writeFile, etc.
-  const pfs = (zenfs.fs as any).promises;
-
-  const backend: BackendInstance = {
-    async readFile(path: string, ...args: any[]): Promise<any> {
-      // ZenFS fs.promises.readFile supports (path, encoding) and (path, options)
-      if (args.length > 0) {
-        return pfs.readFile(path, ...args);
-      }
-      return pfs.readFile(path);
-    },
-    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
-      return pfs.writeFile(path, data, options);
-    },
-    async readdir(path: string): Promise<string[]> {
-      const entries = await pfs.readdir(path);
-      return entries.map((e: any) => typeof e === 'string' ? e : e.name);
-    },
-    async stat(path: string, ...args: any[]): Promise<any> {
-      return pfs.stat(path, ...args);
-    },
-    async exists(path: string): Promise<boolean> {
-      try { await pfs.stat(path); return true; } catch { return false; }
-    },
-    async mkdir(path: string, options?: any): Promise<any> {
-      return pfs.mkdir(path, options);
-    },
-    async unlink(path: string): Promise<void> {
-      return pfs.unlink(path);
-    },
-    async rmdir(path: string): Promise<void> {
-      return pfs.rmdir(path);
-    },
-    async rename(oldPath: string, newPath: string): Promise<void> {
-      return pfs.rename(oldPath, newPath);
-    },
-  };
-
-  return backend;
-});
-
 // ---------------------------------------------------------------------------
-// Built-in: IndexedDB (via @zenfs/dom)
+// Helper: wrap a ZenFS FileSystem into a BackendInstance
+// Uses resolveMountConfig to create an ISOLATED fs — does NOT touch the
+// global ZenFS VFS (configureSingle). This is critical because multiple
+// backends must coexist without overwriting each other.
 // ---------------------------------------------------------------------------
 
-let idbCounter = 0;
-
-registerBackend('IndexedDB', async (options) => {
+async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
   const zenfs = await import('@zenfs/core');
-  const { IndexedDB } = await import('@zenfs/dom');
+  const isolatedFS = await zenfs.resolveMountConfig(config);
 
-  const storeName = (options.storeName as string) ?? `zen-fs-config-${++idbCounter}`;
+  // ZenFS FileSystem has .promises with Node.js-style async API
+  const pfs = (isolatedFS as any).promises;
 
-  await zenfs.configureSingle({ backend: IndexedDB, storeName });
-
-  const pfs = (zenfs.fs as any).promises;
-
-  const backend: BackendInstance = {
+  return {
     async readFile(path: string, ...args: any[]): Promise<any> {
       return args.length > 0 ? pfs.readFile(path, ...args) : pfs.readFile(path);
     },
@@ -187,8 +131,35 @@ registerBackend('IndexedDB', async (options) => {
       return pfs.rename(oldPath, newPath);
     },
   };
+}
 
-  return backend;
+// ---------------------------------------------------------------------------
+// Built-in: InMemory
+// ---------------------------------------------------------------------------
+
+let inMemoryCounter = 0;
+
+registerBackend('InMemory', async (options) => {
+  const { InMemory } = await import('@zenfs/core');
+
+  const maxSize = (options.maxSize as number) ?? 100 * 1024 * 1024;
+  const label = (options.label as string) ?? `zen-fs-config-${++inMemoryCounter}`;
+
+  return wrapZenFSFileSystem({ backend: InMemory, maxSize, label });
+});
+
+// ---------------------------------------------------------------------------
+// Built-in: IndexedDB (via @zenfs/dom)
+// ---------------------------------------------------------------------------
+
+let idbCounter = 0;
+
+registerBackend('IndexedDB', async (options) => {
+  const { IndexedDB } = await import('@zenfs/dom');
+
+  const storeName = (options.storeName as string) ?? `zen-fs-config-${++idbCounter}`;
+
+  return wrapZenFSFileSystem({ backend: IndexedDB, storeName });
 });
 
 // ---------------------------------------------------------------------------
@@ -196,7 +167,6 @@ registerBackend('IndexedDB', async (options) => {
 // ---------------------------------------------------------------------------
 
 registerBackend('WebStorage', async (options) => {
-  const zenfs = await import('@zenfs/core');
   const { WebStorage } = await import('@zenfs/dom');
 
   const storageType = (options.storageType as string) ?? 'localStorage';
@@ -208,42 +178,7 @@ registerBackend('WebStorage', async (options) => {
     storage = localStorage;
   }
 
-  await zenfs.configureSingle({ backend: WebStorage, storage } as any);
-
-  const pfs = (zenfs.fs as any).promises;
-
-  const backend: BackendInstance = {
-    async readFile(path: string, ...args: any[]): Promise<any> {
-      return args.length > 0 ? pfs.readFile(path, ...args) : pfs.readFile(path);
-    },
-    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
-      return pfs.writeFile(path, data, options);
-    },
-    async readdir(path: string): Promise<string[]> {
-      const entries = await pfs.readdir(path);
-      return entries.map((e: any) => typeof e === 'string' ? e : e.name);
-    },
-    async stat(path: string, ...args: any[]): Promise<any> {
-      return pfs.stat(path, ...args);
-    },
-    async exists(path: string): Promise<boolean> {
-      try { await pfs.stat(path); return true; } catch { return false; }
-    },
-    async mkdir(path: string, options?: any): Promise<any> {
-      return pfs.mkdir(path, options);
-    },
-    async unlink(path: string): Promise<void> {
-      return pfs.unlink(path);
-    },
-    async rmdir(path: string): Promise<void> {
-      return pfs.rmdir(path);
-    },
-    async rename(oldPath: string, newPath: string): Promise<void> {
-      return pfs.rename(oldPath, newPath);
-    },
-  };
-
-  return backend;
+  return wrapZenFSFileSystem({ backend: WebStorage, storage });
 });
 
 // ---------------------------------------------------------------------------
