@@ -100,6 +100,8 @@ async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
 
   // resolveMountConfig returns a raw ZenFS FileSystem, not the Node.js-style
   // fs.promises API. We bridge it to our BackendInstance interface.
+  // Key difference from fs.promises.writeFile: FileSystem.write() expects
+  // the file to already exist (it's a low-level API). We must open() first.
   return {
     async readFile(path: string, ...args: any[]): Promise<any> {
       const st = await isolatedFS.stat(path);
@@ -124,6 +126,11 @@ async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
         if (!(await isolatedFS.exists(dir))) {
           await isolatedFS.mkdir(dir, { uid: 0, gid: 0, mode: 0o755 });
         }
+      }
+      // ZenFS FileSystem is low-level: createFile() creates the inode,
+      // then write() writes data to it.
+      if (!(await isolatedFS.exists(path))) {
+        await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
       }
       await isolatedFS.write(path, bytes, 0);
     },
