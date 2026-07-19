@@ -98,37 +98,61 @@ async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
   const zenfs = await import('@zenfs/core');
   const isolatedFS = await zenfs.resolveMountConfig(config);
 
-  // ZenFS FileSystem has .promises with Node.js-style async API
-  const pfs = (isolatedFS as any).promises;
-
+  // resolveMountConfig returns a raw ZenFS FileSystem, not the Node.js-style
+  // fs.promises API. We bridge it to our BackendInstance interface.
   return {
     async readFile(path: string, ...args: any[]): Promise<any> {
-      return args.length > 0 ? pfs.readFile(path, ...args) : pfs.readFile(path);
+      const st = await isolatedFS.stat(path);
+      const size = st.size;
+      const buf = new Uint8Array(size);
+      await isolatedFS.read(path, buf, 0, size);
+      if (args[0] === 'utf-8') return new TextDecoder().decode(buf);
+      return buf;
     },
-    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
-      return pfs.writeFile(path, data, options);
+    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, _options?: any): Promise<void> {
+      const bytes = data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : data instanceof Uint8Array
+          ? data
+          : new TextEncoder().encode(data);
+      // Ensure parent dir exists
+      const parts = path.split('/').filter(Boolean);
+      parts.pop();
+      let dir = '';
+      for (const p of parts) {
+        dir += '/' + p;
+        if (!(await isolatedFS.exists(dir))) {
+          await isolatedFS.mkdir(dir, { uid: 0, gid: 0, mode: 0o755 });
+        }
+      }
+      await isolatedFS.write(path, bytes, 0);
     },
     async readdir(path: string): Promise<string[]> {
-      const entries = await pfs.readdir(path);
-      return entries.map((e: any) => typeof e === 'string' ? e : e.name);
+      return isolatedFS.readdir(path);
     },
-    async stat(path: string, ...args: any[]): Promise<any> {
-      return pfs.stat(path, ...args);
+    async stat(path: string, ..._args: any[]): Promise<any> {
+      const st = await isolatedFS.stat(path);
+      return {
+        isFile: () => (st as any).isDirectory?.() === false || (st.mode !== undefined && ((st.mode as number) & 0o170000) === 0o100000),
+        isDirectory: () => (st as any).isDirectory?.() === true || (st.mode !== undefined && ((st.mode as number) & 0o170000) === 0o040000),
+        size: st.size,
+        mtime: (st as any).mtimeMs ?? (st as any).mtime,
+      };
     },
     async exists(path: string): Promise<boolean> {
-      try { await pfs.stat(path); return true; } catch { return false; }
+      return isolatedFS.exists(path);
     },
     async mkdir(path: string, options?: any): Promise<any> {
-      return pfs.mkdir(path, options);
+      return isolatedFS.mkdir(path, options ?? { uid: 0, gid: 0, mode: 0o755 });
     },
     async unlink(path: string): Promise<void> {
-      return pfs.unlink(path);
+      return isolatedFS.unlink(path);
     },
     async rmdir(path: string): Promise<void> {
-      return pfs.rmdir(path);
+      return isolatedFS.rmdir(path);
     },
     async rename(oldPath: string, newPath: string): Promise<void> {
-      return pfs.rename(oldPath, newPath);
+      return isolatedFS.rename(oldPath, newPath);
     },
   };
 }
