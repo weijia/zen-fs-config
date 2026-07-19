@@ -67,6 +67,8 @@ export class ConfigRepo implements IConfigRepo {
   readonly nodeId: string;
   /** Chroot-isolated fs for app-facing API. Typed as `any` to match `typeof import('node:fs')` duck-typically. */
   readonly fs: any;
+  /** Un-chrooted fs for low-level browsing. */
+  readonly rootFS: any;
 
   private cachedFS: MinimalAsyncFS;
   private fullFS: SyncableFS;
@@ -94,6 +96,8 @@ export class ConfigRepo implements IConfigRepo {
 
     this.fullFS = cachedFSToSyncableFS(cachedFS);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
+    // rootFS = no chroot, so admin UI can browse /.meta/, /shared/, /nodes/, etc.
+    this.rootFS = createChrootFS(cachedFS, '/');
   }
 
   // -----------------------------------------------------------------------

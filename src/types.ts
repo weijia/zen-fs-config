@@ -187,6 +187,9 @@ export interface IConfigRepo {
   /** ZenFS-compatible fs object, context-isolated to this app's directories. */
   readonly fs: typeof import('node:fs');
 
+  /** Un-chrooted fs for low-level browsing (includes /.meta/, all app dirs). */
+  readonly rootFS: typeof import('node:fs');
+
   /** Load or reload configuration from a raw string. */
   load(rawConfig: string): Promise<void>;
 
