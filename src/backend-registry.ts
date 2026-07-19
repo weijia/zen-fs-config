@@ -142,6 +142,111 @@ registerBackend('InMemory', async (options) => {
 });
 
 // ---------------------------------------------------------------------------
+// Built-in: IndexedDB (via @zenfs/dom)
+// ---------------------------------------------------------------------------
+
+let idbCounter = 0;
+
+registerBackend('IndexedDB', async (options) => {
+  const zenfs = await import('@zenfs/core');
+  const { IndexedDB } = await import('@zenfs/dom');
+
+  const storeName = (options.storeName as string) ?? `zen-fs-config-${++idbCounter}`;
+
+  await zenfs.configureSingle({ backend: IndexedDB, storeName });
+
+  const pfs = (zenfs.fs as any).promises;
+
+  const backend: BackendInstance = {
+    async readFile(path: string, ...args: any[]): Promise<any> {
+      return args.length > 0 ? pfs.readFile(path, ...args) : pfs.readFile(path);
+    },
+    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
+      return pfs.writeFile(path, data, options);
+    },
+    async readdir(path: string): Promise<string[]> {
+      const entries = await pfs.readdir(path);
+      return entries.map((e: any) => typeof e === 'string' ? e : e.name);
+    },
+    async stat(path: string, ...args: any[]): Promise<any> {
+      return pfs.stat(path, ...args);
+    },
+    async exists(path: string): Promise<boolean> {
+      try { await pfs.stat(path); return true; } catch { return false; }
+    },
+    async mkdir(path: string, options?: any): Promise<any> {
+      return pfs.mkdir(path, options);
+    },
+    async unlink(path: string): Promise<void> {
+      return pfs.unlink(path);
+    },
+    async rmdir(path: string): Promise<void> {
+      return pfs.rmdir(path);
+    },
+    async rename(oldPath: string, newPath: string): Promise<void> {
+      return pfs.rename(oldPath, newPath);
+    },
+  };
+
+  return backend;
+});
+
+// ---------------------------------------------------------------------------
+// Built-in: WebStorage / LocalStorage (via @zenfs/dom)
+// ---------------------------------------------------------------------------
+
+registerBackend('WebStorage', async (options) => {
+  const zenfs = await import('@zenfs/core');
+  const { WebStorage } = await import('@zenfs/dom');
+
+  const storageType = (options.storageType as string) ?? 'localStorage';
+
+  let storage: Storage;
+  if (storageType === 'sessionStorage' && typeof sessionStorage !== 'undefined') {
+    storage = sessionStorage;
+  } else {
+    storage = localStorage;
+  }
+
+  await zenfs.configureSingle({ backend: WebStorage, storage } as any);
+
+  const pfs = (zenfs.fs as any).promises;
+
+  const backend: BackendInstance = {
+    async readFile(path: string, ...args: any[]): Promise<any> {
+      return args.length > 0 ? pfs.readFile(path, ...args) : pfs.readFile(path);
+    },
+    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
+      return pfs.writeFile(path, data, options);
+    },
+    async readdir(path: string): Promise<string[]> {
+      const entries = await pfs.readdir(path);
+      return entries.map((e: any) => typeof e === 'string' ? e : e.name);
+    },
+    async stat(path: string, ...args: any[]): Promise<any> {
+      return pfs.stat(path, ...args);
+    },
+    async exists(path: string): Promise<boolean> {
+      try { await pfs.stat(path); return true; } catch { return false; }
+    },
+    async mkdir(path: string, options?: any): Promise<any> {
+      return pfs.mkdir(path, options);
+    },
+    async unlink(path: string): Promise<void> {
+      return pfs.unlink(path);
+    },
+    async rmdir(path: string): Promise<void> {
+      return pfs.rmdir(path);
+    },
+    async rename(oldPath: string, newPath: string): Promise<void> {
+      return pfs.rename(oldPath, newPath);
+    },
+  };
+
+  return backend;
+});
+
+// ---------------------------------------------------------------------------
 // Built-in: GitHub (raw content API)
 // ---------------------------------------------------------------------------
 
