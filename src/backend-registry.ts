@@ -14,18 +14,13 @@ import type { BackendDescriptor } from './types';
 // Types
 // ---------------------------------------------------------------------------
 
-/**
- * A factory function that creates a file system instance from options.
- * The returned value must satisfy SyncableFS (and ideally CacheableFileSystem).
- */
 export type BackendFactory = (
   options: Record<string, unknown>,
 ) => Promise<BackendInstance>;
 
 /**
  * The minimal interface a backend instance must satisfy.
- * Combines SyncableFS (from zen-fs-sync) with the write signature
- * needed by CachedFileSystem.
+ * Matches zen-fs-cache's CacheableFileSystem requirements.
  */
 export interface BackendInstance {
   readFile(path: string, ...args: any[]): Promise<any>;
@@ -35,7 +30,7 @@ export interface BackendInstance {
   exists(path: string): Promise<boolean>;
   mkdir(path: string, options?: any): Promise<any>;
   unlink(path: string): Promise<void>;
-  rmdir?(path: string): Promise<void>;
+  rmdir(path: string): Promise<void>;
   rename?(oldPath: string, newPath: string): Promise<void>;
   readFileMeta?(path: string, opts?: any): Promise<any>;
   getRevision?(path: string): Promise<string | number | undefined>;
@@ -47,16 +42,10 @@ export interface BackendInstance {
 
 const registry = new Map<string, BackendFactory>();
 
-/**
- * Register a backend factory by type name.
- */
 export function registerBackend(type: string, factory: BackendFactory): void {
   registry.set(type, factory);
 }
 
-/**
- * Create a backend instance from a descriptor.
- */
 export async function createBackend(
   descriptor: Pick<BackendDescriptor, 'type' | 'options'>,
 ): Promise<BackendInstance> {
@@ -68,26 +57,13 @@ export async function createBackend(
       `Use registerBackend() to register a custom backend.`,
     );
   }
-  const instance = await factory(descriptor.options);
-  // Ensure rmdir exists (required by CacheableFileSystem)
-  if (!instance.rmdir) {
-    instance.rmdir = async (_path: string) => {
-      // No-op by default; backends that need it should implement it
-    };
-  }
-  return instance;
+  return factory(descriptor.options);
 }
 
-/**
- * Check if a backend type is registered.
- */
 export function hasBackend(type: string): boolean {
   return registry.has(type);
 }
 
-/**
- * List all registered backend type names.
- */
 export function listBackends(): string[] {
   return Array.from(registry.keys());
 }
@@ -96,10 +72,68 @@ export function listBackends(): string[] {
 // Built-in: InMemory Backend
 // ---------------------------------------------------------------------------
 
+/**
+ * Wrap a synchronous ZenFS FileSystem into an async BackendInstance.
+ * ZenFS backends (InMemory, etc.) use sync methods (writeFile, readdir, …).
+ * CachedFileSystem requires async methods. This adapter bridges the gap.
+ */
+function syncToAsync(backend: any): BackendInstance {
+  return {
+    readFile(path: string, ...args: any[]): Promise<any> {
+      const result = backend.readFile(path, ...args);
+      return Promise.resolve(result);
+    },
+    writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
+      backend.writeFile(path, data, options);
+      return Promise.resolve();
+    },
+    readdir(path: string): Promise<string[]> {
+      const entries: any[] = backend.readdir(path);
+      // ZenFS may return string[] or Dirent[]
+      return Promise.resolve(entries.map((e: any) => typeof e === 'string' ? e : e.name));
+    },
+    stat(path: string, ...args: any[]): Promise<any> {
+      return Promise.resolve(backend.stat(path, ...args));
+    },
+    exists(path: string): Promise<boolean> {
+      try {
+        backend.stat(path);
+        return Promise.resolve(true);
+      } catch {
+        return Promise.resolve(false);
+      }
+    },
+    mkdir(path: string, options?: any): Promise<any> {
+      backend.mkdir(path, options);
+      return Promise.resolve();
+    },
+    unlink(path: string): Promise<void> {
+      backend.unlink(path);
+      return Promise.resolve();
+    },
+    rmdir(path: string): Promise<void> {
+      if (typeof backend.rmdir === 'function') {
+        backend.rmdir(path);
+      }
+      return Promise.resolve();
+    },
+    rename(oldPath: string, newPath: string): Promise<void> {
+      if (typeof backend.rename === 'function') {
+        backend.rename(oldPath, newPath);
+      }
+      return Promise.resolve();
+    },
+  };
+}
+
 registerBackend('InMemory', async (options) => {
-  // Dynamic import to keep @zenfs/core as a peer dependency
   const { InMemory } = await import('@zenfs/core');
-  const maxSize = (options.maxSize as number) ?? 100 * 1024 * 1024; // 100MB default
+  const maxSize = (options.maxSize as number) ?? 100 * 1024 * 1024;
   const label = (options.label as string) ?? 'zen-fs-config';
-  return InMemory.create({ maxSize, label }) as unknown as BackendInstance;
+
+  // InMemory.create() returns a synchronous StoreFS<InMemoryStore>
+  const fs = InMemory.create({ maxSize, label });
+
+  // Wrap sync → async so CachedFileSystem can use it
+  return syncToAsync(fs);
 });
