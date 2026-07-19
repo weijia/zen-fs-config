@@ -684,26 +684,27 @@ export async function createConfigRepo(
 
   let backendsMeta = await tempRepo.readMetaFile<BackendsMeta>(BACKENDS_FILE);
 
-  // If bootstrap is provided, always use it (overwrites stale meta from previous sessions)
-  if (options.bootstrap) {
-    backendsMeta = {
-      version: 1,
-      backends: options.bootstrap.backends,
-    };
-    console.log(`[createConfigRepo] Using bootstrap backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
-  }
-
   if (!backendsMeta) {
-    backendsMeta = {
-      version: 1,
-      backends: [
-        {
-          id: options.primaryBackendId,
-          type: options.backendInfo.type,
-          options: options.backendInfo.options,
-        },
-      ],
-    };
+    if (options.bootstrap) {
+      backendsMeta = {
+        version: 1,
+        backends: options.bootstrap.backends,
+      };
+      console.log(`[createConfigRepo] First init: using bootstrap backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
+    } else {
+      backendsMeta = {
+        version: 1,
+        backends: [
+          {
+            id: options.primaryBackendId,
+            type: options.backendInfo.type,
+            options: options.backendInfo.options,
+          },
+        ],
+      };
+    }
+  } else {
+    console.log(`[createConfigRepo] Reconnect: using stored backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
   }
 
   const hasPrimary = backendsMeta.backends.some(
@@ -724,34 +725,39 @@ export async function createConfigRepo(
   // -------------------------------------------------------------------
   let syncRulesMeta = await tempRepo.readMetaFile<SyncRulesMeta>(SYNC_RULES_FILE);
 
-  if (options.bootstrap) {
-    syncRulesMeta = {
-      version: 1,
-      rules: options.bootstrap.syncRules,
-    };
-    console.log(`[createConfigRepo] Using bootstrap syncRules: ${syncRulesMeta.rules.length} rules`);
-  }
-
   if (!syncRulesMeta) {
-    syncRulesMeta = {
-      version: 1,
-      rules: [
-        {
-          prefix: `/${appId}/`,
-          direction: 'one-way',
-          conflictStrategy: 'source-wins' as any,
-          replicas: backendsMeta.backends.map((b) => b.id),
-        },
-        {
-          prefix: `${SHARED_DIR}/`,
-          direction: 'bi-directional',
-          conflictStrategy: 'merge' as any,
-          replicas: backendsMeta.backends.map((b) => b.id),
-        },
-        { prefix: `${NODES_DIR}/`, direction: 'none' },
-        { prefix: `${META_DIR}/`, direction: 'none' },
-      ],
-    };
+    if (options.bootstrap) {
+      syncRulesMeta = {
+        version: 1,
+        rules: options.bootstrap.syncRules,
+      };
+      console.log(`[createConfigRepo] First init: using bootstrap syncRules: ${syncRulesMeta.rules.length} rules`);
+    } else {
+      syncRulesMeta = {
+        version: 1,
+        rules: [
+          {
+            prefix: `/${appId}/`,
+            direction: 'one-way',
+            conflictStrategy: 'source-wins' as any,
+            replicas: backendsMeta.backends.map((b) => b.id),
+          },
+          {
+            prefix: `${SHARED_DIR}/`,
+            direction: 'bi-directional',
+            conflictStrategy: 'merge' as any,
+            replicas: backendsMeta.backends.map((b) => b.id),
+          },
+          { prefix: `${NODES_DIR}/`, direction: 'none' },
+          { prefix: `${META_DIR}/`, direction: 'none' },
+        ],
+      };
+    }
+  }
+  
+  // On reconnect, log what we loaded
+  if (syncRulesMeta) {
+    console.log(`[createConfigRepo] Reconnect: using stored syncRules: ${syncRulesMeta.rules.length} rules`);
   }
 
   await tempRepo.writeMetaFile(SYNC_RULES_FILE, syncRulesMeta);
