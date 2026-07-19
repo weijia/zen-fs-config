@@ -76,7 +76,22 @@ export function createChrootFS(inner: AsyncFS, root: string) {
     },
 
     async stat(path: string): Promise<any> {
-      return inner.stat(rp(path));
+      const s = await inner.stat(rp(path));
+      // CachedFileSystem may JSON-serialize stat results, losing methods.
+      // Re-hydrate isFile/isDirectory from available properties.
+      if (typeof s.isFile === 'function' && typeof s.isDirectory === 'function') {
+        return s;
+      }
+      const isDir = typeof s.isDirectory === 'function'
+        ? s.isDirectory()
+        : typeof s.isDirectory === 'boolean'
+          ? s.isDirectory
+          : (s.mode !== undefined && ((s.mode as number) & 0o170000) === 0o040000);
+      return {
+        ...s,
+        isFile: () => !isDir,
+        isDirectory: () => isDir,
+      };
     },
 
     async access(path: string): Promise<void> {

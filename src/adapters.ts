@@ -162,11 +162,18 @@ export function cachedFSToSyncableFS(cached: any): SyncableFS {
 
     async stat(path: string): Promise<FileStat> {
       const s = await cached.stat(path);
+      // CachedFileSystem may return a deserialized JSON object (no methods)
+      // or a fresh stat object with isFile/isDirectory as functions or booleans.
+      const isDir = typeof s.isDirectory === 'function'
+        ? s.isDirectory()
+        : typeof s.isDirectory === 'boolean'
+          ? s.isDirectory
+          : (s.mode !== undefined && ((s.mode as number) & 0o170000) === 0o040000);
       return {
-        isFile: () => s.isFile(),
-        isDirectory: () => s.isDirectory(),
+        isFile: () => !isDir,
+        isDirectory: () => isDir,
         size: s.size,
-        mtimeMs: s.mtimeMs,
+        mtimeMs: s.mtimeMs ?? s.mtime,
       };
     },
 
