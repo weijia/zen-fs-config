@@ -128,11 +128,15 @@ async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
         }
       }
       // ZenFS FileSystem is low-level: createFile() creates the inode,
-      // then write() writes data to it.
+      // then write() writes data to it. But write() doesn't update the
+      // inode's size — we must call touch() to update metadata so that
+      // subsequent stat() returns the correct size.
       if (!(await isolatedFS.exists(path))) {
         await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
       }
       await isolatedFS.write(path, bytes, 0);
+      // Update inode metadata (size, mtime) — FileSystem.write doesn't do this
+      await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
     },
     async readdir(path: string): Promise<string[]> {
       return isolatedFS.readdir(path);
