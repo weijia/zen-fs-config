@@ -530,10 +530,14 @@ export class ConfigRepo implements IConfigRepo {
     for (const part of parts) {
       current += `/${part}`;
       const exists = await this.fullFS.exists(current);
+      console.log(`[ensureDir] ${current} exists=${exists}`);
       if (!exists) {
         try {
-          await this.fullFS.mkdir(current, { recursive: true });
-        } catch {
+          console.log(`[ensureDir] mkdir(${current})`);
+          await this.fullFS.mkdir(current);
+          console.log(`[ensureDir] mkdir(${current}) OK`);
+        } catch (err: any) {
+          console.error(`[ensureDir] mkdir(${current}) FAILED:`, err.message);
           // Directory might already exist due to race
         }
       }
@@ -571,11 +575,14 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   async writeMetaFile(path: string, data: BackendsMeta | SyncRulesMeta): Promise<void> {
+    console.log(`[writeMetaFile] ${path}, ensuring dir...`);
     await this.ensureDir(path);
+    console.log(`[writeMetaFile] ${path}, writing ${JSON.stringify(data).length} bytes...`);
     await this.cachedFS.writeFile(
       path,
       new TextEncoder().encode(JSON.stringify(data, null, 2)),
     );
+    console.log(`[writeMetaFile] ${path} done`);
   }
 
   async readMetaFile<T>(path: string): Promise<T | null> {
