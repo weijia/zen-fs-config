@@ -684,11 +684,13 @@ export async function createConfigRepo(
 
   let backendsMeta = await tempRepo.readMetaFile<BackendsMeta>(BACKENDS_FILE);
 
-  if (!backendsMeta && options.bootstrap) {
+  // If bootstrap is provided, always use it (overwrites stale meta from previous sessions)
+  if (options.bootstrap) {
     backendsMeta = {
       version: 1,
       backends: options.bootstrap.backends,
     };
+    console.log(`[createConfigRepo] Using bootstrap backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
   }
 
   if (!backendsMeta) {
@@ -722,11 +724,12 @@ export async function createConfigRepo(
   // -------------------------------------------------------------------
   let syncRulesMeta = await tempRepo.readMetaFile<SyncRulesMeta>(SYNC_RULES_FILE);
 
-  if (!syncRulesMeta && options.bootstrap) {
+  if (options.bootstrap) {
     syncRulesMeta = {
       version: 1,
       rules: options.bootstrap.syncRules,
     };
+    console.log(`[createConfigRepo] Using bootstrap syncRules: ${syncRulesMeta.rules.length} rules`);
   }
 
   if (!syncRulesMeta) {
