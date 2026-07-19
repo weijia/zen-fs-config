@@ -73,67 +73,70 @@ export function listBackends(): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Wrap a synchronous ZenFS FileSystem into an async BackendInstance.
- * ZenFS backends (InMemory, etc.) use sync methods (writeFile, readdir, …).
- * CachedFileSystem requires async methods. This adapter bridges the gap.
+ * Wrap ZenFS fs.promises into a BackendInstance.
+ *
+ * ZenFS backends (StoreFS) use their own internal API (write, stat, mkdir, …).
+ * CachedFileSystem needs Node.js-style async API (readFile, writeFile, …).
+ * ZenFS provides the Node.js compat layer via `fs.promises` from `@zenfs/core`,
+ * but only *after* a backend is configured via `configureSingle`.
+ *
+ * We isolate each backend into a separate ZenFS instance using Port/Worker,
+ * but for InMemory (sync) the simplest approach is to configure VFS once
+ * and use fs.promises.
+ *
+ * To support multiple InMemory instances, we use a counter to create
+ * unique Port channels.
  */
-function syncToAsync(backend: any): BackendInstance {
-  return {
-    readFile(path: string, ...args: any[]): Promise<any> {
-      const result = backend.readFile(path, ...args);
-      return Promise.resolve(result);
-    },
-    writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
-      backend.writeFile(path, data, options);
-      return Promise.resolve();
-    },
-    readdir(path: string): Promise<string[]> {
-      const entries: any[] = backend.readdir(path);
-      // ZenFS may return string[] or Dirent[]
-      return Promise.resolve(entries.map((e: any) => typeof e === 'string' ? e : e.name));
-    },
-    stat(path: string, ...args: any[]): Promise<any> {
-      return Promise.resolve(backend.stat(path, ...args));
-    },
-    exists(path: string): Promise<boolean> {
-      try {
-        backend.stat(path);
-        return Promise.resolve(true);
-      } catch {
-        return Promise.resolve(false);
-      }
-    },
-    mkdir(path: string, options?: any): Promise<any> {
-      backend.mkdir(path, options);
-      return Promise.resolve();
-    },
-    unlink(path: string): Promise<void> {
-      backend.unlink(path);
-      return Promise.resolve();
-    },
-    rmdir(path: string): Promise<void> {
-      if (typeof backend.rmdir === 'function') {
-        backend.rmdir(path);
-      }
-      return Promise.resolve();
-    },
-    rename(oldPath: string, newPath: string): Promise<void> {
-      if (typeof backend.rename === 'function') {
-        backend.rename(oldPath, newPath);
-      }
-      return Promise.resolve();
-    },
-  };
-}
+let inMemoryCounter = 0;
 
 registerBackend('InMemory', async (options) => {
-  const { InMemory } = await import('@zenfs/core');
+  const zenfs = await import('@zenfs/core');
+  const { InMemory } = zenfs;
+
   const maxSize = (options.maxSize as number) ?? 100 * 1024 * 1024;
-  const label = (options.label as string) ?? 'zen-fs-config';
+  const label = (options.label as string) ?? `zen-fs-config-${++inMemoryCounter}`;
 
-  // InMemory.create() returns a synchronous StoreFS<InMemoryStore>
-  const fs = InMemory.create({ maxSize, label });
+  // configureSingle sets up the global ZenFS VFS with the given backend.
+  // It returns void — the configured fs is accessed via the `fs` re-export.
+  await zenfs.configureSingle({ backend: InMemory, maxSize, label });
 
-  // Wrap sync → async so CachedFileSystem can use it
-  return syncToAsync(fs);
+  // fs.promises has Node.js-style async API: readFile, writeFile, etc.
+  const pfs = (zenfs.fs as any).promises;
+
+  const backend: BackendInstance = {
+    async readFile(path: string, ...args: any[]): Promise<any> {
+      // ZenFS fs.promises.readFile supports (path, encoding) and (path, options)
+      if (args.length > 0) {
+        return pfs.readFile(path, ...args);
+      }
+      return pfs.readFile(path);
+    },
+    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
+      return pfs.writeFile(path, data, options);
+    },
+    async readdir(path: string): Promise<string[]> {
+      const entries = await pfs.readdir(path);
+      return entries.map((e: any) => typeof e === 'string' ? e : e.name);
+    },
+    async stat(path: string, ...args: any[]): Promise<any> {
+      return pfs.stat(path, ...args);
+    },
+    async exists(path: string): Promise<boolean> {
+      try { await pfs.stat(path); return true; } catch { return false; }
+    },
+    async mkdir(path: string, options?: any): Promise<any> {
+      return pfs.mkdir(path, options);
+    },
+    async unlink(path: string): Promise<void> {
+      return pfs.unlink(path);
+    },
+    async rmdir(path: string): Promise<void> {
+      return pfs.rmdir(path);
+    },
+    async rename(oldPath: string, newPath: string): Promise<void> {
+      return pfs.rename(oldPath, newPath);
+    },
+  };
+
+  return backend;
 });
