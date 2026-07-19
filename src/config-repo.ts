@@ -562,6 +562,30 @@ export class ConfigRepo implements IConfigRepo {
     }
   }
 
+  // -----------------------------------------------------------------------
+  // IConfigRepo — Meta file access (no chroot)
+  // -----------------------------------------------------------------------
+
+  async getBackends(): Promise<BackendsMeta | null> {
+    this.assertNotDisposed();
+    return this.readMetaFile<BackendsMeta>(BACKENDS_FILE);
+  }
+
+  async updateBackends(meta: BackendsMeta): Promise<void> {
+    this.assertNotDisposed();
+    await this.writeMetaFile(BACKENDS_FILE, meta);
+  }
+
+  async getSyncRules(): Promise<SyncRulesMeta | null> {
+    this.assertNotDisposed();
+    return this.readMetaFile<SyncRulesMeta>(SYNC_RULES_FILE);
+  }
+
+  async updateSyncRules(meta: SyncRulesMeta): Promise<void> {
+    this.assertNotDisposed();
+    await this.writeMetaFile(SYNC_RULES_FILE, meta);
+  }
+
   private tryParse(content: string): unknown {
     try {
       return JSON.parse(content);

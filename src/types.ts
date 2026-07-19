@@ -222,6 +222,18 @@ export interface IConfigRepo {
   /** List all conflict archives. */
   listConflicts(): Promise<ConflictArchive[]>;
 
+  /** Read .meta/backends.json. */
+  getBackends(): Promise<BackendsMeta | null>;
+
+  /** Write .meta/backends.json. */
+  updateBackends(meta: BackendsMeta): Promise<void>;
+
+  /** Read .meta/sync-rules.json. */
+  getSyncRules(): Promise<SyncRulesMeta | null>;
+
+  /** Write .meta/sync-rules.json. */
+  updateSyncRules(meta: SyncRulesMeta): Promise<void>;
+
   /** Dispose: stop all sync, release cache FS and resources. */
   dispose(): Promise<void>;
 }
