@@ -365,16 +365,30 @@ export class ConfigRepo implements IConfigRepo {
     backends: BackendDescriptor[],
     primaryBackendId: string,
   ): Promise<void> {
+    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId}`);
+    console.log(`[ConfigRepo] setupSync: rules=`, JSON.stringify(rules, null, 2));
+
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
-      const instance = await createBackend(desc);
-      const syncable = backendToSyncableFS(instance);
-      this.replicaBackends.set(desc.id, { instance, syncable });
+      console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
+      try {
+        const instance = await createBackend(desc);
+        const syncable = backendToSyncableFS(instance);
+        this.replicaBackends.set(desc.id, { instance, syncable });
+        console.log(`[ConfigRepo] Replica ${desc.id} created successfully`);
+      } catch (err: any) {
+        console.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
+      }
     }
+
+    console.log(`[ConfigRepo] Available replicas:`, Array.from(this.replicaBackends.keys()));
 
     for (const rule of rules) {
       if (rule.direction === 'none') continue;
-      if (!rule.replicas?.length) continue;
+      if (!rule.replicas?.length) {
+        console.log(`[ConfigRepo] Skipping rule ${rule.prefix}: no replicas`);
+        continue;
+      }
 
       const zenSyncDirection =
         rule.direction === 'bi-directional'
@@ -385,7 +399,10 @@ export class ConfigRepo implements IConfigRepo {
         if (replicaId === primaryBackendId) continue;
 
         const replica = this.replicaBackends.get(replicaId);
-        if (!replica) continue;
+        if (!replica) {
+          console.warn(`[ConfigRepo] Skipping pair ${replicaId}: replica not found (available: ${Array.from(this.replicaBackends.keys()).join(', ')})`);
+          continue;
+        }
 
         const pair = this.syncEngine.addPair(
           this.fullFS,
@@ -400,6 +417,8 @@ export class ConfigRepo implements IConfigRepo {
           '/',
         );
 
+        console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, prefix=${rule.prefix}, dir=${rule.direction}, replica=${replicaId}`);
+
         // Register conflict handler using the pair's pairId (string)
         const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
           this.handleConflict(event, rule);
@@ -410,6 +429,8 @@ export class ConfigRepo implements IConfigRepo {
         this.syncEngine.watch(pair.pairId);
       }
     }
+
+    console.log(`[ConfigRepo] setupSync complete. Sync statuses:`, this.getSyncStatuses());
   }
 
   // -----------------------------------------------------------------------
