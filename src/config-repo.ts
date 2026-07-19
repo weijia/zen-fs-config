@@ -682,6 +682,21 @@ export async function createConfigRepo(
     },
   );
 
+  // Ensure /.meta/ directory exists before wrapping in cache.
+  // On a fresh backend the directory may not exist yet, and
+  // CachedFileSystem.mkdir → BackendInstance.mkdir may have issues.
+  try {
+    const metaExists = await primaryInstance.exists(META_DIR);
+    console.log(`[createConfigRepo] /.meta/ exists: ${metaExists}`);
+    if (!metaExists) {
+      console.log(`[createConfigRepo] Creating /.meta/ via primaryInstance...`);
+      await primaryInstance.mkdir(META_DIR);
+      console.log(`[createConfigRepo] /.meta/ created`);
+    }
+  } catch (err: any) {
+    console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+  }
+
   // -------------------------------------------------------------------
   // Step 3: Read or create .meta/backends.json
   // -------------------------------------------------------------------
