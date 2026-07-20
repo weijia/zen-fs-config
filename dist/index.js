@@ -410,227 +410,26 @@ registerBackend("WebStorage", async (options) => {
   return wrapZenFSFileSystem({ backend: WebStorage, storage });
 });
 registerBackend("GitHub", async (options) => {
-  const token = options.token ?? "";
-  const owner = options.owner ?? "";
-  const repo = options.repo ?? "";
-  const branch = options.branch ?? "main";
-  const baseUrl = options.baseUrl && options.baseUrl.trim() || "https://api.github.com";
-  if (!owner || !repo) throw new Error('GitHub backend requires "owner" and "repo" options');
-  const headers = {
-    "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "zen-fs-config"
-  };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const apiUrl = (path) => {
-    const p = path.startsWith("/") ? path.slice(1) : path;
-    return `${baseUrl}/repos/${owner}/${repo}/contents/${p}?ref=${branch}`;
-  };
-  const treeUrl = () => `${baseUrl}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
-  const ghStat = (item) => ({
-    isFile: () => item.type === "file",
-    isDirectory: () => item.type === "dir",
-    size: item.size ?? 0
+  const { Github } = await import("zen-fs-github");
+  return wrapZenFSFileSystem({
+    backend: Github,
+    token: options.token,
+    owner: options.owner,
+    repo: options.repo,
+    branch: options.branch,
+    baseUrl: options.baseUrl && options.baseUrl.trim() || void 0
   });
-  const fetchJson = async (url) => {
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${url}`);
-    return res.json();
-  };
-  const backend = {
-    async readFile(path, ...args) {
-      const data = await fetchJson(apiUrl(path));
-      if (data.encoding === "base64") {
-        const raw = Uint8Array.from(atob(data.content), (c) => c.charCodeAt(0));
-        if (args[0] === "utf-8") return new TextDecoder().decode(raw);
-        return raw;
-      }
-      return data;
-    },
-    async writeFile(path, data, options2) {
-      const message = options2?.message || `Update ${path}`;
-      const content = typeof data === "string" ? btoa(unescape(encodeURIComponent(data))) : btoa(String.fromCharCode(...new Uint8Array(data)));
-      const sha = await (async () => {
-        try {
-          const d = await fetchJson(apiUrl(path));
-          return d.sha;
-        } catch {
-          return void 0;
-        }
-      })();
-      await fetch(apiUrl(path), {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({ message, content, sha, branch })
-      });
-    },
-    async readdir(path) {
-      const data = await fetchJson(apiUrl(path));
-      return data.map((item) => item.name);
-    },
-    async stat(path, ...args) {
-      try {
-        const data = await fetchJson(apiUrl(path));
-        if (Array.isArray(data)) {
-          return { isFile: () => false, isDirectory: () => true, size: 0 };
-        }
-        return ghStat(data);
-      } catch {
-        throw new Error(`ENOENT: ${path}`);
-      }
-    },
-    async exists(path) {
-      try {
-        await fetchJson(apiUrl(path));
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    async mkdir(path, options2) {
-      const dirPath = path.replace(/\/$/, "");
-      const keepPath = `${dirPath}/.gitkeep`;
-      const message = options2?.message || `Create directory ${dirPath}`;
-      const content = btoa("");
-      await fetch(apiUrl(keepPath), {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({ message, content, branch })
-      });
-    },
-    async unlink(path) {
-      const data = await fetchJson(apiUrl(path));
-      await fetch(apiUrl(path), {
-        method: "DELETE",
-        headers,
-        body: JSON.stringify({ message: `Delete ${path}`, sha: data.sha, branch })
-      });
-    },
-    async rmdir(path) {
-      const items = await fetchJson(apiUrl(path));
-      if (Array.isArray(items)) {
-        for (const item of items) {
-          const itemPath = `${path}/${item.name}`;
-          if (item.type === "dir") {
-            await backend.rmdir(itemPath);
-          } else {
-            await backend.unlink(itemPath);
-          }
-        }
-      }
-    },
-    async rename(oldPath, newPath) {
-      const content = await backend.readFile(oldPath);
-      await backend.writeFile(newPath, content);
-      await backend.unlink(oldPath);
-    }
-  };
-  return backend;
 });
 registerBackend("Gitee", async (options) => {
-  const token = options.token ?? "";
-  const owner = options.owner ?? "";
-  const repo = options.repo ?? "";
-  const branch = options.branch ?? "master";
-  const baseUrl = options.baseUrl && options.baseUrl.trim() || "https://gitee.com/api/v5";
-  if (!owner || !repo) throw new Error('Gitee backend requires "owner" and "repo" options');
-  const fetchJson = async (url) => {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Gitee API ${res.status}: ${url}`);
-    return res.json();
-  };
-  const apiUrl = (path) => {
-    const p = path.startsWith("/") ? path.slice(1) : path;
-    const params = new URLSearchParams({ access_token: token, ref: branch, path: p });
-    return `${baseUrl}/repos/${owner}/${repo}/contents?${params}`;
-  };
-  const ghStat = (item) => ({
-    isFile: () => item.type === "file",
-    isDirectory: () => item.type === "dir",
-    size: item.size ?? 0
+  const { Gitee } = await import("zen-fs-gitee");
+  return wrapZenFSFileSystem({
+    backend: Gitee,
+    token: options.token,
+    owner: options.owner,
+    repo: options.repo,
+    branch: options.branch,
+    baseUrl: options.baseUrl && options.baseUrl.trim() || void 0
   });
-  const backend = {
-    async readFile(path, ...args) {
-      const data = await fetchJson(apiUrl(path));
-      if (data.content) {
-        const raw = Uint8Array.from(atob(data.content), (c) => c.charCodeAt(0));
-        if (args[0] === "utf-8") return new TextDecoder().decode(raw);
-        return raw;
-      }
-      return data;
-    },
-    async writeFile(path, data, options2) {
-      const message = options2?.message || `Update ${path}`;
-      const content = typeof data === "string" ? btoa(unescape(encodeURIComponent(data))) : btoa(String.fromCharCode(...new Uint8Array(data)));
-      const sha = await (async () => {
-        try {
-          const d = await fetchJson(apiUrl(path));
-          return d.sha;
-        } catch {
-          return void 0;
-        }
-      })();
-      await fetch(apiUrl(path), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token, message, content, sha, branch })
-      });
-    },
-    async readdir(path) {
-      const data = await fetchJson(apiUrl(path));
-      return Array.isArray(data) ? data.map((i) => i.name) : [];
-    },
-    async stat(path) {
-      try {
-        const data = await fetchJson(apiUrl(path));
-        if (Array.isArray(data)) return ghStat({ type: "dir", size: 0 });
-        return ghStat(data);
-      } catch {
-        throw new Error(`ENOENT: ${path}`);
-      }
-    },
-    async exists(path) {
-      try {
-        await fetchJson(apiUrl(path));
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    async mkdir(path, options2) {
-      const dirPath = path.replace(/\/$/, "");
-      const keepPath = `${dirPath}/.gitkeep`;
-      const message = options2?.message || `Create directory ${dirPath}`;
-      await fetch(apiUrl(keepPath), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token, message, content: btoa(""), branch })
-      });
-    },
-    async unlink(path) {
-      const data = await fetchJson(apiUrl(path));
-      await fetch(apiUrl(path), {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token, message: `Delete ${path}`, sha: data.sha, branch })
-      });
-    },
-    async rmdir(path) {
-      const items = await fetchJson(apiUrl(path));
-      if (Array.isArray(items)) {
-        for (const item of items) {
-          const itemPath = `${path}/${item.name}`;
-          if (item.type === "dir") await backend.rmdir(itemPath);
-          else await backend.unlink(itemPath);
-        }
-      }
-    },
-    async rename(oldPath, newPath) {
-      const content = await backend.readFile(oldPath);
-      await backend.writeFile(newPath, content);
-      await backend.unlink(oldPath);
-    }
-  };
-  return backend;
 });
 registerBackend("WebDAV", async (options) => {
   const url = options.url ?? "";

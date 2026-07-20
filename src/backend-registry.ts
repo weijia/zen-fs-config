@@ -220,229 +220,35 @@ registerBackend('WebStorage', async (options) => {
 });
 
 // ---------------------------------------------------------------------------
-// Built-in: GitHub (raw content API)
+// Built-in: GitHub (uses zen-fs-github package)
 // ---------------------------------------------------------------------------
 
 registerBackend('GitHub', async (options) => {
-  const token = (options.token as string) ?? '';
-  const owner = (options.owner as string) ?? '';
-  const repo = (options.repo as string) ?? '';
-  const branch = (options.branch as string) ?? 'main';
-  const baseUrl = (options.baseUrl && (options.baseUrl as string).trim()) || 'https://api.github.com';
-
-  if (!owner || !repo) throw new Error('GitHub backend requires "owner" and "repo" options');
-
-  const headers: Record<string, string> = {
-    'Accept': 'application/vnd.github.v3+json',
-    'User-Agent': 'zen-fs-config',
-  };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-
-  const apiUrl = (path: string) => {
-    const p = path.startsWith('/') ? path.slice(1) : path;
-    return `${baseUrl}/repos/${owner}/${repo}/contents/${p}?ref=${branch}`;
-  };
-
-  const treeUrl = () => `${baseUrl}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
-
-  const ghStat = (item: any): { isFile: () => boolean; isDirectory: () => boolean; size: number } => ({
-    isFile: () => item.type === 'file',
-    isDirectory: () => item.type === 'dir',
-    size: item.size ?? 0,
+  const { Github } = await import('zen-fs-github');
+  return wrapZenFSFileSystem({
+    backend: Github,
+    token: options.token,
+    owner: options.owner,
+    repo: options.repo,
+    branch: options.branch,
+    baseUrl: (options.baseUrl && (options.baseUrl as string).trim()) || undefined,
   });
-
-  const fetchJson = async (url: string): Promise<any> => {
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${url}`);
-    return res.json();
-  };
-
-  const backend: BackendInstance = {
-    async readFile(path: string, ...args: any[]): Promise<any> {
-      const data = await fetchJson(apiUrl(path));
-      if (data.encoding === 'base64') {
-        const raw = Uint8Array.from(atob(data.content), c => c.charCodeAt(0));
-        if (args[0] === 'utf-8') return new TextDecoder().decode(raw);
-        return raw;
-      }
-      return data;
-    },
-    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
-      const message = (options as any)?.message || `Update ${path}`;
-      const content = typeof data === 'string' ? btoa(unescape(encodeURIComponent(data))) : btoa(String.fromCharCode(...new Uint8Array(data)));
-      const sha = await (async () => {
-        try { const d = await fetchJson(apiUrl(path)); return d.sha; } catch { return undefined; }
-      })();
-      await fetch(apiUrl(path), {
-        method: 'PUT',
-        headers,
-        body: JSON.stringify({ message, content, sha, branch }),
-      });
-    },
-    async readdir(path: string): Promise<string[]> {
-      const data = await fetchJson(apiUrl(path));
-      return data.map((item: any) => item.name);
-    },
-    async stat(path: string, ...args: any[]): Promise<any> {
-      try {
-        const data = await fetchJson(apiUrl(path));
-        if (Array.isArray(data)) {
-          return { isFile: () => false, isDirectory: () => true, size: 0 };
-        }
-        return ghStat(data);
-      } catch { throw new Error(`ENOENT: ${path}`); }
-    },
-    async exists(path: string): Promise<boolean> {
-      try { await fetchJson(apiUrl(path)); return true; } catch { return false; }
-    },
-    async mkdir(path: string, options?: any): Promise<any> {
-      // GitHub API: create a .gitkeep file
-      const dirPath = path.replace(/\/$/, '');
-      const keepPath = `${dirPath}/.gitkeep`;
-      const message = (options as any)?.message || `Create directory ${dirPath}`;
-      const content = btoa('');
-      await fetch(apiUrl(keepPath), {
-        method: 'PUT',
-        headers,
-        body: JSON.stringify({ message, content, branch }),
-      });
-    },
-    async unlink(path: string): Promise<void> {
-      const data = await fetchJson(apiUrl(path));
-      await fetch(apiUrl(path), {
-        method: 'DELETE',
-        headers,
-        body: JSON.stringify({ message: `Delete ${path}`, sha: data.sha, branch }),
-      });
-    },
-    async rmdir(path: string): Promise<void> {
-      // Recursively delete all contents
-      const items = await fetchJson(apiUrl(path));
-      if (Array.isArray(items)) {
-        for (const item of items) {
-          const itemPath = `${path}/${item.name}`;
-          if (item.type === 'dir') {
-            await backend.rmdir!(itemPath);
-          } else {
-            await backend.unlink(itemPath);
-          }
-        }
-      }
-    },
-    async rename(oldPath: string, newPath: string): Promise<void> {
-      // GitHub has no rename API — copy + delete
-      const content = await backend.readFile(oldPath);
-      await backend.writeFile(newPath, content as any);
-      await backend.unlink(oldPath);
-    },
-  };
-
-  return backend;
 });
 
 // ---------------------------------------------------------------------------
-// Built-in: Gitee (raw content API, similar to GitHub)
+// Built-in: Gitee (uses zen-fs-gitee package)
 // ---------------------------------------------------------------------------
 
 registerBackend('Gitee', async (options) => {
-  const token = (options.token as string) ?? '';
-  const owner = (options.owner as string) ?? '';
-  const repo = (options.repo as string) ?? '';
-  const branch = (options.branch as string) ?? 'master';
-  const baseUrl = (options.baseUrl && (options.baseUrl as string).trim()) || 'https://gitee.com/api/v5';
-
-  if (!owner || !repo) throw new Error('Gitee backend requires "owner" and "repo" options');
-
-  const fetchJson = async (url: string): Promise<any> => {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Gitee API ${res.status}: ${url}`);
-    return res.json();
-  };
-
-  const apiUrl = (path: string) => {
-    const p = path.startsWith('/') ? path.slice(1) : path;
-    const params = new URLSearchParams({ access_token: token, ref: branch, path: p });
-    return `${baseUrl}/repos/${owner}/${repo}/contents?${params}`;
-  };
-
-  const ghStat = (item: any) => ({
-    isFile: () => item.type === 'file',
-    isDirectory: () => item.type === 'dir',
-    size: item.size ?? 0,
+  const { Gitee } = await import('zen-fs-gitee');
+  return wrapZenFSFileSystem({
+    backend: Gitee,
+    token: options.token,
+    owner: options.owner,
+    repo: options.repo,
+    branch: options.branch,
+    baseUrl: (options.baseUrl && (options.baseUrl as string).trim()) || undefined,
   });
-
-  const backend: BackendInstance = {
-    async readFile(path: string, ...args: any[]): Promise<any> {
-      const data = await fetchJson(apiUrl(path));
-      if (data.content) {
-        const raw = Uint8Array.from(atob(data.content), c => c.charCodeAt(0));
-        if (args[0] === 'utf-8') return new TextDecoder().decode(raw);
-        return raw;
-      }
-      return data;
-    },
-    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: any): Promise<void> {
-      const message = (options as any)?.message || `Update ${path}`;
-      const content = typeof data === 'string' ? btoa(unescape(encodeURIComponent(data))) : btoa(String.fromCharCode(...new Uint8Array(data)));
-      const sha = await (async () => {
-        try { const d = await fetchJson(apiUrl(path)); return d.sha; } catch { return undefined; }
-      })();
-      await fetch(apiUrl(path), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: token, message, content, sha, branch }),
-      });
-    },
-    async readdir(path: string): Promise<string[]> {
-      const data = await fetchJson(apiUrl(path));
-      return Array.isArray(data) ? data.map((i: any) => i.name) : [];
-    },
-    async stat(path: string): Promise<any> {
-      try {
-        const data = await fetchJson(apiUrl(path));
-        if (Array.isArray(data)) return ghStat({ type: 'dir', size: 0 });
-        return ghStat(data);
-      } catch { throw new Error(`ENOENT: ${path}`); }
-    },
-    async exists(path: string): Promise<boolean> {
-      try { await fetchJson(apiUrl(path)); return true; } catch { return false; }
-    },
-    async mkdir(path: string, options?: any): Promise<any> {
-      const dirPath = path.replace(/\/$/, '');
-      const keepPath = `${dirPath}/.gitkeep`;
-      const message = (options as any)?.message || `Create directory ${dirPath}`;
-      await fetch(apiUrl(keepPath), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: token, message, content: btoa(''), branch }),
-      });
-    },
-    async unlink(path: string): Promise<void> {
-      const data = await fetchJson(apiUrl(path));
-      await fetch(apiUrl(path), {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: token, message: `Delete ${path}`, sha: data.sha, branch }),
-      });
-    },
-    async rmdir(path: string): Promise<void> {
-      const items = await fetchJson(apiUrl(path));
-      if (Array.isArray(items)) {
-        for (const item of items) {
-          const itemPath = `${path}/${item.name}`;
-          if (item.type === 'dir') await backend.rmdir!(itemPath);
-          else await backend.unlink(itemPath);
-        }
-      }
-    },
-    async rename(oldPath: string, newPath: string): Promise<void> {
-      const content = await backend.readFile(oldPath);
-      await backend.writeFile(newPath, content as any);
-      await backend.unlink(oldPath);
-    },
-  };
-
-  return backend;
 });
 
 // ---------------------------------------------------------------------------

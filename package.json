@@ -39,6 +39,8 @@
   "peerDependencies": {
     "@zenfs/core": ">=2.3.0",
     "zen-fs-cache": ">=1.0.0",
+    "zen-fs-gitee": ">=1.0.0",
+    "zen-fs-github": ">=1.0.0",
     "zen-fs-sync": ">=0.1.0"
   },
   "devDependencies": {
@@ -46,6 +48,8 @@
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "zen-fs-cache": "^1.0.1",
+    "zen-fs-gitee": "^1.0.0",
+    "zen-fs-github": "^1.0.0",
     "zen-fs-sync": "^0.1.0"
   },
   "dependencies": {
