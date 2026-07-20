@@ -441,9 +441,42 @@ registerBackend("Gitee", async (options) => {
     const baseUrl = this.api.baseUrl || "https://gitee.com/api/v5";
     const auth = `access_token=${this.api.token}`;
     const branchUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${this.api.branch}?${auth}`;
-    const branchRes = await fetch(branchUrl);
-    if (!branchRes.ok) throw new Error(`Gitee: branch "${this.api.branch}" not found (${branchRes.status})`);
-    const branchData = await branchRes.json();
+    let branchRes = await fetch(branchUrl);
+    let branchData;
+    if (branchRes.ok) {
+      branchData = await branchRes.json();
+    } else {
+      console.log(`[Gitee] Branch "${this.api.branch}" not found, creating...`);
+      const defaultBranch = this.api.branch === "master" ? "main" : "master";
+      let defaultSha;
+      for (const name of [defaultBranch, "main", "master"]) {
+        const dr = await fetch(`${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${name}?${auth}`);
+        if (dr.ok) {
+          const dd = await dr.json();
+          defaultSha = dd.commit?.sha;
+          if (defaultSha) break;
+        }
+      }
+      if (!defaultSha) {
+        console.log(`[Gitee] No branches found in repo, skipping tree init`);
+        this.initialized = true;
+        return;
+      }
+      const createRes = await fetch(`${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches?${auth}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          refs: defaultSha,
+          branch_name: this.api.branch
+        })
+      });
+      if (!createRes.ok) {
+        const errText = await createRes.text().catch(() => "");
+        throw new Error(`Gitee: failed to create branch "${this.api.branch}": ${createRes.status} ${errText}`);
+      }
+      branchData = await createRes.json();
+      console.log(`[Gitee] Branch "${this.api.branch}" created from ${defaultSha.slice(0, 8)}`);
+    }
     const commitSha = branchData.commit?.sha;
     if (!commitSha) throw new Error(`Gitee: could not get commit SHA for branch "${this.api.branch}"`);
     const commitUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/git/commits/${commitSha}?${auth}`;
