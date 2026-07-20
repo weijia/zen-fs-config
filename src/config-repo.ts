@@ -100,6 +100,11 @@ export class ConfigRepo implements IConfigRepo {
     this.rootFS = createChrootFS(cachedFS, '/');
   }
 
+  /** Full path to this node's directory on the primary backend. */
+  get nodePath(): string {
+    return `/nodes/${this.nodeId}`;
+  }
+
   // -----------------------------------------------------------------------
   // IConfigRepo — Load
   // -----------------------------------------------------------------------
@@ -361,15 +366,17 @@ export class ConfigRepo implements IConfigRepo {
   // -----------------------------------------------------------------------
 
   async setupSync(
-    rules: SyncRule[],
     backends: BackendDescriptor[],
     primaryBackendId: string,
   ): Promise<void> {
     console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId}`);
-    console.log(`[ConfigRepo] setupSync: rules=`, JSON.stringify(rules, null, 2));
 
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
+      if ((desc as any).enabled === false) {
+        console.log(`[ConfigRepo] Skipping disabled replica: ${desc.id}`);
+        continue;
+      }
       console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
@@ -383,51 +390,29 @@ export class ConfigRepo implements IConfigRepo {
 
     console.log(`[ConfigRepo] Available replicas:`, Array.from(this.replicaBackends.keys()));
 
-    for (const rule of rules) {
-      if (rule.direction === 'none') continue;
-      if (!rule.replicas?.length) {
-        console.log(`[ConfigRepo] Skipping rule ${rule.prefix}: no replicas`);
-        continue;
-      }
+    // Create one SyncPair per replica — sync ALL content (no prefix filter)
+    for (const [replicaId, replica] of this.replicaBackends.entries()) {
+      const pair = this.syncEngine.addPair(
+        this.fullFS,
+        replica.syncable,
+        {
+          direction: SyncDirection.OneWay,
+          conflictStrategy: 'source-wins' as any,
+          // No filter = sync everything under nodePath
+        },
+        this.nodePath,
+      );
 
-      const zenSyncDirection =
-        rule.direction === 'bi-directional'
-          ? SyncDirection.BiDirectional
-          : SyncDirection.OneWay;
+      console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, replica=${replicaId}, root=${this.nodePath}`);
 
-      for (const replicaId of rule.replicas) {
-        if (replicaId === primaryBackendId) continue;
+      // Register conflict handler
+      const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
+        this.handleConflict(event, { prefix: '/', direction: 'one-way' } as any);
+      };
+      this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
 
-        const replica = this.replicaBackends.get(replicaId);
-        if (!replica) {
-          console.warn(`[ConfigRepo] Skipping pair ${replicaId}: replica not found (available: ${Array.from(this.replicaBackends.keys()).join(', ')})`);
-          continue;
-        }
-
-        const pair = this.syncEngine.addPair(
-          this.fullFS,
-          replica.syncable,
-          {
-            direction: zenSyncDirection,
-            conflictStrategy: rule.conflictStrategy as any,
-            filter: {
-              includePrefixes: [rule.prefix],
-            },
-          },
-          '/',
-        );
-
-        console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, prefix=${rule.prefix}, dir=${rule.direction}, replica=${replicaId}`);
-
-        // Register conflict handler using the pair's pairId (string)
-        const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
-          this.handleConflict(event, rule);
-        };
-        this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
-
-        // Start watching
-        this.syncEngine.watch(pair.pairId);
-      }
+      // Start watching
+      this.syncEngine.watch(pair.pairId);
     }
 
     console.log(`[ConfigRepo] setupSync complete. Sync statuses:`, this.getSyncStatuses());
@@ -824,7 +809,6 @@ export async function createConfigRepo(
   );
 
   await repo.setupSync(
-    syncRulesMeta.rules,
     backendsMeta.backends,
     options.primaryBackendId,
   );
