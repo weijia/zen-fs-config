@@ -241,51 +241,60 @@ registerBackend('GitHub', async (options) => {
 
 registerBackend('Gitee', async (options) => {
   const zenGitee = await import('zen-fs-gitee');
-  // @ts-expect-error GiteeAPI is not exported from index
-  const { GiteeAPI } = await import('zen-fs-gitee/dist/gitee-api.js');
 
   // Gitee's /git/trees/{sha} requires a SHA, not a branch name (unlike GitHub).
-  // Patch getTree to resolve branch → commit SHA → tree SHA first.
-  const originalGetTree = GiteeAPI.prototype.getTree;
-  GiteeAPI.prototype.getTree = async function (this: any, recursive = true) {
-    // Try the original call first (works if branch is already a SHA)
+  // Patch GiteeFS.prototype.init so that after indexing it resolves the branch
+  // name to a tree SHA on the first 404.
+  const { GiteeFS } = zenGitee as any;
+  const origInit = GiteeFS.prototype.init;
+
+  // Use a WeakSet to avoid double-patching
+  const patched = new WeakSet();
+  GiteeFS.prototype.init = async function (this: any) {
+    let firstErr: any;
     try {
-      return await originalGetTree.call(this, recursive);
+      return await origInit.call(this);
     } catch (err: any) {
       if (!err.message?.includes('404') && !err.message?.includes('Tree not found')) {
         throw err;
       }
+      firstErr = err;
     }
-    // Resolve branch name to commit SHA, then to tree SHA
-    console.log(`[Gitee] getTree failed with branch="${this.branch}", resolving to SHA...`);
-    const baseUrl = this.baseUrl || 'https://gitee.com/api/v5';
-    const sep = '?';
-    const auth = `access_token=${this.token}`;
+    // getTree inside init() failed — resolve branch → SHA and retry
+    if (patched.has(this)) throw firstErr;
+    patched.add(this);
+
+    console.log(`[Gitee] init failed with branch="${this.api.branch}", resolving to SHA...`);
+    const baseUrl = this.api.baseUrl || 'https://gitee.com/api/v5';
+    const auth = `access_token=${this.api.token}`;
 
     // GET /repos/{owner}/{repo}/branches/{branch} → commit.sha
-    const branchUrl = `${baseUrl}/repos/${this.owner}/${this.repo}/branches/${this.branch}${sep}${auth}`;
+    const branchUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${this.api.branch}?${auth}`;
     const branchRes = await fetch(branchUrl);
-    if (!branchRes.ok) throw new Error(`Gitee: branch "${this.branch}" not found (${branchRes.status})`);
+    if (!branchRes.ok) throw new Error(`Gitee: branch "${this.api.branch}" not found (${branchRes.status})`);
     const branchData: any = await branchRes.json();
     const commitSha = branchData.commit?.sha;
-    if (!commitSha) throw new Error(`Gitee: could not get commit SHA for branch "${this.branch}"`);
+    if (!commitSha) throw new Error(`Gitee: could not get commit SHA for branch "${this.api.branch}"`);
 
     // GET /repos/{owner}/{repo}/git/commits/{sha} → tree.sha
-    const commitUrl = `${baseUrl}/repos/${this.owner}/${this.repo}/git/commits/${commitSha}${sep}${auth}`;
+    const commitUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/git/commits/${commitSha}?${auth}`;
     const commitRes = await fetch(commitUrl);
     if (!commitRes.ok) throw new Error(`Gitee: commit ${commitSha} not found (${commitRes.status})`);
     const commitData: any = await commitRes.json();
     const treeSha = commitData.tree?.sha;
     if (!treeSha) throw new Error(`Gitee: could not get tree SHA from commit ${commitSha}`);
 
-    console.log(`[Gitee] Resolved branch="${this.branch}" → commit=${commitSha.slice(0,8)} → tree=${treeSha.slice(0,8)}`);
+    // Replace branch with tree SHA so getTree() succeeds
+    const realBranch = this.api.branch;
+    this.api.branch = treeSha;
+    console.log(`[Gitee] Resolved branch="${realBranch}" → commit=${commitSha.slice(0, 8)} → tree=${treeSha.slice(0, 8)}`);
 
-    // Now call trees API with the actual tree SHA
-    const treeUrl = `${baseUrl}/repos/${this.owner}/${this.repo}/git/trees/${treeSha}${sep}recursive=${recursive ? 1 : 0}&${auth}`;
-    const treeRes = await fetch(treeUrl);
-    if (!treeRes.ok) throw new Error(`Gitee: tree ${treeSha} not found (${treeRes.status})`);
-    const treeData: any = await treeRes.json();
-    return treeData.tree || [];
+    try {
+      return await origInit.call(this);
+    } finally {
+      // Restore original branch name for other API calls (getContents, getRaw, etc.)
+      this.api.branch = realBranch;
+    }
   };
 
   return wrapZenFSFileSystem({
