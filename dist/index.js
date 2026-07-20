@@ -974,7 +974,7 @@ var ConfigRepo = class {
         this.fullFS,
         replica.syncable,
         {
-          direction: import_zen_fs_sync.SyncDirection.OneWay,
+          direction: import_zen_fs_sync.SyncDirection.BiDirectional,
           conflictStrategy: "source-wins"
           // No filter = sync everything under root
         },

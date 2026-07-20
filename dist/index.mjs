@@ -927,7 +927,7 @@ var ConfigRepo = class {
         this.fullFS,
         replica.syncable,
         {
-          direction: SyncDirection.OneWay,
+          direction: SyncDirection.BiDirectional,
           conflictStrategy: "source-wins"
           // No filter = sync everything under root
         },

@@ -396,7 +396,7 @@ export class ConfigRepo implements IConfigRepo {
         this.fullFS,
         replica.syncable,
         {
-          direction: SyncDirection.OneWay,
+          direction: SyncDirection.BiDirectional,
           conflictStrategy: 'source-wins' as any,
           // No filter = sync everything under root
         },
