@@ -421,9 +421,42 @@ registerBackend("GitHub", async (options) => {
   });
 });
 registerBackend("Gitee", async (options) => {
-  const { Gitee } = await import("zen-fs-gitee");
+  const zenGitee = await import("zen-fs-gitee");
+  const { GiteeAPI } = await import("zen-fs-gitee/dist/gitee-api.js");
+  const originalGetTree = GiteeAPI.prototype.getTree;
+  GiteeAPI.prototype.getTree = async function(recursive = true) {
+    try {
+      return await originalGetTree.call(this, recursive);
+    } catch (err) {
+      if (!err.message?.includes("404") && !err.message?.includes("Tree not found")) {
+        throw err;
+      }
+    }
+    console.log(`[Gitee] getTree failed with branch="${this.branch}", resolving to SHA...`);
+    const baseUrl = this.baseUrl || "https://gitee.com/api/v5";
+    const sep = "?";
+    const auth = `access_token=${this.token}`;
+    const branchUrl = `${baseUrl}/repos/${this.owner}/${this.repo}/branches/${this.branch}${sep}${auth}`;
+    const branchRes = await fetch(branchUrl);
+    if (!branchRes.ok) throw new Error(`Gitee: branch "${this.branch}" not found (${branchRes.status})`);
+    const branchData = await branchRes.json();
+    const commitSha = branchData.commit?.sha;
+    if (!commitSha) throw new Error(`Gitee: could not get commit SHA for branch "${this.branch}"`);
+    const commitUrl = `${baseUrl}/repos/${this.owner}/${this.repo}/git/commits/${commitSha}${sep}${auth}`;
+    const commitRes = await fetch(commitUrl);
+    if (!commitRes.ok) throw new Error(`Gitee: commit ${commitSha} not found (${commitRes.status})`);
+    const commitData = await commitRes.json();
+    const treeSha = commitData.tree?.sha;
+    if (!treeSha) throw new Error(`Gitee: could not get tree SHA from commit ${commitSha}`);
+    console.log(`[Gitee] Resolved branch="${this.branch}" \u2192 commit=${commitSha.slice(0, 8)} \u2192 tree=${treeSha.slice(0, 8)}`);
+    const treeUrl = `${baseUrl}/repos/${this.owner}/${this.repo}/git/trees/${treeSha}${sep}recursive=${recursive ? 1 : 0}&${auth}`;
+    const treeRes = await fetch(treeUrl);
+    if (!treeRes.ok) throw new Error(`Gitee: tree ${treeSha} not found (${treeRes.status})`);
+    const treeData = await treeRes.json();
+    return treeData.tree || [];
+  };
   return wrapZenFSFileSystem({
-    backend: Gitee,
+    backend: zenGitee.Gitee,
     token: options.token,
     owner: options.owner,
     repo: options.repo,
