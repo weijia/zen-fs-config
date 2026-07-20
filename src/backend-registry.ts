@@ -228,7 +228,7 @@ registerBackend('GitHub', async (options) => {
   const owner = (options.owner as string) ?? '';
   const repo = (options.repo as string) ?? '';
   const branch = (options.branch as string) ?? 'main';
-  const baseUrl = (options.baseUrl as string) ?? 'https://api.github.com';
+  const baseUrl = (options.baseUrl && (options.baseUrl as string).trim()) || 'https://api.github.com';
 
   if (!owner || !repo) throw new Error('GitHub backend requires "owner" and "repo" options');
 
@@ -349,7 +349,7 @@ registerBackend('Gitee', async (options) => {
   const owner = (options.owner as string) ?? '';
   const repo = (options.repo as string) ?? '';
   const branch = (options.branch as string) ?? 'master';
-  const baseUrl = (options.baseUrl as string) ?? 'https://gitee.com/api/v5';
+  const baseUrl = (options.baseUrl && (options.baseUrl as string).trim()) || 'https://gitee.com/api/v5';
 
   if (!owner || !repo) throw new Error('Gitee backend requires "owner" and "repo" options');
 

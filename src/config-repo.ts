@@ -398,12 +398,12 @@ export class ConfigRepo implements IConfigRepo {
         {
           direction: SyncDirection.OneWay,
           conflictStrategy: 'source-wins' as any,
-          // No filter = sync everything under nodePath
+          // No filter = sync everything under root
         },
-        this.nodePath,
+        '/',
       );
 
-      console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, replica=${replicaId}, root=${this.nodePath}`);
+      console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, replica=${replicaId}, root=/`);
 
       // Register conflict handler
       const conflictHandler: SyncEventHandler = (event: SyncEvent) => {

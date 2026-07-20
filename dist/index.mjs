@@ -367,7 +367,7 @@ registerBackend("GitHub", async (options) => {
   const owner = options.owner ?? "";
   const repo = options.repo ?? "";
   const branch = options.branch ?? "main";
-  const baseUrl = options.baseUrl ?? "https://api.github.com";
+  const baseUrl = options.baseUrl && options.baseUrl.trim() || "https://api.github.com";
   if (!owner || !repo) throw new Error('GitHub backend requires "owner" and "repo" options');
   const headers = {
     "Accept": "application/vnd.github.v3+json",
@@ -484,7 +484,7 @@ registerBackend("Gitee", async (options) => {
   const owner = options.owner ?? "";
   const repo = options.repo ?? "";
   const branch = options.branch ?? "master";
-  const baseUrl = options.baseUrl ?? "https://gitee.com/api/v5";
+  const baseUrl = options.baseUrl && options.baseUrl.trim() || "https://gitee.com/api/v5";
   if (!owner || !repo) throw new Error('Gitee backend requires "owner" and "repo" options');
   const fetchJson = async (url) => {
     const res = await fetch(url);
@@ -1058,11 +1058,11 @@ var ConfigRepo = class {
         {
           direction: SyncDirection.OneWay,
           conflictStrategy: "source-wins"
-          // No filter = sync everything under nodePath
+          // No filter = sync everything under root
         },
-        this.nodePath
+        "/"
       );
-      console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, replica=${replicaId}, root=${this.nodePath}`);
+      console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, replica=${replicaId}, root=/`);
       const conflictHandler = (event) => {
         this.handleConflict(event, { prefix: "/", direction: "one-way" });
       };
