@@ -277,6 +277,34 @@ export class ConfigRepo implements IConfigRepo {
     return Array.from(resultsMap.values());
   }
 
+  /**
+   * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+   *
+   * This ensures the backend topology is available on every replica, enabling
+   * any program that connects to any backend to discover the full topology.
+   *
+   * Called automatically by createConfigRepo() after setupSync().
+   * Can also be called manually after updateBackends() / updateSyncRules().
+   */
+  async syncMetaToReplicas(): Promise<void> {
+    this.assertNotDisposed();
+    for (const metaFile of [BACKENDS_FILE, SYNC_RULES_FILE]) {
+      try {
+        const content = await this.cachedFS.readFile(metaFile);
+        for (const [id, replica] of this.replicaBackends) {
+          try {
+            await replica.syncable.writeFile(metaFile, content);
+            console.log(`[ConfigRepo] Synced ${metaFile} to replica ${id}`);
+          } catch (err: any) {
+            console.error(`[ConfigRepo] Failed to sync ${metaFile} to ${id}:`, err.message);
+          }
+        }
+      } catch {
+        // Meta file might not exist yet (first init edge case)
+      }
+    }
+  }
+
   getSyncStatuses(): Map<string, SyncPairStatus> {
     this.assertNotDisposed();
     return this.syncEngine.getStatusAll();
@@ -756,7 +784,12 @@ export async function createConfigRepo(
             replicas: backendsMeta.backends.map((b) => b.id),
           },
           { prefix: `${NODES_DIR}/`, direction: 'none' },
-          { prefix: `${META_DIR}/`, direction: 'none' },
+          {
+            prefix: `${META_DIR}/`,
+            direction: 'one-way',
+            conflictStrategy: 'source-wins' as any,
+            replicas: backendsMeta.backends.map((b) => b.id),
+          },
         ],
       };
     }
@@ -812,6 +845,9 @@ export async function createConfigRepo(
     backendsMeta.backends,
     options.primaryBackendId,
   );
+
+  // Push .meta/ files to all replicas so topology is available everywhere
+  await repo.syncMetaToReplicas();
 
   await repo.load();
 

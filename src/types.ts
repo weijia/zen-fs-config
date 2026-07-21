@@ -237,6 +237,12 @@ export interface IConfigRepo {
   /** Write .meta/sync-rules.json. */
   updateSyncRules(meta: SyncRulesMeta): Promise<void>;
 
+  /**
+   * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+   * Called automatically by createConfigRepo() after setupSync().
+   */
+  syncMetaToReplicas(): Promise<void>;
+
   /** Dispose: stop all sync, release cache FS and resources. */
   dispose(): Promise<void>;
 }
