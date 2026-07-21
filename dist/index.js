@@ -414,9 +414,12 @@ async function sha256(data) {
     const hex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
     return `sha256:${hex}`;
   }
-  const nodeCrypto = await import("crypto");
-  const hash = nodeCrypto.createHash("sha256").update(Buffer.from(buffer)).digest("hex");
-  return `sha256:${hash}`;
+  if (typeof globalThis.window === "undefined") {
+    const nodeCrypto = await new Function("return import('node:crypto')")();
+    const hash = nodeCrypto.createHash("sha256").update(Buffer.from(buffer)).digest("hex");
+    return `sha256:${hash}`;
+  }
+  throw new Error("SHA-256 not available: neither Web Crypto nor Node.js crypto module found");
 }
 async function readVersion(fs, versionFilePath) {
   try {
@@ -662,6 +665,35 @@ var ConfigRepo = class {
     const resultsMap = await this.syncEngine.syncAll();
     return Array.from(resultsMap.values());
   }
+  /**
+   * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+   *
+   * This ensures the backend topology is available on every replica, enabling
+   * any program that connects to any backend to discover the full topology.
+   *
+   * Called automatically by createConfigRepo() after setupSync().
+   * Can also be called manually after updateBackends() / updateSyncRules().
+   */
+  async syncMetaToReplicas() {
+    this.assertNotDisposed();
+    for (const metaFile of [BACKENDS_FILE, SYNC_RULES_FILE]) {
+      try {
+        const content = await this.cachedFS.readFile(metaFile);
+        const vPath = versionPathFor(metaFile);
+        const vContent = await this.cachedFS.readFile(vPath);
+        for (const [id, replica] of this.replicaBackends) {
+          try {
+            await replica.syncable.writeFile(metaFile, content);
+            await replica.syncable.writeFile(vPath, vContent);
+            console.log(`[ConfigRepo] Synced ${metaFile} + .version to replica ${id}`);
+          } catch (err) {
+            console.error(`[ConfigRepo] Failed to sync ${metaFile} to ${id}:`, err.message);
+          }
+        }
+      } catch {
+      }
+    }
+  }
   getSyncStatuses() {
     this.assertNotDisposed();
     return this.syncEngine.getStatusAll();
@@ -898,12 +930,14 @@ var ConfigRepo = class {
   async writeMetaFile(path, data) {
     console.log(`[writeMetaFile] ${path}, ensuring dir...`);
     await this.ensureDir(path);
-    console.log(`[writeMetaFile] ${path}, writing ${JSON.stringify(data).length} bytes...`);
-    await this.cachedFS.writeFile(
-      path,
-      new TextEncoder().encode(JSON.stringify(data, null, 2))
-    );
-    console.log(`[writeMetaFile] ${path} done`);
+    const bytes = new TextEncoder().encode(JSON.stringify(data, null, 2));
+    console.log(`[writeMetaFile] ${path}, writing ${bytes.length} bytes...`);
+    await this.cachedFS.writeFile(path, bytes);
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, path, bytes, author);
+    await this.ensureDir(versionPathFor(path));
+    await writeVersion(this.fullFS, versionPathFor(path), version);
+    console.log(`[writeMetaFile] ${path} done (version=${version.version})`);
   }
   async readMetaFile(path) {
     try {
@@ -1049,7 +1083,12 @@ async function createConfigRepo(appId, options) {
             replicas: backendsMeta.backends.map((b) => b.id)
           },
           { prefix: `${NODES_DIR}/`, direction: "none" },
-          { prefix: `${META_DIR}/`, direction: "none" }
+          {
+            prefix: `${META_DIR}/`,
+            direction: "one-way",
+            conflictStrategy: "source-wins",
+            replicas: backendsMeta.backends.map((b) => b.id)
+          }
         ]
       };
     }
@@ -1091,6 +1130,7 @@ async function createConfigRepo(appId, options) {
     backendsMeta.backends,
     options.primaryBackendId
   );
+  await repo.syncMetaToReplicas();
   await repo.load();
   return repo;
 }

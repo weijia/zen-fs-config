@@ -170,6 +170,11 @@ interface IConfigRepo {
     getSyncRules(): Promise<SyncRulesMeta | null>;
     /** Write .meta/sync-rules.json. */
     updateSyncRules(meta: SyncRulesMeta): Promise<void>;
+    /**
+     * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+     * Called automatically by createConfigRepo() after setupSync().
+     */
+    syncMetaToReplicas(): Promise<void>;
     /** Dispose: stop all sync, release cache FS and resources. */
     dispose(): Promise<void>;
 }
@@ -254,6 +259,16 @@ declare class ConfigRepo implements IConfigRepo {
     }): Promise<SyncResult>;
     peekNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
     flush(): Promise<SyncResult[]>;
+    /**
+     * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+     *
+     * This ensures the backend topology is available on every replica, enabling
+     * any program that connects to any backend to discover the full topology.
+     *
+     * Called automatically by createConfigRepo() after setupSync().
+     * Can also be called manually after updateBackends() / updateSyncRules().
+     */
+    syncMetaToReplicas(): Promise<void>;
     getSyncStatuses(): Map<string, SyncPairStatus>;
     resolveConflict(conflictId: string, mergedContent: unknown): Promise<void>;
     listConflicts(): Promise<ConflictArchive[]>;
