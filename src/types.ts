@@ -83,18 +83,20 @@ export interface ConflictArchive {
   sourceAuthor: string;
   /** Author of the target side. */
   targetAuthor: string;
-  /** Source side content. */
-  sourceContent: unknown;
-  /** Target side content. */
-  targetContent: unknown;
   /** Source side version. */
   sourceVersion: number;
   /** Target side version. */
   targetVersion: number;
   /** Strategy that was used to auto-resolve (if any). */
   resolvedStrategy?: ConflictStrategy;
-  /** The content that was written as the resolved result (if auto-resolved). */
-  resolvedContent?: unknown;
+
+  // --- Backup file paths (relative to CONFLICTS_DIR) ---
+  /** Path to the source-side backup file. */
+  sourceBackupPath: string;
+  /** Path to the target-side backup file. */
+  targetBackupPath: string;
+  /** Path to the resolved file (present after resolution). */
+  resolvedBackupPath?: string;
 }
 
 /** Information passed to conflict event handlers. */
@@ -224,6 +226,12 @@ export interface IConfigRepo {
 
   /** List all conflict archives. */
   listConflicts(): Promise<ConflictArchive[]>;
+
+  /** Read the raw content of a conflict backup file (source/target/resolved).
+   *  @param conflictId The meta.json path (e.g., "12345_path.conflict/meta.json")
+   *  @param fileType One of "source", "target", or "resolved"
+   */
+  readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
 
   /** Read .meta/backends.json. */
   getBackends(): Promise<BackendsMeta | null>;

@@ -703,9 +703,9 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   async resolveConflict(conflictId, mergedContent) {
     this.assertNotDisposed();
-    const archivePath = `${CONFLICTS_DIR}/${conflictId}`;
+    const metaPath = `${CONFLICTS_DIR}/${conflictId}`;
     try {
-      const raw = await this.cachedFS.readFile(archivePath);
+      const raw = await this.cachedFS.readFile(metaPath);
       const archive = JSON.parse(
         new TextDecoder().decode(toUint8Array(raw))
       );
@@ -720,9 +720,13 @@ var ConfigRepo = class {
         author
       );
       await writeVersion(this.fullFS, versionPathFor(configPath), version);
-      archive.resolvedContent = mergedContent;
+      const conflictDir = metaPath.substring(0, metaPath.lastIndexOf("/"));
+      const resolvedBackupPath = `${conflictDir}/resolved`;
+      const resolvedBytes = typeof mergedContent === "string" ? new TextEncoder().encode(mergedContent) : new TextEncoder().encode(JSON.stringify(mergedContent, null, 2));
+      await this.cachedFS.writeFile(resolvedBackupPath, resolvedBytes);
+      archive.resolvedBackupPath = `./resolved`;
       await this.cachedFS.writeFile(
-        archivePath,
+        metaPath,
         new TextEncoder().encode(JSON.stringify(archive, null, 2))
       );
     } catch (err) {
@@ -735,9 +739,9 @@ var ConfigRepo = class {
     try {
       const entries = await this.cachedFS.readdir(CONFLICTS_DIR);
       for (const entry of entries) {
-        if (!entry.endsWith(".json")) continue;
+        const metaPath = `${CONFLICTS_DIR}/${entry}/meta.json`;
         try {
-          const raw = await this.cachedFS.readFile(`${CONFLICTS_DIR}/${entry}`);
+          const raw = await this.cachedFS.readFile(metaPath);
           const archive = JSON.parse(
             new TextDecoder().decode(toUint8Array(raw))
           );
@@ -748,6 +752,13 @@ var ConfigRepo = class {
     } catch {
     }
     return archives.sort((a, b) => a.timestamp - b.timestamp);
+  }
+  async readConflictBackup(conflictId, fileType) {
+    this.assertNotDisposed();
+    const conflictDir = `${CONFLICTS_DIR}/${conflictId}`.replace(/\/meta\.json$/, "");
+    const filePath = `${conflictDir}/${fileType}`;
+    const raw = await this.cachedFS.readFile(filePath);
+    return new TextDecoder().decode(toUint8Array(raw));
   }
   // -----------------------------------------------------------------------
   // IConfigRepo — Lifecycle
@@ -838,42 +849,54 @@ var ConfigRepo = class {
   async handleConflict(event, _rule) {
     const conflict = event.conflict;
     if (!conflict) return;
+    const conflictId = `${event.timestamp}_${conflict.path.replace(/\//g, "_")}`;
+    const conflictDir = `${CONFLICTS_DIR}/${conflictId}`;
+    const sourceBackupPath = `${conflictDir}/source`;
+    const targetBackupPath = `${conflictDir}/target`;
+    await this.ensureDir(conflictDir);
+    await this.cachedFS.writeFile(
+      sourceBackupPath,
+      new TextEncoder().encode(conflict.sourceContent)
+    );
+    await this.cachedFS.writeFile(
+      targetBackupPath,
+      new TextEncoder().encode(conflict.targetContent)
+    );
+    let sourceVersion = 0;
+    try {
+      const srcVer = await readVersion(this.fullFS, versionPathFor(conflict.path));
+      if (srcVer) sourceVersion = srcVer.version;
+    } catch {
+    }
     const archive = {
       conflictPath: conflict.path,
       timestamp: event.timestamp,
       sourceAuthor: `${this.appId}/${this.nodeId}`,
       targetAuthor: "unknown",
-      sourceContent: this.tryParse(conflict.sourceContent),
-      targetContent: this.tryParse(conflict.targetContent),
-      sourceVersion: 0,
+      sourceVersion,
       targetVersion: 0,
-      resolvedStrategy: conflict.resolvedWith
+      resolvedStrategy: conflict.resolvedWith,
+      sourceBackupPath: `./source`,
+      targetBackupPath: `./target`
     };
-    try {
-      const srcVer = await readVersion(this.fullFS, versionPathFor(conflict.path));
-      if (srcVer) archive.sourceVersion = srcVer.version;
-    } catch {
-    }
-    const archiveFileName = `${event.timestamp}_${conflict.path.replace(/\//g, "_")}.conflict.json`;
-    const archivePath = `${CONFLICTS_DIR}/${archiveFileName}`;
-    await this.ensureDir(archivePath);
+    const metaPath = `${conflictDir}/meta.json`;
     await this.cachedFS.writeFile(
-      archivePath,
+      metaPath,
       new TextEncoder().encode(JSON.stringify(archive, null, 2))
     );
     if (this.onConflictCallback) {
       const info = {
-        conflictId: archiveFileName,
+        conflictId: `${conflictId}/meta.json`,
         path: conflict.path,
         sourceAuthor: archive.sourceAuthor,
         targetAuthor: archive.targetAuthor,
-        sourceContent: archive.sourceContent,
-        targetContent: archive.targetContent
+        sourceContent: this.tryParse(conflict.sourceContent),
+        targetContent: this.tryParse(conflict.targetContent)
       };
       try {
         const customMerge = await this.onConflictCallback(info);
         if (customMerge !== null && customMerge !== void 0) {
-          await this.resolveConflict(archiveFileName, customMerge);
+          await this.resolveConflict(`${conflictId}/meta.json`, customMerge);
         }
       } catch (err) {
         console.error("[zen-fs-config] Conflict handler error:", err);
