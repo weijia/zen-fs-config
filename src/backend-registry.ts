@@ -2,10 +2,17 @@
  * zen-fs-config — Backend Registry
  *
  * A pluggable registry that maps backend type names to factory functions.
- * Built-in support for ZenFS backends (InMemory, IndexedDB, etc.)
- * loaded from @zenfs/core.
  *
- * Users can register custom backends via `registerBackend()`.
+ * Core principle: zen-fs-config does NOT hardcode every ZenFS backend.
+ * Instead, it provides:
+ *   1. A simple registry API (registerBackend, createBackend, etc.)
+ *   2. One built-in backend (InMemory) — zero extra dependencies
+ *   3. A wrapZenFSFileSystem() helper to adapt any ZenFS FileSystem
+ *      implementation into the BackendInstance interface
+ *
+ * Applications (like zen-fs-config-admin) register whatever backends
+ * they need at startup.  Adding a new backend never requires changing
+ * zen-fs-config itself.
  */
 
 import type { BackendDescriptor } from './types';
@@ -46,6 +53,10 @@ export function registerBackend(type: string, factory: BackendFactory): void {
   registry.set(type, factory);
 }
 
+export function unregisterBackend(type: string): boolean {
+  return registry.delete(type);
+}
+
 export async function createBackend(
   descriptor: Pick<BackendDescriptor, 'type' | 'options'>,
 ): Promise<BackendInstance> {
@@ -69,39 +80,20 @@ export function listBackends(): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in: InMemory Backend
-// ---------------------------------------------------------------------------
-
-/**
- * Wrap ZenFS fs.promises into a BackendInstance.
- *
- * ZenFS backends (StoreFS) use their own internal API (write, stat, mkdir, …).
- * CachedFileSystem needs Node.js-style async API (readFile, writeFile, …).
- * ZenFS provides the Node.js compat layer via `fs.promises` from `@zenfs/core`,
- * but only *after* a backend is configured via `configureSingle`.
- *
- * We isolate each backend into a separate ZenFS instance using Port/Worker,
- * but for InMemory (sync) the simplest approach is to configure VFS once
- * and use fs.promises.
- *
- * To support multiple InMemory instances, we use a counter to create
- * unique Port channels.
- */
-// ---------------------------------------------------------------------------
 // Helper: wrap a ZenFS FileSystem into a BackendInstance
+//
 // Uses resolveMountConfig to create an ISOLATED fs — does NOT touch the
 // global ZenFS VFS (configureSingle). This is critical because multiple
 // backends must coexist without overwriting each other.
+//
+// Exported so that external backend packages can reuse this adapter
+// instead of reimplementing the Node.js-style API bridge.
 // ---------------------------------------------------------------------------
 
-async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
+export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
   const zenfs = await import('@zenfs/core');
   const isolatedFS = await zenfs.resolveMountConfig(config);
 
-  // resolveMountConfig returns a raw ZenFS FileSystem, not the Node.js-style
-  // fs.promises API. We bridge it to our BackendInstance interface.
-  // Key difference from fs.promises.writeFile: FileSystem.write() expects
-  // the file to already exist (it's a low-level API). We must open() first.
   return {
     async readFile(path: string, ...args: any[]): Promise<any> {
       const st = await isolatedFS.stat(path);
@@ -127,15 +119,10 @@ async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
           await isolatedFS.mkdir(dir, { uid: 0, gid: 0, mode: 0o755 });
         }
       }
-      // ZenFS FileSystem is low-level: createFile() creates the inode,
-      // then write() writes data to it. But write() doesn't update the
-      // inode's size — we must call touch() to update metadata so that
-      // subsequent stat() returns the correct size.
       if (!(await isolatedFS.exists(path))) {
         await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
       }
       await isolatedFS.write(path, bytes, 0);
-      // Update inode metadata (size, mtime) — FileSystem.write doesn't do this
       await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
     },
     async readdir(path: string): Promise<string[]> {
@@ -173,6 +160,9 @@ async function wrapZenFSFileSystem(config: any): Promise<BackendInstance> {
 
 // ---------------------------------------------------------------------------
 // Built-in: InMemory
+//
+// The only backend bundled with zen-fs-config.  No extra dependencies
+// beyond @zenfs/core (which is a peer dep anyway).
 // ---------------------------------------------------------------------------
 
 let inMemoryCounter = 0;
@@ -184,294 +174,4 @@ registerBackend('InMemory', async (options) => {
   const label = (options.label as string) ?? `zen-fs-config-${++inMemoryCounter}`;
 
   return wrapZenFSFileSystem({ backend: InMemory, maxSize, label });
-});
-
-// ---------------------------------------------------------------------------
-// Built-in: IndexedDB (via @zenfs/dom)
-// ---------------------------------------------------------------------------
-
-let idbCounter = 0;
-
-registerBackend('IndexedDB', async (options) => {
-  const { IndexedDB } = await import('@zenfs/dom');
-
-  const storeName = (options.storeName as string) ?? `zen-fs-config-${++idbCounter}`;
-
-  return wrapZenFSFileSystem({ backend: IndexedDB, storeName });
-});
-
-// ---------------------------------------------------------------------------
-// Built-in: WebStorage / LocalStorage (via @zenfs/dom)
-// ---------------------------------------------------------------------------
-
-registerBackend('WebStorage', async (options) => {
-  const { WebStorage } = await import('@zenfs/dom');
-
-  const storageType = (options.storageType as string) ?? 'localStorage';
-
-  let storage: Storage;
-  if (storageType === 'sessionStorage' && typeof sessionStorage !== 'undefined') {
-    storage = sessionStorage;
-  } else {
-    storage = localStorage;
-  }
-
-  return wrapZenFSFileSystem({ backend: WebStorage, storage });
-});
-
-// ---------------------------------------------------------------------------
-// Built-in: GitHub (uses zen-fs-github package)
-// ---------------------------------------------------------------------------
-
-registerBackend('GitHub', async (options) => {
-  const { Github } = await import('zen-fs-github');
-  return wrapZenFSFileSystem({
-    backend: Github,
-    token: options.token,
-    owner: options.owner,
-    repo: options.repo,
-    branch: options.branch,
-    baseUrl: (options.baseUrl && (options.baseUrl as string).trim()) || undefined,
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Built-in: Gitee (uses zen-fs-gitee package)
-// ---------------------------------------------------------------------------
-
-registerBackend('Gitee', async (options) => {
-  const zenGitee = await import('zen-fs-gitee');
-
-  // Gitee's /git/trees/{sha} requires a SHA, not a branch name (unlike GitHub).
-  // Patch GiteeFS.prototype.init so that after indexing it resolves the branch
-  // name to a tree SHA on the first 404.
-  const { GiteeFS } = zenGitee as any;
-  const origInit = GiteeFS.prototype.init;
-
-  // Use a WeakSet to avoid double-patching
-  const patched = new WeakSet();
-  GiteeFS.prototype.init = async function (this: any) {
-    let firstErr: any;
-    try {
-      return await origInit.call(this);
-    } catch (err: any) {
-      if (!err.message?.includes('404') && !err.message?.includes('Tree not found')) {
-        throw err;
-      }
-      firstErr = err;
-    }
-    // getTree inside init() failed — resolve branch → SHA and retry
-    if (patched.has(this)) throw firstErr;
-    patched.add(this);
-
-    console.log(`[Gitee] init failed with branch="${this.api.branch}", resolving to SHA...`);
-    const baseUrl = this.api.baseUrl || 'https://gitee.com/api/v5';
-    const auth = `access_token=${this.api.token}`;
-
-    // GET /repos/{owner}/{repo}/branches/{branch} → commit.sha
-    const branchUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${this.api.branch}?${auth}`;
-    let branchRes = await fetch(branchUrl);
-    let branchData: any;
-
-    if (branchRes.ok) {
-      branchData = await branchRes.json();
-    } else {
-      // Branch doesn't exist — create it from the default branch (master/main)
-      console.log(`[Gitee] Branch "${this.api.branch}" not found, creating...`);
-      const defaultBranch = this.api.branch === 'master' ? 'main' : 'master';
-
-      // Find the default branch's SHA
-      let defaultSha: string | undefined;
-      for (const name of [defaultBranch, 'main', 'master']) {
-        const dr = await fetch(`${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${name}?${auth}`);
-        if (dr.ok) {
-          const dd: any = await dr.json();
-          defaultSha = dd.commit?.sha;
-          if (defaultSha) break;
-        }
-      }
-
-      if (!defaultSha) {
-        // No branches at all — repo might be empty. Just skip tree init gracefully.
-        console.log(`[Gitee] No branches found in repo, skipping tree init`);
-        this.initialized = true;
-        return;
-      }
-
-      // POST /repos/{owner}/{repo}/branches to create branch
-      const createRes = await fetch(`${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches?${auth}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          refs: defaultSha,
-          branch_name: this.api.branch,
-        }),
-      });
-
-      if (!createRes.ok) {
-        const errText = await createRes.text().catch(() => '');
-        throw new Error(`Gitee: failed to create branch "${this.api.branch}": ${createRes.status} ${errText}`);
-      }
-
-      branchData = await createRes.json();
-      console.log(`[Gitee] Branch "${this.api.branch}" created from ${defaultSha.slice(0, 8)}`);
-    }
-
-    const commitSha = branchData.commit?.sha;
-    if (!commitSha) throw new Error(`Gitee: could not get commit SHA for branch "${this.api.branch}"`);
-
-    // GET /repos/{owner}/{repo}/git/commits/{sha} → tree.sha
-    const commitUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/git/commits/${commitSha}?${auth}`;
-    const commitRes = await fetch(commitUrl);
-    if (!commitRes.ok) throw new Error(`Gitee: commit ${commitSha} not found (${commitRes.status})`);
-    const commitData: any = await commitRes.json();
-    const treeSha = commitData.tree?.sha;
-    if (!treeSha) throw new Error(`Gitee: could not get tree SHA from commit ${commitSha}`);
-
-    // Replace branch with tree SHA so getTree() succeeds
-    const realBranch = this.api.branch;
-    this.api.branch = treeSha;
-    console.log(`[Gitee] Resolved branch="${realBranch}" → commit=${commitSha.slice(0, 8)} → tree=${treeSha.slice(0, 8)}`);
-
-    try {
-      return await origInit.call(this);
-    } finally {
-      // Restore original branch name for other API calls (getContents, getRaw, etc.)
-      this.api.branch = realBranch;
-    }
-  };
-
-  return wrapZenFSFileSystem({
-    backend: zenGitee.Gitee,
-    token: options.token,
-    owner: options.owner,
-    repo: options.repo,
-    branch: options.branch,
-    baseUrl: (options.baseUrl && (options.baseUrl as string).trim()) || undefined,
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Built-in: WebDAV
-// ---------------------------------------------------------------------------
-
-registerBackend('WebDAV', async (options) => {
-  const url = (options.url as string) ?? '';
-  const username = (options.username as string) ?? '';
-  const password = (options.password as string) ?? '';
-  const rootPath = (options.rootPath as string) ?? '/';
-
-  if (!url) throw new Error('WebDAV backend requires "url" option');
-
-  const authHeader = username ? `Basic ${btoa(`${username}:${password}`)}` : '';
-
-  const davUrl = (path: string) => {
-    const cleanRoot = rootPath.replace(/\/$/, '');
-    const cleanPath = path.startsWith('/') ? path : `/${path}`;
-    return `${url.replace(/\/$/, '')}${cleanRoot}${cleanPath}`;
-  };
-
-  const davFetch = async (path: string, method: string, body?: any) => {
-    const headers: Record<string, string> = {};
-    if (authHeader) headers['Authorization'] = authHeader;
-    if (body) headers['Content-Type'] = 'application/xml';
-    const res = await fetch(davUrl(path), { method, headers, body });
-    if (!res.ok && res.status !== 404) throw new Error(`WebDAV ${res.status} ${method} ${davUrl(path)}`);
-    return res;
-  };
-
-  const parseMultiStatus = async (res: Response): Promise<{ path: string; isDir: boolean; size: number }[]> => {
-    const text = await res.text();
-    const results: { path: string; isDir: boolean; size: number }[] = [];
-    // Simple XML parsing for DAV:response elements
-    const responses = text.match(/<D:response[^>]*>[\s\S]*?<\/D:response>/gi) || [];
-    for (const resp of responses) {
-      const href = (resp.match(/<D:href>([^<]+)<\/D:href>/i) || [])[1] || '';
-      const isDir = /<D:collection\s*\/>/i.test(resp) || /<D:resourcetype>.*<D:collection/.test(resp);
-      const sizeMatch = resp.match(/<D:getcontentlength>([^<]+)<\/D:getcontentlength>/i);
-      const size = sizeMatch ? parseInt(sizeMatch[1]) : 0;
-      const decoded = decodeURIComponent(href);
-      results.push({ path: decoded, isDir, size });
-    }
-    return results;
-  };
-
-  const exists = async (path: string): Promise<boolean> => {
-    const res = await davFetch(path, 'PROPFIND');
-    return res.ok;
-  };
-
-  const backend: BackendInstance = {
-    async readFile(path: string, ...args: any[]): Promise<any> {
-      const res = await davFetch(path, 'GET');
-      if (!res.ok) throw new Error(`ENOENT: ${path}`);
-      if (args[0] === 'utf-8') return res.text();
-      const buf = await res.arrayBuffer();
-      return new Uint8Array(buf);
-    },
-    async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, _options?: any): Promise<void> {
-      const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
-      if (authHeader) headers['Authorization'] = authHeader;
-      await fetch(davUrl(path), {
-        method: 'PUT',
-        headers,
-        body: data instanceof ArrayBuffer ? data : data instanceof Uint8Array ? new Uint8Array(data).buffer as ArrayBuffer : new TextEncoder().encode(data),
-      });
-    },
-    async readdir(path: string): Promise<string[]> {
-      const headers: Record<string, string> = { Depth: '1' };
-      if (authHeader) headers['Authorization'] = authHeader;
-      const res = await fetch(davUrl(path), { method: 'PROPFIND', headers });
-      if (!res.ok) throw new Error(`WebDAV PROPFIND failed: ${res.status}`);
-      const items = await parseMultiStatus(res);
-      const prefix = davUrl(path);
-      return items
-        .filter(i => i.path !== prefix && i.path !== `${prefix}/`)
-        .map(i => i.path.split('/').filter(Boolean).pop() || '');
-    },
-    async stat(path: string): Promise<any> {
-      const headers: Record<string, string> = { Depth: '0' };
-      if (authHeader) headers['Authorization'] = authHeader;
-      const res = await fetch(davUrl(path), { method: 'PROPFIND', headers });
-      if (!res.ok) throw new Error(`ENOENT: ${path}`);
-      const items = await parseMultiStatus(res);
-      const item = items[0];
-      return { isFile: () => !item.isDir, isDirectory: () => item.isDir, size: item.size };
-    },
-    async exists(path: string): Promise<boolean> {
-      return exists(path);
-    },
-    async mkdir(path: string): Promise<any> {
-      const headers: Record<string, string> = {};
-      if (authHeader) headers['Authorization'] = authHeader;
-      const res = await fetch(davUrl(path), { method: 'MKCOL', headers });
-      if (!res.ok && res.status !== 405) throw new Error(`WebDAV MKCOL failed: ${res.status}`);
-    },
-    async unlink(path: string): Promise<void> {
-      await davFetch(path, 'DELETE');
-    },
-    async rmdir(path: string): Promise<void> {
-      const items = await (async () => {
-        const headers: Record<string, string> = { Depth: '1' };
-        if (authHeader) headers['Authorization'] = authHeader;
-        const res = await fetch(davUrl(path), { method: 'PROPFIND', headers });
-        if (!res.ok) return [];
-        const parsed = await parseMultiStatus(res);
-        const prefix = davUrl(path);
-        return parsed.filter(i => i.path !== prefix && i.path !== `${prefix}/`);
-      })();
-      for (const item of items) {
-        if (item.isDir) await backend.rmdir!(item.path);
-        else await backend.unlink(item.path);
-      }
-      await davFetch(path, 'DELETE');
-    },
-    async rename(oldPath: string, newPath: string): Promise<void> {
-      const headers: Record<string, string> = { Destination: davUrl(newPath) };
-      if (authHeader) headers['Authorization'] = authHeader;
-      await fetch(davUrl(oldPath), { method: 'MOVE', headers });
-    },
-  };
-
-  return backend;
 });

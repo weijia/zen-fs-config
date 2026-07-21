@@ -10,7 +10,7 @@
 export { createConfigRepo, ConfigRepo } from './config-repo';
 
 // Backend registry
-export { registerBackend, createBackend, hasBackend, listBackends } from './backend-registry';
+export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, wrapZenFSFileSystem } from './backend-registry';
 export type { BackendFactory, BackendInstance } from './backend-registry';
 
 // Serializers

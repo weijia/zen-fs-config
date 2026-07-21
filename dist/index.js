@@ -42,8 +42,10 @@ __export(index_exports, {
   readVersion: () => readVersion,
   registerBackend: () => registerBackend,
   sha256: () => sha256,
+  unregisterBackend: () => unregisterBackend,
   verifyOrRepairVersion: () => verifyOrRepairVersion,
   versionPathFor: () => versionPathFor,
+  wrapZenFSFileSystem: () => wrapZenFSFileSystem,
   writeVersion: () => writeVersion
 });
 module.exports = __toCommonJS(index_exports);
@@ -311,6 +313,9 @@ var registry = /* @__PURE__ */ new Map();
 function registerBackend(type, factory) {
   registry.set(type, factory);
 }
+function unregisterBackend(type) {
+  return registry.delete(type);
+}
 async function createBackend(descriptor) {
   const factory = registry.get(descriptor.type);
   if (!factory) {
@@ -391,226 +396,6 @@ registerBackend("InMemory", async (options) => {
   const maxSize = options.maxSize ?? 100 * 1024 * 1024;
   const label = options.label ?? `zen-fs-config-${++inMemoryCounter}`;
   return wrapZenFSFileSystem({ backend: InMemory, maxSize, label });
-});
-var idbCounter = 0;
-registerBackend("IndexedDB", async (options) => {
-  const { IndexedDB } = await import("@zenfs/dom");
-  const storeName = options.storeName ?? `zen-fs-config-${++idbCounter}`;
-  return wrapZenFSFileSystem({ backend: IndexedDB, storeName });
-});
-registerBackend("WebStorage", async (options) => {
-  const { WebStorage } = await import("@zenfs/dom");
-  const storageType = options.storageType ?? "localStorage";
-  let storage;
-  if (storageType === "sessionStorage" && typeof sessionStorage !== "undefined") {
-    storage = sessionStorage;
-  } else {
-    storage = localStorage;
-  }
-  return wrapZenFSFileSystem({ backend: WebStorage, storage });
-});
-registerBackend("GitHub", async (options) => {
-  const { Github } = await import("zen-fs-github");
-  return wrapZenFSFileSystem({
-    backend: Github,
-    token: options.token,
-    owner: options.owner,
-    repo: options.repo,
-    branch: options.branch,
-    baseUrl: options.baseUrl && options.baseUrl.trim() || void 0
-  });
-});
-registerBackend("Gitee", async (options) => {
-  const zenGitee = await import("zen-fs-gitee");
-  const { GiteeFS } = zenGitee;
-  const origInit = GiteeFS.prototype.init;
-  const patched = /* @__PURE__ */ new WeakSet();
-  GiteeFS.prototype.init = async function() {
-    let firstErr;
-    try {
-      return await origInit.call(this);
-    } catch (err) {
-      if (!err.message?.includes("404") && !err.message?.includes("Tree not found")) {
-        throw err;
-      }
-      firstErr = err;
-    }
-    if (patched.has(this)) throw firstErr;
-    patched.add(this);
-    console.log(`[Gitee] init failed with branch="${this.api.branch}", resolving to SHA...`);
-    const baseUrl = this.api.baseUrl || "https://gitee.com/api/v5";
-    const auth = `access_token=${this.api.token}`;
-    const branchUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${this.api.branch}?${auth}`;
-    let branchRes = await fetch(branchUrl);
-    let branchData;
-    if (branchRes.ok) {
-      branchData = await branchRes.json();
-    } else {
-      console.log(`[Gitee] Branch "${this.api.branch}" not found, creating...`);
-      const defaultBranch = this.api.branch === "master" ? "main" : "master";
-      let defaultSha;
-      for (const name of [defaultBranch, "main", "master"]) {
-        const dr = await fetch(`${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches/${name}?${auth}`);
-        if (dr.ok) {
-          const dd = await dr.json();
-          defaultSha = dd.commit?.sha;
-          if (defaultSha) break;
-        }
-      }
-      if (!defaultSha) {
-        console.log(`[Gitee] No branches found in repo, skipping tree init`);
-        this.initialized = true;
-        return;
-      }
-      const createRes = await fetch(`${baseUrl}/repos/${this.api.owner}/${this.api.repo}/branches?${auth}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          refs: defaultSha,
-          branch_name: this.api.branch
-        })
-      });
-      if (!createRes.ok) {
-        const errText = await createRes.text().catch(() => "");
-        throw new Error(`Gitee: failed to create branch "${this.api.branch}": ${createRes.status} ${errText}`);
-      }
-      branchData = await createRes.json();
-      console.log(`[Gitee] Branch "${this.api.branch}" created from ${defaultSha.slice(0, 8)}`);
-    }
-    const commitSha = branchData.commit?.sha;
-    if (!commitSha) throw new Error(`Gitee: could not get commit SHA for branch "${this.api.branch}"`);
-    const commitUrl = `${baseUrl}/repos/${this.api.owner}/${this.api.repo}/git/commits/${commitSha}?${auth}`;
-    const commitRes = await fetch(commitUrl);
-    if (!commitRes.ok) throw new Error(`Gitee: commit ${commitSha} not found (${commitRes.status})`);
-    const commitData = await commitRes.json();
-    const treeSha = commitData.tree?.sha;
-    if (!treeSha) throw new Error(`Gitee: could not get tree SHA from commit ${commitSha}`);
-    const realBranch = this.api.branch;
-    this.api.branch = treeSha;
-    console.log(`[Gitee] Resolved branch="${realBranch}" \u2192 commit=${commitSha.slice(0, 8)} \u2192 tree=${treeSha.slice(0, 8)}`);
-    try {
-      return await origInit.call(this);
-    } finally {
-      this.api.branch = realBranch;
-    }
-  };
-  return wrapZenFSFileSystem({
-    backend: zenGitee.Gitee,
-    token: options.token,
-    owner: options.owner,
-    repo: options.repo,
-    branch: options.branch,
-    baseUrl: options.baseUrl && options.baseUrl.trim() || void 0
-  });
-});
-registerBackend("WebDAV", async (options) => {
-  const url = options.url ?? "";
-  const username = options.username ?? "";
-  const password = options.password ?? "";
-  const rootPath = options.rootPath ?? "/";
-  if (!url) throw new Error('WebDAV backend requires "url" option');
-  const authHeader = username ? `Basic ${btoa(`${username}:${password}`)}` : "";
-  const davUrl = (path) => {
-    const cleanRoot = rootPath.replace(/\/$/, "");
-    const cleanPath = path.startsWith("/") ? path : `/${path}`;
-    return `${url.replace(/\/$/, "")}${cleanRoot}${cleanPath}`;
-  };
-  const davFetch = async (path, method, body) => {
-    const headers = {};
-    if (authHeader) headers["Authorization"] = authHeader;
-    if (body) headers["Content-Type"] = "application/xml";
-    const res = await fetch(davUrl(path), { method, headers, body });
-    if (!res.ok && res.status !== 404) throw new Error(`WebDAV ${res.status} ${method} ${davUrl(path)}`);
-    return res;
-  };
-  const parseMultiStatus = async (res) => {
-    const text = await res.text();
-    const results = [];
-    const responses = text.match(/<D:response[^>]*>[\s\S]*?<\/D:response>/gi) || [];
-    for (const resp of responses) {
-      const href = (resp.match(/<D:href>([^<]+)<\/D:href>/i) || [])[1] || "";
-      const isDir = /<D:collection\s*\/>/i.test(resp) || /<D:resourcetype>.*<D:collection/.test(resp);
-      const sizeMatch = resp.match(/<D:getcontentlength>([^<]+)<\/D:getcontentlength>/i);
-      const size = sizeMatch ? parseInt(sizeMatch[1]) : 0;
-      const decoded = decodeURIComponent(href);
-      results.push({ path: decoded, isDir, size });
-    }
-    return results;
-  };
-  const exists = async (path) => {
-    const res = await davFetch(path, "PROPFIND");
-    return res.ok;
-  };
-  const backend = {
-    async readFile(path, ...args) {
-      const res = await davFetch(path, "GET");
-      if (!res.ok) throw new Error(`ENOENT: ${path}`);
-      if (args[0] === "utf-8") return res.text();
-      const buf = await res.arrayBuffer();
-      return new Uint8Array(buf);
-    },
-    async writeFile(path, data, _options) {
-      const headers = { "Content-Type": "application/octet-stream" };
-      if (authHeader) headers["Authorization"] = authHeader;
-      await fetch(davUrl(path), {
-        method: "PUT",
-        headers,
-        body: data instanceof ArrayBuffer ? data : data instanceof Uint8Array ? new Uint8Array(data).buffer : new TextEncoder().encode(data)
-      });
-    },
-    async readdir(path) {
-      const headers = { Depth: "1" };
-      if (authHeader) headers["Authorization"] = authHeader;
-      const res = await fetch(davUrl(path), { method: "PROPFIND", headers });
-      if (!res.ok) throw new Error(`WebDAV PROPFIND failed: ${res.status}`);
-      const items = await parseMultiStatus(res);
-      const prefix = davUrl(path);
-      return items.filter((i) => i.path !== prefix && i.path !== `${prefix}/`).map((i) => i.path.split("/").filter(Boolean).pop() || "");
-    },
-    async stat(path) {
-      const headers = { Depth: "0" };
-      if (authHeader) headers["Authorization"] = authHeader;
-      const res = await fetch(davUrl(path), { method: "PROPFIND", headers });
-      if (!res.ok) throw new Error(`ENOENT: ${path}`);
-      const items = await parseMultiStatus(res);
-      const item = items[0];
-      return { isFile: () => !item.isDir, isDirectory: () => item.isDir, size: item.size };
-    },
-    async exists(path) {
-      return exists(path);
-    },
-    async mkdir(path) {
-      const headers = {};
-      if (authHeader) headers["Authorization"] = authHeader;
-      const res = await fetch(davUrl(path), { method: "MKCOL", headers });
-      if (!res.ok && res.status !== 405) throw new Error(`WebDAV MKCOL failed: ${res.status}`);
-    },
-    async unlink(path) {
-      await davFetch(path, "DELETE");
-    },
-    async rmdir(path) {
-      const items = await (async () => {
-        const headers = { Depth: "1" };
-        if (authHeader) headers["Authorization"] = authHeader;
-        const res = await fetch(davUrl(path), { method: "PROPFIND", headers });
-        if (!res.ok) return [];
-        const parsed = await parseMultiStatus(res);
-        const prefix = davUrl(path);
-        return parsed.filter((i) => i.path !== prefix && i.path !== `${prefix}/`);
-      })();
-      for (const item of items) {
-        if (item.isDir) await backend.rmdir(item.path);
-        else await backend.unlink(item.path);
-      }
-      await davFetch(path, "DELETE");
-    },
-    async rename(oldPath, newPath) {
-      const headers = { Destination: davUrl(newPath) };
-      if (authHeader) headers["Authorization"] = authHeader;
-      await fetch(davUrl(oldPath), { method: "MOVE", headers });
-    }
-  };
-  return backend;
 });
 
 // src/version.ts
@@ -1323,7 +1108,9 @@ async function createConfigRepo(appId, options) {
   readVersion,
   registerBackend,
   sha256,
+  unregisterBackend,
   verifyOrRepairVersion,
   versionPathFor,
+  wrapZenFSFileSystem,
   writeVersion
 });

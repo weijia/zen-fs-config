@@ -279,10 +279,17 @@ declare function createConfigRepo(appId: string, options: ConfigRepoOptions): Pr
  * zen-fs-config — Backend Registry
  *
  * A pluggable registry that maps backend type names to factory functions.
- * Built-in support for ZenFS backends (InMemory, IndexedDB, etc.)
- * loaded from @zenfs/core.
  *
- * Users can register custom backends via `registerBackend()`.
+ * Core principle: zen-fs-config does NOT hardcode every ZenFS backend.
+ * Instead, it provides:
+ *   1. A simple registry API (registerBackend, createBackend, etc.)
+ *   2. One built-in backend (InMemory) — zero extra dependencies
+ *   3. A wrapZenFSFileSystem() helper to adapt any ZenFS FileSystem
+ *      implementation into the BackendInstance interface
+ *
+ * Applications (like zen-fs-config-admin) register whatever backends
+ * they need at startup.  Adding a new backend never requires changing
+ * zen-fs-config itself.
  */
 
 type BackendFactory = (options: Record<string, unknown>) => Promise<BackendInstance>;
@@ -304,9 +311,11 @@ interface BackendInstance {
     getRevision?(path: string): Promise<string | number | undefined>;
 }
 declare function registerBackend(type: string, factory: BackendFactory): void;
+declare function unregisterBackend(type: string): boolean;
 declare function createBackend(descriptor: Pick<BackendDescriptor, 'type' | 'options'>): Promise<BackendInstance>;
 declare function hasBackend(type: string): boolean;
 declare function listBackends(): string[];
+declare function wrapZenFSFileSystem(config: any): Promise<BackendInstance>;
 
 /**
  * zen-fs-config — Sidecar Version File Management
@@ -350,4 +359,4 @@ declare function incrementVersion(fs: SyncableFS, configFilePath: string, newCon
  */
 declare function verifyOrRepairVersion(fs: SyncableFS, configFilePath: string, author: string): Promise<VersionMeta | null>;
 
-export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type BootstrapData, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type SyncRule, type SyncRulesMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, verifyOrRepairVersion, versionPathFor, writeVersion };
+export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type BootstrapData, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type SyncRule, type SyncRulesMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };

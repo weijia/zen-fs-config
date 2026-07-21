@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-config",
-  "version": "0.3.16",
+  "version": "0.3.17",
   "description": "Distributed config management library built on ZenFS, zen-fs-cache, and zen-fs-sync",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -21,6 +21,8 @@
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
@@ -39,20 +41,15 @@
   "peerDependencies": {
     "@zenfs/core": ">=2.3.0",
     "zen-fs-cache": ">=1.0.0",
-    "zen-fs-gitee": ">=1.0.0",
-    "zen-fs-github": ">=1.0.0",
     "zen-fs-sync": ">=0.1.0"
   },
   "devDependencies": {
     "@zenfs/core": "^2.5.7",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
+    "vitest": "^1.6.1",
     "zen-fs-cache": "^1.0.1",
-    "zen-fs-gitee": "^1.0.0",
-    "zen-fs-github": "^1.0.0",
     "zen-fs-sync": "^0.1.0"
   },
-  "dependencies": {
-    "@zenfs/dom": "^1.2.9"
-  }
+  "dependencies": {}
 }
