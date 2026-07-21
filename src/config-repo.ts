@@ -291,10 +291,13 @@ export class ConfigRepo implements IConfigRepo {
     for (const metaFile of [BACKENDS_FILE, SYNC_RULES_FILE]) {
       try {
         const content = await this.cachedFS.readFile(metaFile);
+        const vPath = versionPathFor(metaFile);
+        const vContent = await this.cachedFS.readFile(vPath);
         for (const [id, replica] of this.replicaBackends) {
           try {
             await replica.syncable.writeFile(metaFile, content);
-            console.log(`[ConfigRepo] Synced ${metaFile} to replica ${id}`);
+            await replica.syncable.writeFile(vPath, vContent);
+            console.log(`[ConfigRepo] Synced ${metaFile} + .version to replica ${id}`);
           } catch (err: any) {
             console.error(`[ConfigRepo] Failed to sync ${metaFile} to ${id}:`, err.message);
           }
@@ -590,12 +593,17 @@ export class ConfigRepo implements IConfigRepo {
   async writeMetaFile(path: string, data: BackendsMeta | SyncRulesMeta): Promise<void> {
     console.log(`[writeMetaFile] ${path}, ensuring dir...`);
     await this.ensureDir(path);
-    console.log(`[writeMetaFile] ${path}, writing ${JSON.stringify(data).length} bytes...`);
-    await this.cachedFS.writeFile(
-      path,
-      new TextEncoder().encode(JSON.stringify(data, null, 2)),
-    );
-    console.log(`[writeMetaFile] ${path} done`);
+
+    const bytes = new TextEncoder().encode(JSON.stringify(data, null, 2));
+    console.log(`[writeMetaFile] ${path}, writing ${bytes.length} bytes...`);
+    await this.cachedFS.writeFile(path, bytes);
+
+    // Generate version sidecar for meta files, same as config data files
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, path, bytes, author);
+    await this.ensureDir(versionPathFor(path));
+    await writeVersion(this.fullFS, versionPathFor(path), version);
+    console.log(`[writeMetaFile] ${path} done (version=${version.version})`);
   }
 
   async readMetaFile<T>(path: string): Promise<T | null> {
