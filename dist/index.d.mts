@@ -1,4 +1,4 @@
-import { ConflictStrategy, SyncResult, SyncPairStatus, SyncableFS } from 'zen-fs-sync';
+import { SyncResult, SyncPairStatus, ConflictStrategy, SyncableFS } from 'zen-fs-sync';
 export { SyncPairStatus, SyncResult } from 'zen-fs-sync';
 import * as node_fs from 'node:fs';
 
@@ -17,24 +17,6 @@ interface BackendDescriptor {
 interface BackendsMeta {
     version: 1;
     backends: BackendDescriptor[];
-}
-/** Sync direction for a path prefix. */
-type SyncDirection = 'one-way' | 'bi-directional' | 'none';
-/** A single sync rule. */
-interface SyncRule {
-    /** Path prefix this rule applies to (e.g., "/app-a/"). */
-    prefix: string;
-    /** Sync direction. */
-    direction: SyncDirection;
-    /** Conflict resolution strategy (only relevant for bi-directional). */
-    conflictStrategy?: ConflictStrategy;
-    /** IDs of replica backends to sync with (from .meta/backends.json). */
-    replicas?: string[];
-}
-/** Content of `.meta/sync-rules.json`. */
-interface SyncRulesMeta {
-    version: 1;
-    rules: SyncRule[];
 }
 /** Content of a sidecar `.version` file. */
 interface VersionMeta {
@@ -103,11 +85,6 @@ interface CacheOptions {
     /** TTL in milliseconds for cache hits without revalidation. Default: 0 (always revalidate). */
     ttlMs?: number;
 }
-/** Bootstrap data, written to .meta/ only on first initialization. */
-interface BootstrapData {
-    backends: Omit<BackendDescriptor, 'description'>[];
-    syncRules: SyncRule[];
-}
 /** Options for creating a ConfigRepo. */
 interface ConfigRepoOptions {
     /** The backend ID (from .meta/backends.json) to use as this instance's primary. */
@@ -121,8 +98,6 @@ interface ConfigRepoOptions {
     nodeId?: string;
     /** Cache configuration. */
     cache?: CacheOptions;
-    /** Bootstrap data (only used when .meta/backends.json doesn't exist). */
-    bootstrap?: BootstrapData;
     /** Custom serializer. */
     serializer?: ConfigSerializer;
     /** Custom conflict handler. Called before auto-resolution. */
@@ -171,12 +146,8 @@ interface IConfigRepo {
     getBackends(): Promise<BackendsMeta | null>;
     /** Write .meta/backends.json. */
     updateBackends(meta: BackendsMeta): Promise<void>;
-    /** Read .meta/sync-rules.json. */
-    getSyncRules(): Promise<SyncRulesMeta | null>;
-    /** Write .meta/sync-rules.json. */
-    updateSyncRules(meta: SyncRulesMeta): Promise<void>;
     /**
-     * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+     * Sync .meta/ files (backends.json) to all replica backends.
      * Called automatically by createConfigRepo() after setupSync().
      */
     syncMetaToReplicas(): Promise<void>;
@@ -265,13 +236,12 @@ declare class ConfigRepo implements IConfigRepo {
     peekNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
     flush(): Promise<SyncResult[]>;
     /**
-     * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+     * Sync .meta/ files (backends.json) to all replica backends.
      *
      * This ensures the backend topology is available on every replica, enabling
      * any program that connects to any backend to discover the full topology.
      *
      * Called automatically by createConfigRepo() after setupSync().
-     * Can also be called manually after updateBackends() / updateSyncRules().
      */
     syncMetaToReplicas(): Promise<void>;
     getSyncStatuses(): Map<string, SyncPairStatus>;
@@ -285,12 +255,10 @@ declare class ConfigRepo implements IConfigRepo {
     private handleConflict;
     private ensureDir;
     private walkDir;
-    writeMetaFile(path: string, data: BackendsMeta | SyncRulesMeta): Promise<void>;
+    writeMetaFile(path: string, data: BackendsMeta): Promise<void>;
     readMetaFile<T>(path: string): Promise<T | null>;
     getBackends(): Promise<BackendsMeta | null>;
     updateBackends(meta: BackendsMeta): Promise<void>;
-    getSyncRules(): Promise<SyncRulesMeta | null>;
-    updateSyncRules(meta: SyncRulesMeta): Promise<void>;
     private tryParse;
     private assertNotDisposed;
 }
@@ -380,4 +348,4 @@ declare function incrementVersion(fs: SyncableFS, configFilePath: string, newCon
  */
 declare function verifyOrRepairVersion(fs: SyncableFS, configFilePath: string, author: string): Promise<VersionMeta | null>;
 
-export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type BootstrapData, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type SyncRule, type SyncRulesMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };
+export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };

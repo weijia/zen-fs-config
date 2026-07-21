@@ -23,14 +23,11 @@ export { versionPathFor, sha256, readVersion, writeVersion, incrementVersion, ve
 export type {
   BackendDescriptor,
   BackendsMeta,
-  SyncRule,
-  SyncRulesMeta,
   VersionMeta,
   ConflictArchive,
   ConflictInfo,
   ConfigSerializer,
   CacheOptions,
-  BootstrapData,
   ConfigRepoOptions,
   IConfigRepo,
 } from './types';

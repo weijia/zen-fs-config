@@ -17,8 +17,6 @@ import type {
   IConfigRepo,
   ConfigRepoOptions,
   BackendsMeta,
-  SyncRulesMeta,
-  SyncRule,
   BackendDescriptor,
   ConflictArchive,
   ConflictInfo,
@@ -36,7 +34,6 @@ import { versionPathFor, incrementVersion, writeVersion, readVersion } from './v
 
 const META_DIR = '/.meta';
 const BACKENDS_FILE = `${META_DIR}/backends.json`;
-const SYNC_RULES_FILE = `${META_DIR}/sync-rules.json`;
 const CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
@@ -119,12 +116,6 @@ export class ConfigRepo implements IConfigRepo {
           version: 1,
           backends: data.backends,
         } as BackendsMeta);
-      }
-      if (data.syncRules) {
-        await this.writeMetaFile(SYNC_RULES_FILE, {
-          version: 1,
-          rules: data.syncRules,
-        } as SyncRulesMeta);
       }
     }
 
@@ -278,33 +269,30 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+   * Sync .meta/ files (backends.json) to all replica backends.
    *
    * This ensures the backend topology is available on every replica, enabling
    * any program that connects to any backend to discover the full topology.
    *
    * Called automatically by createConfigRepo() after setupSync().
-   * Can also be called manually after updateBackends() / updateSyncRules().
    */
   async syncMetaToReplicas(): Promise<void> {
     this.assertNotDisposed();
-    for (const metaFile of [BACKENDS_FILE, SYNC_RULES_FILE]) {
-      try {
-        const content = await this.cachedFS.readFile(metaFile);
-        const vPath = versionPathFor(metaFile);
-        const vContent = await this.cachedFS.readFile(vPath);
-        for (const [id, replica] of this.replicaBackends) {
-          try {
-            await replica.syncable.writeFile(metaFile, content);
-            await replica.syncable.writeFile(vPath, vContent);
-            console.log(`[ConfigRepo] Synced ${metaFile} + .version to replica ${id}`);
-          } catch (err: any) {
-            console.error(`[ConfigRepo] Failed to sync ${metaFile} to ${id}:`, err.message);
-          }
+    try {
+      const content = await this.cachedFS.readFile(BACKENDS_FILE);
+      const vPath = versionPathFor(BACKENDS_FILE);
+      const vContent = await this.cachedFS.readFile(vPath);
+      for (const [id, replica] of this.replicaBackends) {
+        try {
+          await replica.syncable.writeFile(BACKENDS_FILE, content);
+          await replica.syncable.writeFile(vPath, vContent);
+          console.log(`[ConfigRepo] Synced ${BACKENDS_FILE} + .version to replica ${id}`);
+        } catch (err: any) {
+          console.error(`[ConfigRepo] Failed to sync ${BACKENDS_FILE} to ${id}:`, err.message);
         }
-      } catch {
-        // Meta file might not exist yet (first init edge case)
       }
+    } catch {
+      // Meta file might not exist yet (first init edge case)
     }
   }
 
@@ -457,7 +445,7 @@ export class ConfigRepo implements IConfigRepo {
 
       // Register conflict handler
       const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
-        this.handleConflict(event, { prefix: '/', direction: 'one-way' } as any);
+        this.handleConflict(event);
       };
       this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
 
@@ -504,7 +492,7 @@ export class ConfigRepo implements IConfigRepo {
   // Internal — Conflict Handling
   // -----------------------------------------------------------------------
 
-  private async handleConflict(event: SyncEvent, _rule: SyncRule): Promise<void> {
+  private async handleConflict(event: SyncEvent): Promise<void> {
     const conflict = event.conflict;
     if (!conflict) return;
 
@@ -625,7 +613,7 @@ export class ConfigRepo implements IConfigRepo {
     return results;
   }
 
-  async writeMetaFile(path: string, data: BackendsMeta | SyncRulesMeta): Promise<void> {
+  async writeMetaFile(path: string, data: BackendsMeta): Promise<void> {
     console.log(`[writeMetaFile] ${path}, ensuring dir...`);
     await this.ensureDir(path);
 
@@ -662,16 +650,6 @@ export class ConfigRepo implements IConfigRepo {
   async updateBackends(meta: BackendsMeta): Promise<void> {
     this.assertNotDisposed();
     await this.writeMetaFile(BACKENDS_FILE, meta);
-  }
-
-  async getSyncRules(): Promise<SyncRulesMeta | null> {
-    this.assertNotDisposed();
-    return this.readMetaFile<SyncRulesMeta>(SYNC_RULES_FILE);
-  }
-
-  async updateSyncRules(meta: SyncRulesMeta): Promise<void> {
-    this.assertNotDisposed();
-    await this.writeMetaFile(SYNC_RULES_FILE, meta);
   }
 
   private tryParse(content: string): unknown {
@@ -763,24 +741,17 @@ export async function createConfigRepo(
   let backendsMeta = await tempRepo.readMetaFile<BackendsMeta>(BACKENDS_FILE);
 
   if (!backendsMeta) {
-    if (options.bootstrap) {
-      backendsMeta = {
-        version: 1,
-        backends: options.bootstrap.backends,
-      };
-      console.log(`[createConfigRepo] First init: using bootstrap backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
-    } else {
-      backendsMeta = {
-        version: 1,
-        backends: [
-          {
-            id: options.primaryBackendId,
-            type: options.backendInfo.type,
-            options: options.backendInfo.options,
-          },
-        ],
-      };
-    }
+    backendsMeta = {
+      version: 1,
+      backends: [
+        {
+          id: options.primaryBackendId,
+          type: options.backendInfo.type,
+          options: options.backendInfo.options,
+        },
+      ],
+    };
+    console.log(`[createConfigRepo] First init: using bootstrap backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
   } else {
     console.log(`[createConfigRepo] Reconnect: using stored backends: ${backendsMeta.backends.map(b => b.id).join(', ')}`);
   }
@@ -799,54 +770,7 @@ export async function createConfigRepo(
   await tempRepo.writeMetaFile(BACKENDS_FILE, backendsMeta);
 
   // -------------------------------------------------------------------
-  // Step 4: Read or create .meta/sync-rules.json
-  // -------------------------------------------------------------------
-  let syncRulesMeta = await tempRepo.readMetaFile<SyncRulesMeta>(SYNC_RULES_FILE);
-
-  if (!syncRulesMeta) {
-    if (options.bootstrap) {
-      syncRulesMeta = {
-        version: 1,
-        rules: options.bootstrap.syncRules,
-      };
-      console.log(`[createConfigRepo] First init: using bootstrap syncRules: ${syncRulesMeta.rules.length} rules`);
-    } else {
-      syncRulesMeta = {
-        version: 1,
-        rules: [
-          {
-            prefix: `/${appId}/`,
-            direction: 'one-way',
-            conflictStrategy: 'source-wins' as any,
-            replicas: backendsMeta.backends.map((b) => b.id),
-          },
-          {
-            prefix: `${SHARED_DIR}/`,
-            direction: 'bi-directional',
-            conflictStrategy: 'merge' as any,
-            replicas: backendsMeta.backends.map((b) => b.id),
-          },
-          { prefix: `${NODES_DIR}/`, direction: 'none' },
-          {
-            prefix: `${META_DIR}/`,
-            direction: 'one-way',
-            conflictStrategy: 'source-wins' as any,
-            replicas: backendsMeta.backends.map((b) => b.id),
-          },
-        ],
-      };
-    }
-  }
-  
-  // On reconnect, log what we loaded
-  if (syncRulesMeta) {
-    console.log(`[createConfigRepo] Reconnect: using stored syncRules: ${syncRulesMeta.rules.length} rules`);
-  }
-
-  await tempRepo.writeMetaFile(SYNC_RULES_FILE, syncRulesMeta);
-
-  // -------------------------------------------------------------------
-  // Step 5: Determine nodeId
+  // Step 4: Determine nodeId
   // -------------------------------------------------------------------
   let nodeId = options.nodeId;
   if (!nodeId) {
@@ -873,7 +797,7 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 6: Create ConfigRepo and set up sync
+  // Step 5: Create ConfigRepo and set up sync
   // -------------------------------------------------------------------
   const serializer = createSerializerChain(options.serializer);
   const repo = new ConfigRepo(

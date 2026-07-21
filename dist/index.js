@@ -484,10 +484,8 @@ async function verifyOrRepairVersion(fs, configFilePath, author) {
 // src/config-repo.ts
 var META_DIR = "/.meta";
 var BACKENDS_FILE = `${META_DIR}/backends.json`;
-var SYNC_RULES_FILE = `${META_DIR}/sync-rules.json`;
 var CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 var NODES_DIR = "/nodes";
-var SHARED_DIR = "/shared";
 var NODE_ID_FILE = `${NODES_DIR}/.node-id`;
 var ConfigRepo = class {
   appId;
@@ -531,12 +529,6 @@ var ConfigRepo = class {
         await this.writeMetaFile(BACKENDS_FILE, {
           version: 1,
           backends: data.backends
-        });
-      }
-      if (data.syncRules) {
-        await this.writeMetaFile(SYNC_RULES_FILE, {
-          version: 1,
-          rules: data.syncRules
         });
       }
     }
@@ -666,32 +658,29 @@ var ConfigRepo = class {
     return Array.from(resultsMap.values());
   }
   /**
-   * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+   * Sync .meta/ files (backends.json) to all replica backends.
    *
    * This ensures the backend topology is available on every replica, enabling
    * any program that connects to any backend to discover the full topology.
    *
    * Called automatically by createConfigRepo() after setupSync().
-   * Can also be called manually after updateBackends() / updateSyncRules().
    */
   async syncMetaToReplicas() {
     this.assertNotDisposed();
-    for (const metaFile of [BACKENDS_FILE, SYNC_RULES_FILE]) {
-      try {
-        const content = await this.cachedFS.readFile(metaFile);
-        const vPath = versionPathFor(metaFile);
-        const vContent = await this.cachedFS.readFile(vPath);
-        for (const [id, replica] of this.replicaBackends) {
-          try {
-            await replica.syncable.writeFile(metaFile, content);
-            await replica.syncable.writeFile(vPath, vContent);
-            console.log(`[ConfigRepo] Synced ${metaFile} + .version to replica ${id}`);
-          } catch (err) {
-            console.error(`[ConfigRepo] Failed to sync ${metaFile} to ${id}:`, err.message);
-          }
+    try {
+      const content = await this.cachedFS.readFile(BACKENDS_FILE);
+      const vPath = versionPathFor(BACKENDS_FILE);
+      const vContent = await this.cachedFS.readFile(vPath);
+      for (const [id, replica] of this.replicaBackends) {
+        try {
+          await replica.syncable.writeFile(BACKENDS_FILE, content);
+          await replica.syncable.writeFile(vPath, vContent);
+          console.log(`[ConfigRepo] Synced ${BACKENDS_FILE} + .version to replica ${id}`);
+        } catch (err) {
+          console.error(`[ConfigRepo] Failed to sync ${BACKENDS_FILE} to ${id}:`, err.message);
         }
-      } catch {
       }
+    } catch {
     }
   }
   getSyncStatuses() {
@@ -810,7 +799,7 @@ var ConfigRepo = class {
       );
       console.log(`[ConfigRepo] Sync pair added: pairId=${pair.pairId}, replica=${replicaId}, root=/`);
       const conflictHandler = (event) => {
-        this.handleConflict(event, { prefix: "/", direction: "one-way" });
+        this.handleConflict(event);
       };
       this.syncEngine.on(pair.pairId, "conflict", conflictHandler);
       this.syncEngine.watch(pair.pairId);
@@ -846,7 +835,7 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   // Internal — Conflict Handling
   // -----------------------------------------------------------------------
-  async handleConflict(event, _rule) {
+  async handleConflict(event) {
     const conflict = event.conflict;
     if (!conflict) return;
     const conflictId = `${event.timestamp}_${conflict.path.replace(/\//g, "_")}`;
@@ -981,14 +970,6 @@ var ConfigRepo = class {
     this.assertNotDisposed();
     await this.writeMetaFile(BACKENDS_FILE, meta);
   }
-  async getSyncRules() {
-    this.assertNotDisposed();
-    return this.readMetaFile(SYNC_RULES_FILE);
-  }
-  async updateSyncRules(meta) {
-    this.assertNotDisposed();
-    await this.writeMetaFile(SYNC_RULES_FILE, meta);
-  }
   tryParse(content) {
     try {
       return JSON.parse(content);
@@ -1049,24 +1030,17 @@ async function createConfigRepo(appId, options) {
   );
   let backendsMeta = await tempRepo.readMetaFile(BACKENDS_FILE);
   if (!backendsMeta) {
-    if (options.bootstrap) {
-      backendsMeta = {
-        version: 1,
-        backends: options.bootstrap.backends
-      };
-      console.log(`[createConfigRepo] First init: using bootstrap backends: ${backendsMeta.backends.map((b) => b.id).join(", ")}`);
-    } else {
-      backendsMeta = {
-        version: 1,
-        backends: [
-          {
-            id: options.primaryBackendId,
-            type: options.backendInfo.type,
-            options: options.backendInfo.options
-          }
-        ]
-      };
-    }
+    backendsMeta = {
+      version: 1,
+      backends: [
+        {
+          id: options.primaryBackendId,
+          type: options.backendInfo.type,
+          options: options.backendInfo.options
+        }
+      ]
+    };
+    console.log(`[createConfigRepo] First init: using bootstrap backends: ${backendsMeta.backends.map((b) => b.id).join(", ")}`);
   } else {
     console.log(`[createConfigRepo] Reconnect: using stored backends: ${backendsMeta.backends.map((b) => b.id).join(", ")}`);
   }
@@ -1081,45 +1055,6 @@ async function createConfigRepo(appId, options) {
     });
   }
   await tempRepo.writeMetaFile(BACKENDS_FILE, backendsMeta);
-  let syncRulesMeta = await tempRepo.readMetaFile(SYNC_RULES_FILE);
-  if (!syncRulesMeta) {
-    if (options.bootstrap) {
-      syncRulesMeta = {
-        version: 1,
-        rules: options.bootstrap.syncRules
-      };
-      console.log(`[createConfigRepo] First init: using bootstrap syncRules: ${syncRulesMeta.rules.length} rules`);
-    } else {
-      syncRulesMeta = {
-        version: 1,
-        rules: [
-          {
-            prefix: `/${appId}/`,
-            direction: "one-way",
-            conflictStrategy: "source-wins",
-            replicas: backendsMeta.backends.map((b) => b.id)
-          },
-          {
-            prefix: `${SHARED_DIR}/`,
-            direction: "bi-directional",
-            conflictStrategy: "merge",
-            replicas: backendsMeta.backends.map((b) => b.id)
-          },
-          { prefix: `${NODES_DIR}/`, direction: "none" },
-          {
-            prefix: `${META_DIR}/`,
-            direction: "one-way",
-            conflictStrategy: "source-wins",
-            replicas: backendsMeta.backends.map((b) => b.id)
-          }
-        ]
-      };
-    }
-  }
-  if (syncRulesMeta) {
-    console.log(`[createConfigRepo] Reconnect: using stored syncRules: ${syncRulesMeta.rules.length} rules`);
-  }
-  await tempRepo.writeMetaFile(SYNC_RULES_FILE, syncRulesMeta);
   let nodeId = options.nodeId;
   if (!nodeId) {
     nodeId = process.env.NODE_ID;

@@ -29,31 +29,6 @@ export interface BackendsMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Sync Rules
-// ---------------------------------------------------------------------------
-
-/** Sync direction for a path prefix. */
-export type SyncDirection = 'one-way' | 'bi-directional' | 'none';
-
-/** A single sync rule. */
-export interface SyncRule {
-  /** Path prefix this rule applies to (e.g., "/app-a/"). */
-  prefix: string;
-  /** Sync direction. */
-  direction: SyncDirection;
-  /** Conflict resolution strategy (only relevant for bi-directional). */
-  conflictStrategy?: ConflictStrategy;
-  /** IDs of replica backends to sync with (from .meta/backends.json). */
-  replicas?: string[];
-}
-
-/** Content of `.meta/sync-rules.json`. */
-export interface SyncRulesMeta {
-  version: 1;
-  rules: SyncRule[];
-}
-
-// ---------------------------------------------------------------------------
 // Version Files (Sidecar)
 // ---------------------------------------------------------------------------
 
@@ -143,12 +118,6 @@ export interface CacheOptions {
   ttlMs?: number;
 }
 
-/** Bootstrap data, written to .meta/ only on first initialization. */
-export interface BootstrapData {
-  backends: Omit<BackendDescriptor, 'description'>[];
-  syncRules: SyncRule[];
-}
-
 /** Options for creating a ConfigRepo. */
 export interface ConfigRepoOptions {
   /** The backend ID (from .meta/backends.json) to use as this instance's primary. */
@@ -165,9 +134,6 @@ export interface ConfigRepoOptions {
 
   /** Cache configuration. */
   cache?: CacheOptions;
-
-  /** Bootstrap data (only used when .meta/backends.json doesn't exist). */
-  bootstrap?: BootstrapData;
 
   /** Custom serializer. */
   serializer?: ConfigSerializer;
@@ -239,14 +205,8 @@ export interface IConfigRepo {
   /** Write .meta/backends.json. */
   updateBackends(meta: BackendsMeta): Promise<void>;
 
-  /** Read .meta/sync-rules.json. */
-  getSyncRules(): Promise<SyncRulesMeta | null>;
-
-  /** Write .meta/sync-rules.json. */
-  updateSyncRules(meta: SyncRulesMeta): Promise<void>;
-
   /**
-   * Sync .meta/ files (backends.json, sync-rules.json) to all replica backends.
+   * Sync .meta/ files (backends.json) to all replica backends.
    * Called automatically by createConfigRepo() after setupSync().
    */
   syncMetaToReplicas(): Promise<void>;
