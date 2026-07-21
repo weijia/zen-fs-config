@@ -49,10 +49,13 @@ export async function sha256(data: Uint8Array): Promise<string> {
     const hex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
     return `sha256:${hex}`;
   }
-  // Node.js fallback
-  const nodeCrypto = await import('node:crypto');
-  const hash = nodeCrypto.createHash('sha256').update(Buffer.from(buffer)).digest('hex');
-  return `sha256:${hash}`;
+  // Node.js fallback — hidden from bundler static analysis via new Function()
+  if (typeof (globalThis as any).window === 'undefined') {
+    const nodeCrypto = await (new Function("return import('node:crypto')")());
+    const hash = nodeCrypto.createHash('sha256').update(Buffer.from(buffer)).digest('hex');
+    return `sha256:${hash}`;
+  }
+  throw new Error('SHA-256 not available: neither Web Crypto nor Node.js crypto module found');
 }
 
 // ---------------------------------------------------------------------------
