@@ -29,6 +29,17 @@ interface VersionMeta {
     /** Timestamp when the version was created. */
     timestamp: number;
 }
+/** Content of a tombstone file in `.meta/.deleted/`. */
+interface TombstoneMeta {
+    /** The deleted file path. */
+    path: string;
+    /** Timestamp of deletion. */
+    deletedAt: number;
+    /** Backend ID that initiated the deletion. */
+    deletedBy: string;
+    /** Backend IDs that have confirmed the deletion (synced). */
+    confirmedBy: string[];
+}
 /** Content of a conflict archive file in `.meta/.conflicts/`. */
 interface ConflictArchive {
     /** The config file path that conflicted. */
@@ -147,6 +158,12 @@ interface IConfigRepo {
     /** Write .meta/backends.json. */
     updateBackends(meta: BackendsMeta): Promise<void>;
     /**
+     * Delete a file and record a tombstone for cross-backend sync.
+     * The tombstone ensures the deletion propagates to all backends
+     * instead of being treated as a "missing file" that gets re-created.
+     */
+    deleteFile(path: string): Promise<void>;
+    /**
      * Sync .meta/ files (backends.json) to all replica backends.
      * Called automatically by createConfigRepo() after setupSync().
      */
@@ -191,80 +208,6 @@ declare function configKeyToFilePath(configPath: string): string;
 declare function getExtension(path: string): string;
 
 /**
- * zen-fs-config — ConfigRepo Implementation
- *
- * Core implementation of IConfigRepo and the createConfigRepo factory.
- */
-
-interface MinimalAsyncFS {
-    readFile(path: string, ...args: any[]): Promise<any>;
-    writeFile(path: string, data: any, options?: any): Promise<void>;
-    readdir(path: string): Promise<string[]>;
-    stat(path: string): Promise<any>;
-    exists(path: string): Promise<boolean>;
-    mkdir(path: string, options?: any): Promise<any>;
-    unlink(path: string): Promise<void>;
-    rmdir?(path: string): Promise<void>;
-    rename?(oldPath: string, newPath: string): Promise<void>;
-}
-declare class ConfigRepo implements IConfigRepo {
-    readonly appId: string;
-    readonly nodeId: string;
-    /** Chroot-isolated fs for app-facing API. Typed as `any` to match `typeof import('node:fs')` duck-typically. */
-    readonly fs: any;
-    /** Un-chrooted fs for low-level browsing. */
-    readonly rootFS: any;
-    private cachedFS;
-    private fullFS;
-    private serializer;
-    private syncEngine;
-    private replicaBackends;
-    private onConflictCallback?;
-    private disposed;
-    private configCache;
-    constructor(appId: string, nodeId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>);
-    /** Full path to this node's directory on the primary backend. */
-    get nodePath(): string;
-    load(rawConfig?: string): Promise<void>;
-    getConfig<T = unknown>(path: string): T;
-    setConfig(path: string, data: unknown): void;
-    getNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
-    setNodeConfig(nodeId: string, path: string, data: unknown): Promise<void>;
-    publishNodeConfig(nodeId: string, options?: {
-        paths?: string[];
-    }): Promise<SyncResult>;
-    peekNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
-    flush(): Promise<SyncResult[]>;
-    /**
-     * Sync .meta/ files (backends.json) to all replica backends.
-     *
-     * This ensures the backend topology is available on every replica, enabling
-     * any program that connects to any backend to discover the full topology.
-     *
-     * Called automatically by createConfigRepo() after setupSync().
-     */
-    syncMetaToReplicas(): Promise<void>;
-    getSyncStatuses(): Map<string, SyncPairStatus>;
-    resolveConflict(conflictId: string, mergedContent: unknown): Promise<void>;
-    listConflicts(): Promise<ConflictArchive[]>;
-    readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
-    dispose(): Promise<void>;
-    setupSync(backends: BackendDescriptor[], primaryBackendId: string): Promise<void>;
-    private persistConfig;
-    private reloadConfigCache;
-    private handleConflict;
-    private ensureDir;
-    private walkDir;
-    writeMetaFile(path: string, data: BackendsMeta): Promise<void>;
-    readMetaFile<T>(path: string): Promise<T | null>;
-    getBackends(): Promise<BackendsMeta | null>;
-    updateBackends(meta: BackendsMeta): Promise<void>;
-    private tryParse;
-    private assertNotDisposed;
-}
-declare function createConfigRepo(appId: string, options: ConfigRepoOptions): Promise<IConfigRepo>;
-
-/**
  * zen-fs-config — Backend Registry
  *
  * A pluggable registry that maps backend type names to factory functions.
@@ -305,6 +248,94 @@ declare function createBackend(descriptor: Pick<BackendDescriptor, 'type' | 'opt
 declare function hasBackend(type: string): boolean;
 declare function listBackends(): string[];
 declare function wrapZenFSFileSystem(config: any): Promise<BackendInstance>;
+
+/**
+ * zen-fs-config — ConfigRepo Implementation
+ *
+ * Core implementation of IConfigRepo and the createConfigRepo factory.
+ */
+
+interface MinimalAsyncFS extends BackendInstance {
+}
+declare class ConfigRepo implements IConfigRepo {
+    readonly appId: string;
+    readonly nodeId: string;
+    /** Chroot-isolated fs for app-facing API. Typed as `any` to match `typeof import('node:fs')` duck-typically. */
+    readonly fs: any;
+    /** Un-chrooted fs for low-level browsing. */
+    readonly rootFS: any;
+    private cachedFS;
+    private fullFS;
+    private serializer;
+    private syncEngine;
+    private replicaBackends;
+    private onConflictCallback?;
+    private disposed;
+    private configCache;
+    private readonly primaryBackendId;
+    constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>);
+    /** Full path to this node's directory on the primary backend. */
+    get nodePath(): string;
+    load(rawConfig?: string): Promise<void>;
+    getConfig<T = unknown>(path: string): T;
+    setConfig(path: string, data: unknown): void;
+    getNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
+    setNodeConfig(nodeId: string, path: string, data: unknown): Promise<void>;
+    publishNodeConfig(nodeId: string, options?: {
+        paths?: string[];
+    }): Promise<SyncResult>;
+    peekNodeConfig<T = unknown>(nodeId: string, path: string): Promise<T>;
+    flush(): Promise<SyncResult[]>;
+    /**
+     * Delete a file and write a tombstone so the deletion propagates
+     * to all backends instead of being treated as "missing file → re-create".
+     */
+    deleteFile(path: string): Promise<void>;
+    /**
+     * Read all tombstones from the primary backend.
+     */
+    private readTombstones;
+    /**
+     * Before sync: for each tombstone, delete the actual file on all replicas.
+     * This prevents bi-directional sync from copying the file back.
+     */
+    private processTombstones;
+    /**
+     * After sync: mark each tombstone as confirmed by all replica backends.
+     */
+    private updateTombstoneConfirmations;
+    /**
+     * GC: remove tombstones where all backends in backends.json have confirmed.
+     */
+    private gcTombstones;
+    /**
+     * Sync .meta/ files (backends.json) to all replica backends.
+     *
+     * This ensures the backend topology is available on every replica, enabling
+     * any program that connects to any backend to discover the full topology.
+     *
+     * Called automatically by createConfigRepo() after setupSync().
+     */
+    syncMetaToReplicas(): Promise<void>;
+    getSyncStatuses(): Map<string, SyncPairStatus>;
+    resolveConflict(conflictId: string, mergedContent: unknown): Promise<void>;
+    listConflicts(): Promise<ConflictArchive[]>;
+    readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
+    dispose(): Promise<void>;
+    setupSync(backends: BackendDescriptor[], primaryBackendId: string): Promise<void>;
+    private persistConfig;
+    private reloadConfigCache;
+    private handleConflict;
+    private ensureDir;
+    private walkDir;
+    writeMetaFile(path: string, data: BackendsMeta): Promise<void>;
+    readMetaFile<T>(path: string): Promise<T | null>;
+    getBackends(): Promise<BackendsMeta | null>;
+    updateBackends(meta: BackendsMeta): Promise<void>;
+    private tryParse;
+    private assertNotDisposed;
+}
+declare function createConfigRepo(appId: string, options: ConfigRepoOptions): Promise<IConfigRepo>;
 
 /**
  * zen-fs-config — Sidecar Version File Management
@@ -348,4 +379,4 @@ declare function incrementVersion(fs: SyncableFS, configFilePath: string, newCon
  */
 declare function verifyOrRepairVersion(fs: SyncableFS, configFilePath: string, author: string): Promise<VersionMeta | null>;
 
-export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };
+export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type TombstoneMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };

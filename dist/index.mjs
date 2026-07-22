@@ -176,8 +176,8 @@ async function ensureParentDir(absolutePath) {
 }
 
 // src/adapters.ts
-function backendToSyncableFS(backend) {
-  return {
+function backendToSyncableFS(backend, name) {
+  const syncable = {
     async readdir(path) {
       return backend.readdir(path);
     },
@@ -203,8 +203,7 @@ function backendToSyncableFS(backend) {
     async stat(path) {
       const s = await backend.stat(path);
       return {
-        isFile: typeof s.isFile === "function" ? () => s.isFile() : () => !!(s.mode && !(s.mode & 16384)),
-        isDirectory: typeof s.isDirectory === "function" ? () => s.isDirectory() : () => !!(s.mode && s.mode & 16384),
+        mode: typeof s.mode === "number" ? s.mode : void 0,
         size: s.size ?? 0,
         mtimeMs: typeof s.mtimeMs === "number" ? s.mtimeMs : s.mtime ? new Date(s.mtime).getTime() : 0
       };
@@ -216,47 +215,14 @@ function backendToSyncableFS(backend) {
       return backend.exists(path);
     }
   };
-}
-function cachedFSToSyncableFS(cached) {
-  return {
-    async readdir(path) {
-      return cached.readdir(path);
-    },
-    async readFile(path, encoding) {
-      const data = await cached.readFile(path);
-      if (encoding) {
-        if (typeof data === "string") return data;
-        return new TextDecoder().decode(
-          data instanceof ArrayBuffer ? new Uint8Array(data) : data
-        );
-      }
-      if (typeof data === "string") return Buffer.from(data);
-      if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
-      return Buffer.from(data);
-    },
-    async writeFile(path, data) {
-      return cached.writeFile(path, data);
-    },
-    async unlink(path) {
-      return cached.unlink(path);
-    },
-    async stat(path) {
-      const s = await cached.stat(path);
-      const isDir = typeof s.isDirectory === "function" ? s.isDirectory() : typeof s.isDirectory === "boolean" ? s.isDirectory : s.mode !== void 0 && (s.mode & 61440) === 16384;
-      return {
-        isFile: () => !isDir,
-        isDirectory: () => isDir,
-        size: s.size,
-        mtimeMs: s.mtimeMs ?? s.mtime
-      };
-    },
-    async mkdir(path, options) {
-      return cached.mkdir(path, options);
-    },
-    async exists(path) {
-      return cached.exists(path);
-    }
-  };
+  if (name) {
+    syncable.backendName = name;
+  } else if (backend.backendName) {
+    syncable.backendName = backend.backendName;
+  } else {
+    syncable.backendName = backend.constructor.name || "Backend";
+  }
+  return syncable;
 }
 
 // src/backend-registry.ts
@@ -316,12 +282,10 @@ async function wrapZenFSFileSystem(config) {
     },
     async stat(path, ..._args) {
       const st = await isolatedFS.stat(path);
-      const isDir = typeof st.isDirectory === "function" ? st.isDirectory() : st.mode !== void 0 && (st.mode & 61440) === 16384;
       return {
-        isFile: () => !isDir,
-        isDirectory: () => isDir,
+        mode: typeof st.mode === "number" ? st.mode : void 0,
         size: st.size,
-        mtime: st.mtimeMs ?? st.mtime
+        mtimeMs: st.mtimeMs ?? st.mtime ?? 0
       };
     },
     async exists(path) {
@@ -436,8 +400,12 @@ async function verifyOrRepairVersion(fs, configFilePath, author) {
 var META_DIR = "/.meta";
 var BACKENDS_FILE = `${META_DIR}/backends.json`;
 var CONFLICTS_DIR = `${META_DIR}/.conflicts`;
+var DELETIONS_DIR = `${META_DIR}/.deleted`;
 var NODES_DIR = "/nodes";
 var NODE_ID_FILE = `${NODES_DIR}/.node-id`;
+function tombstoneFileName(filePath) {
+  return filePath.replace(/^\//, "").replace(/\//g, "__").replace(/\./g, "++") + ".json";
+}
 var ConfigRepo = class {
   appId;
   nodeId;
@@ -453,15 +421,17 @@ var ConfigRepo = class {
   onConflictCallback;
   disposed = false;
   configCache = /* @__PURE__ */ new Map();
-  constructor(appId, nodeId, cachedFS, serializer, onConflict) {
+  primaryBackendId;
+  constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict) {
     this.appId = appId;
     this.nodeId = nodeId;
+    this.primaryBackendId = primaryBackendId;
     this.cachedFS = cachedFS;
     this.serializer = serializer;
     this.syncEngine = new ZenFSSync();
     this.replicaBackends = /* @__PURE__ */ new Map();
     this.onConflictCallback = onConflict;
-    this.fullFS = cachedFSToSyncableFS(cachedFS);
+    this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
     this.rootFS = createChrootFS(cachedFS, "/");
   }
@@ -605,8 +575,140 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   async flush() {
     this.assertNotDisposed();
+    await this.processTombstones();
     const resultsMap = await this.syncEngine.syncAll();
+    await this.updateTombstoneConfirmations();
+    await this.gcTombstones();
     return Array.from(resultsMap.values());
+  }
+  // -----------------------------------------------------------------------
+  // Tombstone (Deletion Tracking)
+  // -----------------------------------------------------------------------
+  /**
+   * Delete a file and write a tombstone so the deletion propagates
+   * to all backends instead of being treated as "missing file → re-create".
+   */
+  async deleteFile(path) {
+    this.assertNotDisposed();
+    const normalizedPath = path.startsWith("/") ? path : "/" + path;
+    const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(normalizedPath)}`;
+    const tombstone = {
+      path: normalizedPath,
+      deletedAt: Date.now(),
+      deletedBy: this.primaryBackendId,
+      confirmedBy: [this.primaryBackendId]
+    };
+    await this.ensureDir(tombstonePath);
+    await this.cachedFS.writeFile(
+      tombstonePath,
+      new TextEncoder().encode(JSON.stringify(tombstone, null, 2))
+    );
+    try {
+      await this.cachedFS.unlink(normalizedPath);
+    } catch {
+    }
+    const versionPath = versionPathFor(normalizedPath);
+    try {
+      await this.cachedFS.unlink(versionPath);
+    } catch {
+    }
+    console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+  }
+  /**
+   * Read all tombstones from the primary backend.
+   */
+  async readTombstones() {
+    try {
+      const entries = await this.cachedFS.readdir(DELETIONS_DIR);
+      const tombstones = [];
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        try {
+          const raw = await this.cachedFS.readFile(`${DELETIONS_DIR}/${entry}`);
+          const data = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          tombstones.push(data);
+        } catch {
+        }
+      }
+      return tombstones;
+    } catch {
+      return [];
+    }
+  }
+  /**
+   * Before sync: for each tombstone, delete the actual file on all replicas.
+   * This prevents bi-directional sync from copying the file back.
+   */
+  async processTombstones() {
+    const tombstones = await this.readTombstones();
+    if (tombstones.length === 0) return;
+    console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
+    for (const tombstone of tombstones) {
+      try {
+        await this.cachedFS.unlink(tombstone.path);
+      } catch {
+      }
+      try {
+        await this.cachedFS.unlink(versionPathFor(tombstone.path));
+      } catch {
+      }
+      for (const [replicaId, replica] of this.replicaBackends) {
+        try {
+          await replica.instance.unlink(tombstone.path);
+        } catch {
+        }
+        try {
+          await replica.instance.unlink(versionPathFor(tombstone.path));
+        } catch {
+        }
+        console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+      }
+    }
+  }
+  /**
+   * After sync: mark each tombstone as confirmed by all replica backends.
+   */
+  async updateTombstoneConfirmations() {
+    const tombstones = await this.readTombstones();
+    if (tombstones.length === 0) return;
+    const backendsMeta = await this.getBackends();
+    const allBackendIds = backendsMeta?.backends.map((b) => b.id) ?? [this.primaryBackendId];
+    for (const tombstone of tombstones) {
+      const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
+      for (const replicaId of this.replicaBackends.keys()) {
+        if (!tombstone.confirmedBy.includes(replicaId)) {
+          tombstone.confirmedBy.push(replicaId);
+        }
+      }
+      try {
+        await this.cachedFS.writeFile(
+          tombstonePath,
+          new TextEncoder().encode(JSON.stringify(tombstone, null, 2))
+        );
+      } catch {
+      }
+    }
+    console.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+  }
+  /**
+   * GC: remove tombstones where all backends in backends.json have confirmed.
+   */
+  async gcTombstones() {
+    const tombstones = await this.readTombstones();
+    if (tombstones.length === 0) return;
+    const backendsMeta = await this.getBackends();
+    const allBackendIds = backendsMeta?.backends.map((b) => b.id) ?? [this.primaryBackendId];
+    for (const tombstone of tombstones) {
+      const allConfirmed = allBackendIds.every((id) => tombstone.confirmedBy.includes(id));
+      if (allConfirmed) {
+        const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
+        try {
+          await this.cachedFS.unlink(tombstonePath);
+          console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
+        } catch {
+        }
+      }
+    }
   }
   /**
    * Sync .meta/ files (backends.json) to all replica backends.
@@ -618,20 +720,11 @@ var ConfigRepo = class {
    */
   async syncMetaToReplicas() {
     this.assertNotDisposed();
-    try {
-      const content = await this.cachedFS.readFile(BACKENDS_FILE);
-      const vPath = versionPathFor(BACKENDS_FILE);
-      const vContent = await this.cachedFS.readFile(vPath);
-      for (const [id, replica] of this.replicaBackends) {
-        try {
-          await replica.syncable.writeFile(BACKENDS_FILE, content);
-          await replica.syncable.writeFile(vPath, vContent);
-          console.log(`[ConfigRepo] Synced ${BACKENDS_FILE} + .version to replica ${id}`);
-        } catch (err) {
-          console.error(`[ConfigRepo] Failed to sync ${BACKENDS_FILE} to ${id}:`, err.message);
-        }
-      }
-    } catch {
+    const results = await this.flush();
+    for (const result of results) {
+      console.log(
+        `[ConfigRepo] syncMetaToReplicas: ${result.pairId} +${result.filesCreated}/~${result.filesUpdated}/-${result.filesDeleted} skip:${result.filesSkipped} ${result.durationMs}ms`
+      );
     }
   }
   getSyncStatuses() {
@@ -729,7 +822,7 @@ var ConfigRepo = class {
       console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
-        const syncable = backendToSyncableFS(instance);
+        const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
         this.replicaBackends.set(desc.id, { instance, syncable });
         console.log(`[ConfigRepo] Replica ${desc.id} created successfully`);
       } catch (err) {
@@ -946,21 +1039,7 @@ async function createConfigRepo(appId, options) {
     type: options.backendInfo.type,
     options: options.backendInfo.options
   });
-  const zenCache = await import("zen-fs-cache");
-  let cacheStore;
-  const storeType = options.cache?.storeType ?? "MemoryCacheStore";
-  if (storeType === "IdbCacheStore") {
-    cacheStore = new zenCache.IdbCacheStore(options.cache?.storePrefix);
-  } else {
-    cacheStore = new zenCache.MemoryCacheStore();
-  }
-  const cachedFS = new zenCache.CachedFileSystem(
-    primaryInstance,
-    cacheStore,
-    {
-      ttlMs: options.cache?.ttlMs ?? 0
-    }
-  );
+  const cachedFS = primaryInstance;
   try {
     const metaExists = await primaryInstance.exists(META_DIR);
     console.log(`[createConfigRepo] /.meta/ exists: ${metaExists}`);
@@ -975,6 +1054,7 @@ async function createConfigRepo(appId, options) {
   const tempRepo = new ConfigRepo(
     appId,
     "",
+    options.primaryBackendId,
     cachedFS,
     createSerializerChain(),
     void 0
@@ -1031,6 +1111,7 @@ async function createConfigRepo(appId, options) {
   const repo = new ConfigRepo(
     appId,
     nodeId,
+    options.primaryBackendId,
     cachedFS,
     serializer,
     options.onConflict

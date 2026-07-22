@@ -20,6 +20,7 @@ import type {
   BackendDescriptor,
   ConflictArchive,
   ConflictInfo,
+  TombstoneMeta,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
@@ -35,9 +36,26 @@ import { versionPathFor, incrementVersion, writeVersion, readVersion } from './v
 const META_DIR = '/.meta';
 const BACKENDS_FILE = `${META_DIR}/backends.json`;
 const CONFLICTS_DIR = `${META_DIR}/.conflicts`;
+const DELETIONS_DIR = `${META_DIR}/.deleted`;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
 const NODE_ID_FILE = `${NODES_DIR}/.node-id`;
+
+/** Encode a file path into a tombstone filename (no slashes, no dots issue). */
+function tombstoneFileName(filePath: string): string {
+  return filePath
+    .replace(/^\//, '')
+    .replace(/\//g, '__')
+    .replace(/\./g, '++') + '.json';
+}
+
+/** Decode a tombstone filename back to the original file path. */
+function decodeTombstoneFileName(name: string): string {
+  return '/' + name
+    .replace(/\.json$/, '')
+    .replace(/\+\+/g, '.')
+    .replace(/__/g, '/');
+}
 
 // ---------------------------------------------------------------------------
 // Minimal async FS interface for internal use
@@ -65,6 +83,7 @@ export class ConfigRepo implements IConfigRepo {
   private onConflictCallback?: (conflict: ConflictInfo) => Promise<unknown | null>;
   private disposed = false;
   private configCache = new Map<string, unknown>();
+  private readonly primaryBackendId: string;
 
   constructor(
     appId: string,
@@ -76,6 +95,7 @@ export class ConfigRepo implements IConfigRepo {
   ) {
     this.appId = appId;
     this.nodeId = nodeId;
+    this.primaryBackendId = primaryBackendId;
     this.cachedFS = cachedFS;
     this.serializer = serializer;
     this.syncEngine = new ZenFSSync();
@@ -255,8 +275,158 @@ export class ConfigRepo implements IConfigRepo {
 
   async flush(): Promise<SyncResult[]> {
     this.assertNotDisposed();
+    // 1. Process tombstones: delete actual files on all replicas
+    await this.processTombstones();
+    // 2. Run normal sync (syncs data files + tombstone files)
     const resultsMap = await this.syncEngine.syncAll();
+    // 3. Update tombstone confirmations + GC
+    await this.updateTombstoneConfirmations();
+    await this.gcTombstones();
     return Array.from(resultsMap.values());
+  }
+
+  // -----------------------------------------------------------------------
+  // Tombstone (Deletion Tracking)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Delete a file and write a tombstone so the deletion propagates
+   * to all backends instead of being treated as "missing file → re-create".
+   */
+  async deleteFile(path: string): Promise<void> {
+    this.assertNotDisposed();
+    const normalizedPath = path.startsWith('/') ? path : '/' + path;
+
+    // 1. Write tombstone
+    const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(normalizedPath)}`;
+    const tombstone: TombstoneMeta = {
+      path: normalizedPath,
+      deletedAt: Date.now(),
+      deletedBy: this.primaryBackendId,
+      confirmedBy: [this.primaryBackendId],
+    };
+    await this.ensureDir(tombstonePath);
+    await this.cachedFS.writeFile(
+      tombstonePath,
+      new TextEncoder().encode(JSON.stringify(tombstone, null, 2)),
+    );
+
+    // 2. Delete the actual file on primary
+    try {
+      await this.cachedFS.unlink(normalizedPath);
+    } catch {
+      // File may already be gone — tombstone is still valid
+    }
+
+    // 3. Also delete the version sidecar if it exists
+    const versionPath = versionPathFor(normalizedPath);
+    try {
+      await this.cachedFS.unlink(versionPath);
+    } catch { /* no version file */ }
+
+    console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+  }
+
+  /**
+   * Read all tombstones from the primary backend.
+   */
+  private async readTombstones(): Promise<TombstoneMeta[]> {
+    try {
+      const entries = await this.cachedFS.readdir(DELETIONS_DIR);
+      const tombstones: TombstoneMeta[] = [];
+      for (const entry of entries) {
+        if (!entry.endsWith('.json')) continue;
+        try {
+          const raw = await this.cachedFS.readFile(`${DELETIONS_DIR}/${entry}`);
+          const data = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          tombstones.push(data as TombstoneMeta);
+        } catch { /* skip corrupt tombstone */ }
+      }
+      return tombstones;
+    } catch {
+      return []; // DELETIONS_DIR doesn't exist yet
+    }
+  }
+
+  /**
+   * Before sync: for each tombstone, delete the actual file on all replicas.
+   * This prevents bi-directional sync from copying the file back.
+   */
+  private async processTombstones(): Promise<void> {
+    const tombstones = await this.readTombstones();
+    if (tombstones.length === 0) return;
+
+    console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
+
+    for (const tombstone of tombstones) {
+      // Delete on primary (in case it was re-created)
+      try { await this.cachedFS.unlink(tombstone.path); } catch { /* already gone */ }
+      try { await this.cachedFS.unlink(versionPathFor(tombstone.path)); } catch { /* no version */ }
+
+      // Delete on all replicas
+      for (const [replicaId, replica] of this.replicaBackends) {
+        try {
+          await replica.instance.unlink(tombstone.path);
+        } catch { /* not on this replica */ }
+        try {
+          await replica.instance.unlink(versionPathFor(tombstone.path));
+        } catch { /* no version */ }
+        console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+      }
+    }
+  }
+
+  /**
+   * After sync: mark each tombstone as confirmed by all replica backends.
+   */
+  private async updateTombstoneConfirmations(): Promise<void> {
+    const tombstones = await this.readTombstones();
+    if (tombstones.length === 0) return;
+
+    // Get all backend IDs from backends.json
+    const backendsMeta = await this.getBackends();
+    const allBackendIds = backendsMeta?.backends.map(b => b.id) ?? [this.primaryBackendId];
+
+    for (const tombstone of tombstones) {
+      const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
+      // Add all replica IDs that we just synced with
+      for (const replicaId of this.replicaBackends.keys()) {
+        if (!tombstone.confirmedBy.includes(replicaId)) {
+          tombstone.confirmedBy.push(replicaId);
+        }
+      }
+      // Write updated tombstone back
+      try {
+        await this.cachedFS.writeFile(
+          tombstonePath,
+          new TextEncoder().encode(JSON.stringify(tombstone, null, 2)),
+        );
+      } catch { /* ignore write error */ }
+    }
+
+    console.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+  }
+
+  /**
+   * GC: remove tombstones where all backends in backends.json have confirmed.
+   */
+  private async gcTombstones(): Promise<void> {
+    const tombstones = await this.readTombstones();
+    if (tombstones.length === 0) return;
+
+    const backendsMeta = await this.getBackends();
+    const allBackendIds = backendsMeta?.backends.map(b => b.id) ?? [this.primaryBackendId];
+
+    for (const tombstone of tombstones) {
+      const allConfirmed = allBackendIds.every(id => tombstone.confirmedBy.includes(id));
+      if (allConfirmed) {
+        const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
+        try {
+          await this.cachedFS.unlink(tombstonePath);
+          console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
+        } catch { /* already gone */ }
+      }
+    }
   }
 
   /**

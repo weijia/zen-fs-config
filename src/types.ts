@@ -45,6 +45,22 @@ export interface VersionMeta {
 }
 
 // ---------------------------------------------------------------------------
+// Tombstones (Deletion Tracking)
+// ---------------------------------------------------------------------------
+
+/** Content of a tombstone file in `.meta/.deleted/`. */
+export interface TombstoneMeta {
+  /** The deleted file path. */
+  path: string;
+  /** Timestamp of deletion. */
+  deletedAt: number;
+  /** Backend ID that initiated the deletion. */
+  deletedBy: string;
+  /** Backend IDs that have confirmed the deletion (synced). */
+  confirmedBy: string[];
+}
+
+// ---------------------------------------------------------------------------
 // Conflict Archives
 // ---------------------------------------------------------------------------
 
@@ -204,6 +220,13 @@ export interface IConfigRepo {
 
   /** Write .meta/backends.json. */
   updateBackends(meta: BackendsMeta): Promise<void>;
+
+  /**
+   * Delete a file and record a tombstone for cross-backend sync.
+   * The tombstone ensures the deletion propagates to all backends
+   * instead of being treated as a "missing file" that gets re-created.
+   */
+  deleteFile(path: string): Promise<void>;
 
   /**
    * Sync .meta/ files (backends.json) to all replica backends.

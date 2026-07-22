@@ -24,6 +24,7 @@ export type {
   BackendDescriptor,
   BackendsMeta,
   VersionMeta,
+  TombstoneMeta,
   ConflictArchive,
   ConflictInfo,
   ConfigSerializer,
