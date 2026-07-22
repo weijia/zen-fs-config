@@ -281,12 +281,35 @@ export class ConfigRepo implements IConfigRepo {
     try {
       const content = await this.cachedFS.readFile(BACKENDS_FILE);
       const vPath = versionPathFor(BACKENDS_FILE);
-      const vContent = await this.cachedFS.readFile(vPath);
+      let vContent: any;
+      try {
+        vContent = await this.cachedFS.readFile(vPath);
+      } catch { /* no version file yet */ }
+
       for (const [id, replica] of this.replicaBackends) {
         try {
-          await replica.syncable.writeFile(BACKENDS_FILE, content);
-          await replica.syncable.writeFile(vPath, vContent);
-          console.log(`[ConfigRepo] Synced ${BACKENDS_FILE} + .version to replica ${id}`);
+          // Compare with replica's current content — skip if identical
+          let needWrite = true;
+          try {
+            const existing = await replica.syncable.readFile(BACKENDS_FILE);
+            if (this.bufferEqual(content, existing)) {
+              needWrite = false;
+              console.log(`[ConfigRepo] ${BACKENDS_FILE} already up-to-date on ${id}, skipping`);
+            }
+          } catch { /* file doesn't exist on replica, will write */ }
+
+          if (needWrite) {
+            await replica.syncable.writeFile(BACKENDS_FILE, content);
+            console.log(`[ConfigRepo] Synced ${BACKENDS_FILE} to replica ${id}`);
+          }
+
+          if (vContent) {
+            try {
+              await replica.syncable.writeFile(vPath, vContent);
+            } catch (err: any) {
+              console.error(`[ConfigRepo] Failed to sync ${vPath} to ${id}:`, err.message);
+            }
+          }
         } catch (err: any) {
           console.error(`[ConfigRepo] Failed to sync ${BACKENDS_FILE} to ${id}:`, err.message);
         }
@@ -294,6 +317,25 @@ export class ConfigRepo implements IConfigRepo {
     } catch {
       // Meta file might not exist yet (first init edge case)
     }
+  }
+
+  /** Compare two file contents (handles Uint8Array, ArrayBuffer, string, Buffer). */
+  private bufferEqual(a: unknown, b: unknown): boolean {
+    const ua = this.toUint8Array(a);
+    const ub = this.toUint8Array(b);
+    if (ua.length !== ub.length) return false;
+    for (let i = 0; i < ua.length; i++) {
+      if (ua[i] !== ub[i]) return false;
+    }
+    return true;
+  }
+
+  private toUint8Array(raw: unknown): Uint8Array {
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    if (raw instanceof Uint8Array) return raw;
+    if (typeof raw === 'string') return new TextEncoder().encode(raw);
+    if (Buffer.isBuffer(raw)) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    return new Uint8Array(raw as ArrayBuffer);
   }
 
   getSyncStatuses(): Map<string, SyncPairStatus> {
