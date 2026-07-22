@@ -127,16 +127,16 @@ describe('backend-registry', () => {
     it('stat returns correct file info', async () => {
       await backend.writeFile('/stat.txt', '12345');
       const st = await backend.stat('/stat.txt');
-      expect(st.isFile()).toBe(true);
-      expect(st.isDirectory()).toBe(false);
+      expect(st.mode !== undefined && (st.mode & 0o100000) === 0o100000).toBe(true);
+      expect(st.mode !== undefined && (st.mode & 0o40000) === 0o40000).toBe(false);
       expect(st.size).toBe(5);
     });
 
     it('stat returns correct directory info', async () => {
       await backend.mkdir('/mydir');
       const st = await backend.stat('/mydir');
-      expect(st.isFile()).toBe(false);
-      expect(st.isDirectory()).toBe(true);
+      expect(st.mode !== undefined && (st.mode & 0o100000) === 0o100000).toBe(false);
+      expect(st.mode !== undefined && (st.mode & 0o40000) === 0o40000).toBe(true);
     });
 
     it('can unlink files', async () => {
