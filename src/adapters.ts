@@ -17,8 +17,8 @@ import type { BackendInstance } from './backend-registry';
  * BackendInstance's readFile may return string | Buffer | Uint8Array;
  * SyncableFS requires readFile(path, 'utf-8') → string and readFile(path) → Buffer.
  */
-export function backendToSyncableFS(backend: BackendInstance): SyncableFS {
-  return {
+export function backendToSyncableFS(backend: BackendInstance, name?: string): SyncableFS {
+  const syncable: SyncableFS = {
     async readdir(path: string): Promise<string[]> {
       return backend.readdir(path);
     },
@@ -68,6 +68,17 @@ export function backendToSyncableFS(backend: BackendInstance): SyncableFS {
       return backend.exists(path);
     },
   };
+
+  // Set backendName for zen-fs-sync logging
+  if (name) {
+    syncable.backendName = name;
+  } else if ((backend as any).backendName) {
+    syncable.backendName = (backend as any).backendName;
+  } else {
+    syncable.backendName = (backend.constructor as any).name || 'Backend';
+  }
+
+  return syncable;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +144,8 @@ export function zenfsPromisesToSyncableFS(promises: Record<string, any>): Syncab
  * Wrap a CachedFileSystem from zen-fs-cache into a SyncableFS.
  * CachedFileSystem's readFile returns Uint8Array.
  */
-export function cachedFSToSyncableFS(cached: any): SyncableFS {
-  return {
+export function cachedFSToSyncableFS(cached: any, name?: string): SyncableFS {
+  const syncable: SyncableFS = {
     async readdir(path: string): Promise<string[]> {
       return cached.readdir(path);
     },
@@ -185,4 +196,7 @@ export function cachedFSToSyncableFS(cached: any): SyncableFS {
       return cached.exists(path);
     },
   };
+
+  syncable.backendName = name || 'CachedFS';
+  return syncable;
 }

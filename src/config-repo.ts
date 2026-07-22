@@ -79,6 +79,7 @@ export class ConfigRepo implements IConfigRepo {
   constructor(
     appId: string,
     nodeId: string,
+    primaryBackendId: string,
     cachedFS: MinimalAsyncFS,
     serializer: PathAwareSerializer,
     onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>,
@@ -91,7 +92,7 @@ export class ConfigRepo implements IConfigRepo {
     this.replicaBackends = new Map();
     this.onConflictCallback = onConflict;
 
-    this.fullFS = cachedFSToSyncableFS(cachedFS);
+    this.fullFS = cachedFSToSyncableFS(cachedFS, `CachedFS(${primaryBackendId})`);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
     // rootFS = no chroot, so admin UI can browse /.meta/, /shared/, /nodes/, etc.
     this.rootFS = createChrootFS(cachedFS, '/');
@@ -414,7 +415,7 @@ export class ConfigRepo implements IConfigRepo {
       console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
-        const syncable = backendToSyncableFS(instance);
+        const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
         this.replicaBackends.set(desc.id, { instance, syncable });
         console.log(`[ConfigRepo] Replica ${desc.id} created successfully`);
       } catch (err: any) {
@@ -731,7 +732,7 @@ export async function createConfigRepo(
   // Step 3: Read or create .meta/backends.json
   // -------------------------------------------------------------------
   const tempRepo = new ConfigRepo(
-    appId, '', cachedFS, createSerializerChain(), undefined,
+    appId, '', options.primaryBackendId, cachedFS, createSerializerChain(), undefined,
   );
 
   let backendsMeta = await tempRepo.readMetaFile<BackendsMeta>(BACKENDS_FILE);
@@ -799,6 +800,7 @@ export async function createConfigRepo(
   const repo = new ConfigRepo(
     appId,
     nodeId,
+    options.primaryBackendId,
     cachedFS,
     serializer,
     options.onConflict,
