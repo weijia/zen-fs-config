@@ -278,64 +278,18 @@ export class ConfigRepo implements IConfigRepo {
    */
   async syncMetaToReplicas(): Promise<void> {
     this.assertNotDisposed();
-    try {
-      const content = await this.cachedFS.readFile(BACKENDS_FILE);
-      const vPath = versionPathFor(BACKENDS_FILE);
-      let vContent: any;
-      try {
-        vContent = await this.cachedFS.readFile(vPath);
-      } catch { /* no version file yet */ }
-
-      for (const [id, replica] of this.replicaBackends) {
-        try {
-          // Compare with replica's current content — skip if identical
-          let needWrite = true;
-          try {
-            const existing = await replica.syncable.readFile(BACKENDS_FILE);
-            if (this.bufferEqual(content, existing)) {
-              needWrite = false;
-              console.log(`[ConfigRepo] ${BACKENDS_FILE} already up-to-date on ${id}, skipping`);
-            }
-          } catch { /* file doesn't exist on replica, will write */ }
-
-          if (needWrite) {
-            await replica.syncable.writeFile(BACKENDS_FILE, content);
-            console.log(`[ConfigRepo] Synced ${BACKENDS_FILE} to replica ${id}`);
-          }
-
-          if (vContent) {
-            try {
-              await replica.syncable.writeFile(vPath, vContent);
-            } catch (err: any) {
-              console.error(`[ConfigRepo] Failed to sync ${vPath} to ${id}:`, err.message);
-            }
-          }
-        } catch (err: any) {
-          console.error(`[ConfigRepo] Failed to sync ${BACKENDS_FILE} to ${id}:`, err.message);
-        }
-      }
-    } catch {
-      // Meta file might not exist yet (first init edge case)
+    // Instead of directly writing to replicas (which bypasses the sync engine),
+    // trigger the sync engine to sync all pending changes immediately.
+    // The sync engine performs hash-based change detection, only transfers
+    // changed files, and handles conflicts properly.
+    const results = await this.flush();
+    for (const result of results) {
+      console.log(
+        `[ConfigRepo] syncMetaToReplicas: ${result.pairId} ` +
+        `+${result.filesCreated}/~${result.filesUpdated}/-${result.filesDeleted} ` +
+        `skip:${result.filesSkipped} ${result.durationMs}ms`,
+      );
     }
-  }
-
-  /** Compare two file contents (handles Uint8Array, ArrayBuffer, string, Buffer). */
-  private bufferEqual(a: unknown, b: unknown): boolean {
-    const ua = this.toUint8Array(a);
-    const ub = this.toUint8Array(b);
-    if (ua.length !== ub.length) return false;
-    for (let i = 0; i < ua.length; i++) {
-      if (ua[i] !== ub[i]) return false;
-    }
-    return true;
-  }
-
-  private toUint8Array(raw: unknown): Uint8Array {
-    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
-    if (raw instanceof Uint8Array) return raw;
-    if (typeof raw === 'string') return new TextEncoder().encode(raw);
-    if (Buffer.isBuffer(raw)) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    return new Uint8Array(raw as ArrayBuffer);
   }
 
   getSyncStatuses(): Map<string, SyncPairStatus> {
