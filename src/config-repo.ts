@@ -753,9 +753,9 @@ export class ConfigRepo implements IConfigRepo {
           const fullPath = current === '/' ? `/${entry}` : `${current}/${entry}`;
           try {
             const stat = await this.cachedFS.stat(fullPath);
-            if (stat.isDirectory()) {
+            if (stat.mode !== undefined && (stat.mode & 0o40000) === 0o40000) {
               stack.push(fullPath);
-            } else if (stat.isFile()) {
+            } else {
               results.push(fullPath);
             }
           } catch {

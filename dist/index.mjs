@@ -101,14 +101,10 @@ function createChrootFS(inner, root) {
     },
     async stat(path) {
       const s = await inner.stat(rp(path));
-      if (typeof s.isFile === "function" && typeof s.isDirectory === "function") {
-        return s;
-      }
-      const isDir = typeof s.isDirectory === "function" ? s.isDirectory() : typeof s.isDirectory === "boolean" ? s.isDirectory : s.mode !== void 0 && (s.mode & 61440) === 16384;
       return {
-        ...s,
-        isFile: () => !isDir,
-        isDirectory: () => isDir
+        mode: typeof s.mode === "number" ? s.mode : void 0,
+        size: s.size ?? 0,
+        mtimeMs: s.mtimeMs ?? s.mtime ?? 0
       };
     },
     async access(path) {
@@ -970,9 +966,9 @@ var ConfigRepo = class {
           const fullPath = current === "/" ? `/${entry}` : `${current}/${entry}`;
           try {
             const stat = await this.cachedFS.stat(fullPath);
-            if (stat.isDirectory()) {
+            if (stat.mode !== void 0 && (stat.mode & 16384) === 16384) {
               stack.push(fullPath);
-            } else if (stat.isFile()) {
+            } else {
               results.push(fullPath);
             }
           } catch {
