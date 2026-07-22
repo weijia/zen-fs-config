@@ -130,14 +130,10 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
     },
     async stat(path: string, ..._args: any[]): Promise<any> {
       const st = await isolatedFS.stat(path);
-      const isDir = typeof (st as any).isDirectory === 'function'
-        ? (st as any).isDirectory()
-        : (st.mode !== undefined && ((st.mode as number) & 0o170000) === 0o040000);
       return {
-        isFile: () => !isDir,
-        isDirectory: () => isDir,
+        mode: typeof st.mode === 'number' ? st.mode : undefined,
         size: st.size,
-        mtime: (st as any).mtimeMs ?? (st as any).mtime,
+        mtimeMs: (st as any).mtimeMs ?? (st as any).mtime ?? 0,
       };
     },
     async exists(path: string): Promise<boolean> {

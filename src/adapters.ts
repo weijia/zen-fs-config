@@ -49,10 +49,9 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
 
     async stat(path: string): Promise<FileStat> {
       const s = await backend.stat(path);
-      // Normalize various stat shapes into FileStat
+      // Directly pass through mode/size/mtimeMs — zen-fs-sync now uses mode to detect type
       return {
-        isFile: typeof s.isFile === 'function' ? () => s.isFile() : () => !!(s.mode && !(s.mode & 0o40000)),
-        isDirectory: typeof s.isDirectory === 'function' ? () => s.isDirectory() : () => !!(s.mode && (s.mode & 0o40000)),
+        mode: typeof s.mode === 'number' ? s.mode : undefined,
         size: s.size ?? 0,
         mtimeMs: typeof s.mtimeMs === 'number' ? s.mtimeMs
           : s.mtime ? new Date(s.mtime).getTime()
@@ -114,8 +113,7 @@ export function zenfsPromisesToSyncableFS(promises: Record<string, any>): Syncab
     async stat(path: string): Promise<FileStat> {
       const s = await promises.stat(path);
       return {
-        isFile: () => s.isFile(),
-        isDirectory: () => s.isDirectory(),
+        mode: typeof s.mode === 'number' ? s.mode : undefined,
         size: s.size,
         mtimeMs: s.mtimeMs,
       };
@@ -173,16 +171,10 @@ export function cachedFSToSyncableFS(cached: any, name?: string): SyncableFS {
 
     async stat(path: string): Promise<FileStat> {
       const s = await cached.stat(path);
-      // CachedFileSystem may return a deserialized JSON object (no methods)
-      // or a fresh stat object with isFile/isDirectory as functions or booleans.
-      const isDir = typeof s.isDirectory === 'function'
-        ? s.isDirectory()
-        : typeof s.isDirectory === 'boolean'
-          ? s.isDirectory
-          : (s.mode !== undefined && ((s.mode as number) & 0o170000) === 0o040000);
+      // CachedFileSystem may return a deserialized JSON object (no methods).
+      // zen-fs-sync now uses mode directly, so we just pass it through.
       return {
-        isFile: () => !isDir,
-        isDirectory: () => isDir,
+        mode: typeof s.mode === 'number' ? s.mode : undefined,
         size: s.size,
         mtimeMs: s.mtimeMs ?? s.mtime,
       };

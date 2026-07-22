@@ -24,8 +24,8 @@ import type {
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
 import type { PathAwareSerializer } from './serializer';
-import { backendToSyncableFS, cachedFSToSyncableFS } from './adapters';
-import { createBackend } from './backend-registry';
+import { backendToSyncableFS } from './adapters';
+import { createBackend, type BackendInstance } from './backend-registry';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 
 // ---------------------------------------------------------------------------
@@ -43,17 +43,7 @@ const NODE_ID_FILE = `${NODES_DIR}/.node-id`;
 // Minimal async FS interface for internal use
 // ---------------------------------------------------------------------------
 
-interface MinimalAsyncFS {
-  readFile(path: string, ...args: any[]): Promise<any>;
-  writeFile(path: string, data: any, options?: any): Promise<void>;
-  readdir(path: string): Promise<string[]>;
-  stat(path: string): Promise<any>;
-  exists(path: string): Promise<boolean>;
-  mkdir(path: string, options?: any): Promise<any>;
-  unlink(path: string): Promise<void>;
-  rmdir?(path: string): Promise<void>;
-  rename?(oldPath: string, newPath: string): Promise<void>;
-}
+interface MinimalAsyncFS extends BackendInstance {}
 
 // ---------------------------------------------------------------------------
 // ConfigRepo
@@ -92,7 +82,7 @@ export class ConfigRepo implements IConfigRepo {
     this.replicaBackends = new Map();
     this.onConflictCallback = onConflict;
 
-    this.fullFS = cachedFSToSyncableFS(cachedFS, `CachedFS(${primaryBackendId})`);
+    this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
     // rootFS = no chroot, so admin UI can browse /.meta/, /shared/, /nodes/, etc.
     this.rootFS = createChrootFS(cachedFS, '/');
@@ -693,29 +683,9 @@ export async function createConfigRepo(
   });
 
   // -------------------------------------------------------------------
-  // Step 2: Wrap with zen-fs-cache
+  // Step 2: Use primary backend directly (zen-fs-cache removed)
   // -------------------------------------------------------------------
-  const zenCache = await import('zen-fs-cache');
-
-  let cacheStore: any;
-  const storeType = options.cache?.storeType ?? 'MemoryCacheStore';
-  if (storeType === 'IdbCacheStore') {
-    cacheStore = new zenCache.IdbCacheStore(options.cache?.storePrefix);
-  } else {
-    cacheStore = new zenCache.MemoryCacheStore();
-  }
-
-  const cachedFS = new zenCache.CachedFileSystem(
-    primaryInstance as any,
-    cacheStore,
-    {
-      ttlMs: options.cache?.ttlMs ?? 0,
-    },
-  );
-
-  // Ensure /.meta/ directory exists before wrapping in cache.
-  // On a fresh backend the directory may not exist yet, and
-  // CachedFileSystem.mkdir → BackendInstance.mkdir may have issues.
+  const cachedFS = primaryInstance;
   try {
     const metaExists = await primaryInstance.exists(META_DIR);
     console.log(`[createConfigRepo] /.meta/ exists: ${metaExists}`);
