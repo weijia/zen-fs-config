@@ -991,14 +991,10 @@ var ConfigRepo = class {
     for (const part of parts) {
       current += `/${part}`;
       const exists = await this.fullFS.exists(current);
-      console.log(`[ensureDir] ${current} exists=${exists}`);
       if (!exists) {
         try {
-          console.log(`[ensureDir] mkdir(${current})`);
           await this.fullFS.mkdir(current);
-          console.log(`[ensureDir] mkdir(${current}) OK`);
-        } catch (err) {
-          console.error(`[ensureDir] mkdir(${current}) FAILED:`, err.message);
+        } catch {
         }
       }
     }
@@ -1029,16 +1025,13 @@ var ConfigRepo = class {
     return results;
   }
   async writeMetaFile(path, data) {
-    console.log(`[writeMetaFile] ${path}, ensuring dir...`);
     await this.ensureDir(path);
     const bytes = new TextEncoder().encode(JSON.stringify(data, null, 2));
-    console.log(`[writeMetaFile] ${path}, writing ${bytes.length} bytes...`);
     await this.cachedFS.writeFile(path, bytes);
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, path, bytes, author);
     await this.ensureDir(versionPathFor(path));
     await writeVersion(this.fullFS, versionPathFor(path), version);
-    console.log(`[writeMetaFile] ${path} done (version=${version.version})`);
   }
   async readMetaFile(path) {
     try {
