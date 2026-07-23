@@ -990,12 +990,9 @@ var ConfigRepo = class {
     let current = "";
     for (const part of parts) {
       current += `/${part}`;
-      const exists = await this.fullFS.exists(current);
-      if (!exists) {
-        try {
-          await this.fullFS.mkdir(current);
-        } catch {
-        }
+      try {
+        await this.fullFS.mkdir(current);
+      } catch {
       }
     }
   }
@@ -1079,13 +1076,8 @@ async function createConfigRepo(appId, options) {
   });
   const cachedFS = primaryInstance;
   try {
-    const metaExists = await primaryInstance.exists(META_DIR);
-    console.log(`[createConfigRepo] /.meta/ exists: ${metaExists}`);
-    if (!metaExists) {
-      console.log(`[createConfigRepo] Creating /.meta/ via primaryInstance...`);
-      await primaryInstance.mkdir(META_DIR);
-      console.log(`[createConfigRepo] /.meta/ created`);
-    }
+    await primaryInstance.mkdir(META_DIR);
+    console.log(`[createConfigRepo] /.meta/ ready`);
   } catch (err) {
     console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
   }

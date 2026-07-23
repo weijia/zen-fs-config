@@ -725,13 +725,12 @@ export class ConfigRepo implements IConfigRepo {
     let current = '';
     for (const part of parts) {
       current += `/${part}`;
-      const exists = await this.fullFS.exists(current);
-      if (!exists) {
-        try {
-          await this.fullFS.mkdir(current);
-        } catch {
-          // Directory might already exist due to race
-        }
+      // mkdir is idempotent — no need to exists() first.
+      // This avoids HEAD+GET 404 probes on every first-time directory creation.
+      try {
+        await this.fullFS.mkdir(current);
+      } catch {
+        // Directory might already exist — that's fine
       }
     }
   }
@@ -849,14 +848,11 @@ export async function createConfigRepo(
   // Step 2: Use primary backend directly (zen-fs-cache removed)
   // -------------------------------------------------------------------
   const cachedFS = primaryInstance;
+  // Create /.meta/ unconditionally — mkdir is idempotent (just PUTs a .keep file),
+  // so we skip the exists() probe that would generate HEAD+GET 404s on first run.
   try {
-    const metaExists = await primaryInstance.exists(META_DIR);
-    console.log(`[createConfigRepo] /.meta/ exists: ${metaExists}`);
-    if (!metaExists) {
-      console.log(`[createConfigRepo] Creating /.meta/ via primaryInstance...`);
-      await primaryInstance.mkdir(META_DIR);
-      console.log(`[createConfigRepo] /.meta/ created`);
-    }
+    await primaryInstance.mkdir(META_DIR);
+    console.log(`[createConfigRepo] /.meta/ ready`);
   } catch (err: any) {
     console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
   }
