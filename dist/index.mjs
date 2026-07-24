@@ -223,10 +223,15 @@ function backendToSyncableFS(backend, name) {
 
 // src/backend-registry.ts
 var registry = /* @__PURE__ */ new Map();
-function registerBackend(type, factory) {
+var metadataRegistry = /* @__PURE__ */ new Map();
+function registerBackend(type, factory, metadata) {
   registry.set(type, factory);
+  if (metadata) {
+    metadataRegistry.set(type, metadata);
+  }
 }
 function unregisterBackend(type) {
+  metadataRegistry.delete(type);
   return registry.delete(type);
 }
 async function createBackend(descriptor) {
@@ -243,6 +248,12 @@ function hasBackend(type) {
 }
 function listBackends() {
   return Array.from(registry.keys());
+}
+function getBackendMetadata(type) {
+  return metadataRegistry.get(type);
+}
+function listBackendMetadata() {
+  return Array.from(metadataRegistry.values());
 }
 async function wrapZenFSFileSystem(config) {
   const zenfs = await import("@zenfs/core");
@@ -307,12 +318,29 @@ registerBackend("InMemory", async (options) => {
   const maxSize = options.maxSize ?? 100 * 1024 * 1024;
   const label = options.label ?? `zen-fs-config-${++inMemoryCounter}`;
   return wrapZenFSFileSystem({ backend: InMemory, maxSize, label });
+}, {
+  type: "InMemory",
+  label: "InMemory",
+  icon: "\u{1F9E0}",
+  fields: [
+    { key: "maxSize", label: "Max Size (bytes)", type: "text", placeholder: "104857600" },
+    { key: "label", label: "Label", type: "text", placeholder: "zen-fs-config-1" }
+  ],
+  defaultOptions: { maxSize: "", label: "" }
 });
 registerBackend("IndexedDB", async (options) => {
   const { IndexedDB } = await import("@zenfs/dom");
   const storeName = options.storeName ?? "zen-fs-config";
   const label = options.label ?? storeName;
   return wrapZenFSFileSystem({ backend: IndexedDB, storeName, label });
+}, {
+  type: "IndexedDB",
+  label: "IndexedDB",
+  icon: "\u{1F4BE}",
+  fields: [
+    { key: "storeName", label: "Store Name", type: "text", placeholder: "zen-fs-config" }
+  ],
+  defaultOptions: { storeName: "" }
 });
 
 // src/version.ts
@@ -1244,13 +1272,16 @@ async function createConfigRepo(appId, options = {}) {
 }
 export {
   ConfigRepo,
+  LOCAL_IDB_BACKEND_ID,
   configKeyToFilePath,
   createBackend,
   createConfigRepo,
   createSerializerChain,
+  getBackendMetadata,
   getExtension,
   hasBackend,
   incrementVersion,
+  listBackendMetadata,
   listBackends,
   readVersion,
   registerBackend,

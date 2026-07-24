@@ -44,16 +44,55 @@ export interface BackendInstance {
 }
 
 // ---------------------------------------------------------------------------
+// Backend Metadata (for dynamic UI form generation)
+// ---------------------------------------------------------------------------
+
+/** A single parameter field definition for a backend type. */
+export interface BackendParamDef {
+  /** Option key (maps to BackendDescriptor.options[key]). */
+  key: string;
+  /** Human-readable label for the UI form. */
+  label: string;
+  /** Input type: text, password (masked), or select (dropdown). */
+  type: 'text' | 'password' | 'select';
+  /** Placeholder text for text/password inputs. */
+  placeholder?: string;
+  /** Whether the field is required. */
+  required?: boolean;
+  /** Options for select type. */
+  options?: { value: string; label: string }[];
+}
+
+/** Metadata describing a registered backend type (for UI form generation). */
+export interface BackendMetadata {
+  /** Backend type name (matches the registry key). */
+  type: string;
+  /** Human-readable label. */
+  label: string;
+  /** Emoji or icon identifier. */
+  icon: string;
+  /** Parameter field definitions. */
+  fields: BackendParamDef[];
+  /** Default option values (merged into the form's initial state). */
+  defaultOptions: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
 const registry = new Map<string, BackendFactory>();
+const metadataRegistry = new Map<string, BackendMetadata>();
 
-export function registerBackend(type: string, factory: BackendFactory): void {
+export function registerBackend(type: string, factory: BackendFactory, metadata?: BackendMetadata): void {
   registry.set(type, factory);
+  if (metadata) {
+    metadataRegistry.set(type, metadata);
+  }
 }
 
 export function unregisterBackend(type: string): boolean {
+  metadataRegistry.delete(type);
   return registry.delete(type);
 }
 
@@ -77,6 +116,16 @@ export function hasBackend(type: string): boolean {
 
 export function listBackends(): string[] {
   return Array.from(registry.keys());
+}
+
+/** Get metadata for a specific backend type. Returns undefined if not registered or no metadata. */
+export function getBackendMetadata(type: string): BackendMetadata | undefined {
+  return metadataRegistry.get(type);
+}
+
+/** List all backend types that have registered metadata. Used for dynamic form generation. */
+export function listBackendMetadata(): BackendMetadata[] {
+  return Array.from(metadataRegistry.values());
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +218,15 @@ registerBackend('InMemory', async (options) => {
   const label = (options.label as string) ?? `zen-fs-config-${++inMemoryCounter}`;
 
   return wrapZenFSFileSystem({ backend: InMemory, maxSize, label });
+}, {
+  type: 'InMemory',
+  label: 'InMemory',
+  icon: '\u{1F9E0}',
+  fields: [
+    { key: 'maxSize', label: 'Max Size (bytes)', type: 'text', placeholder: '104857600' },
+    { key: 'label', label: 'Label', type: 'text', placeholder: 'zen-fs-config-1' },
+  ],
+  defaultOptions: { maxSize: '', label: '' },
 });
 
 // ---------------------------------------------------------------------------
@@ -187,4 +245,12 @@ registerBackend('IndexedDB', async (options) => {
   const label = (options.label as string) ?? storeName;
 
   return wrapZenFSFileSystem({ backend: IndexedDB, storeName, label });
+}, {
+  type: 'IndexedDB',
+  label: 'IndexedDB',
+  icon: '\u{1F4BE}',
+  fields: [
+    { key: 'storeName', label: 'Store Name', type: 'text', placeholder: 'zen-fs-config' },
+  ],
+  defaultOptions: { storeName: '' },
 });

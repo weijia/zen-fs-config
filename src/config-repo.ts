@@ -43,7 +43,7 @@ const SHARED_DIR = '/shared';
 const NODE_ID_FILE = `${NODES_DIR}/.node-id`;
 
 /** Fixed ID for the local IndexedDB primary backend. */
-const LOCAL_IDB_BACKEND_ID = 'local-idb';
+export const LOCAL_IDB_BACKEND_ID = 'local-idb';
 
 /** Encode a file path into a tombstone filename (no slashes, no dots issue). */
 function tombstoneFileName(filePath: string): string {

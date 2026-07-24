@@ -7,11 +7,11 @@
  */
 
 // Factory & main class
-export { createConfigRepo, ConfigRepo } from './config-repo';
+export { createConfigRepo, ConfigRepo, LOCAL_IDB_BACKEND_ID } from './config-repo';
 
 // Backend registry
-export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, wrapZenFSFileSystem } from './backend-registry';
-export type { BackendFactory, BackendInstance } from './backend-registry';
+export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, getBackendMetadata, listBackendMetadata, wrapZenFSFileSystem } from './backend-registry';
+export type { BackendFactory, BackendInstance, BackendMetadata, BackendParamDef } from './backend-registry';
 
 // Serializers
 export { createSerializerChain, configKeyToFilePath, getExtension } from './serializer';

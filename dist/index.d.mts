@@ -272,11 +272,46 @@ interface BackendInstance {
     readFileMeta?(path: string, opts?: any): Promise<any>;
     getRevision?(path: string): Promise<string | number | undefined>;
 }
-declare function registerBackend(type: string, factory: BackendFactory): void;
+/** A single parameter field definition for a backend type. */
+interface BackendParamDef {
+    /** Option key (maps to BackendDescriptor.options[key]). */
+    key: string;
+    /** Human-readable label for the UI form. */
+    label: string;
+    /** Input type: text, password (masked), or select (dropdown). */
+    type: 'text' | 'password' | 'select';
+    /** Placeholder text for text/password inputs. */
+    placeholder?: string;
+    /** Whether the field is required. */
+    required?: boolean;
+    /** Options for select type. */
+    options?: {
+        value: string;
+        label: string;
+    }[];
+}
+/** Metadata describing a registered backend type (for UI form generation). */
+interface BackendMetadata {
+    /** Backend type name (matches the registry key). */
+    type: string;
+    /** Human-readable label. */
+    label: string;
+    /** Emoji or icon identifier. */
+    icon: string;
+    /** Parameter field definitions. */
+    fields: BackendParamDef[];
+    /** Default option values (merged into the form's initial state). */
+    defaultOptions: Record<string, string>;
+}
+declare function registerBackend(type: string, factory: BackendFactory, metadata?: BackendMetadata): void;
 declare function unregisterBackend(type: string): boolean;
 declare function createBackend(descriptor: Pick<BackendDescriptor, 'type' | 'options'>): Promise<BackendInstance>;
 declare function hasBackend(type: string): boolean;
 declare function listBackends(): string[];
+/** Get metadata for a specific backend type. Returns undefined if not registered or no metadata. */
+declare function getBackendMetadata(type: string): BackendMetadata | undefined;
+/** List all backend types that have registered metadata. Used for dynamic form generation. */
+declare function listBackendMetadata(): BackendMetadata[];
 declare function wrapZenFSFileSystem(config: any): Promise<BackendInstance>;
 
 /**
@@ -285,6 +320,8 @@ declare function wrapZenFSFileSystem(config: any): Promise<BackendInstance>;
  * Core implementation of IConfigRepo and the createConfigRepo factory.
  */
 
+/** Fixed ID for the local IndexedDB primary backend. */
+declare const LOCAL_IDB_BACKEND_ID = "local-idb";
 interface MinimalAsyncFS extends BackendInstance {
 }
 declare class ConfigRepo implements IConfigRepo {
@@ -419,4 +456,4 @@ declare function incrementVersion(fs: SyncableFS, configFilePath: string, newCon
  */
 declare function verifyOrRepairVersion(fs: SyncableFS, configFilePath: string, author: string): Promise<VersionMeta | null>;
 
-export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, type TombstoneMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getExtension, hasBackend, incrementVersion, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };
+export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendMetadata, type BackendParamDef, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, LOCAL_IDB_BACKEND_ID, type TombstoneMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getBackendMetadata, getExtension, hasBackend, incrementVersion, listBackendMetadata, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };
