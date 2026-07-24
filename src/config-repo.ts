@@ -40,7 +40,6 @@ const CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 const DELETIONS_DIR = `${META_DIR}/.deleted`;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
-const NODE_ID_FILE = `${NODES_DIR}/.node-id`;
 
 /** Fixed ID for the local IndexedDB primary backend. */
 export const LOCAL_IDB_BACKEND_ID = 'local-idb';
@@ -1108,26 +1107,13 @@ export async function createConfigRepo(
 
   // -------------------------------------------------------------------
   // Step 7: Determine nodeId
+  // nodeId is the caller's responsibility to persist (e.g. localStorage).
+  // We no longer read/write /nodes/.node-id to avoid sync conflicts.
   // -------------------------------------------------------------------
   let nodeId = options.nodeId;
-  if (!nodeId && typeof process !== 'undefined' && process.env?.NODE_ID) {
-    nodeId = process.env.NODE_ID;
-  }
-  if (!nodeId) {
-    try {
-      const raw = await cachedFS.readFile(NODE_ID_FILE);
-      nodeId = new TextDecoder().decode(toUint8Array(raw)).trim();
-    } catch {
-      // File doesn't exist
-    }
-  }
   if (!nodeId) {
     nodeId = `node-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      await cachedFS.writeFile(NODE_ID_FILE, new TextEncoder().encode(nodeId));
-    } catch {
-      // Best effort
-    }
+    console.log(`[createConfigRepo] Generated nodeId: ${nodeId}`);
   }
 
   // -------------------------------------------------------------------

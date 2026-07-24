@@ -485,7 +485,6 @@ var BACKENDS_DIR = `${META_DIR}/backends`;
 var CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 var DELETIONS_DIR = `${META_DIR}/.deleted`;
 var NODES_DIR = "/nodes";
-var NODE_ID_FILE = `${NODES_DIR}/.node-id`;
 var LOCAL_IDB_BACKEND_ID = "local-idb";
 function tombstoneFileName(filePath) {
   return filePath.replace(/^\//, "").replace(/\//g, "__").replace(/\./g, "++") + ".json";
@@ -1319,22 +1318,9 @@ async function createConfigRepo(appId, options = {}) {
   const allBackends = await tempRepo.readAllBackendDescriptors();
   console.log(`[createConfigRepo] Replica backends: ${allBackends.map((b) => b.id).join(", ") || "(none)"}`);
   let nodeId = options.nodeId;
-  if (!nodeId && typeof process !== "undefined" && process.env?.NODE_ID) {
-    nodeId = process.env.NODE_ID;
-  }
-  if (!nodeId) {
-    try {
-      const raw = await cachedFS.readFile(NODE_ID_FILE);
-      nodeId = new TextDecoder().decode(toUint8Array(raw)).trim();
-    } catch {
-    }
-  }
   if (!nodeId) {
     nodeId = `node-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      await cachedFS.writeFile(NODE_ID_FILE, new TextEncoder().encode(nodeId));
-    } catch {
-    }
+    console.log(`[createConfigRepo] Generated nodeId: ${nodeId}`);
   }
   const serializer = createSerializerChain(options.serializer);
   const repo = new ConfigRepo(
