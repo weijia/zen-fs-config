@@ -136,14 +136,27 @@ export interface CacheOptions {
 
 /** Options for creating a ConfigRepo. */
 export interface ConfigRepoOptions {
-  /** The backend ID (from .meta/backends.json) to use as this instance's primary. */
-  primaryBackendId: string;
+  /**
+   * ID for a user-provided replica backend.
+   * If `backendInfo` is provided, this ID identifies the replica in `.meta/backends/`.
+   * If omitted, a default ID based on the backend type is generated.
+   * The local IndexedDB primary always uses the fixed ID `local-idb`.
+   */
+  primaryBackendId?: string;
 
-  /** Connection info for the primary backend. */
-  backendInfo: {
+  /**
+   * Connection info for a user-provided replica backend.
+   * When provided, this backend is added as a replica and auto-synced with
+   * the local IndexedDB primary. When omitted, only the local IndexedDB
+   * primary is used (offline-first mode).
+   */
+  backendInfo?: {
     type: string;
     options: Record<string, unknown>;
   };
+
+  /** IndexedDB store name for the local primary backend. Default: `zen-fs-config-{appId}` */
+  idbStoreName?: string;
 
   /** Node identifier. Auto-detected if not provided (see DESIGN.md §8.2). */
   nodeId?: string;
@@ -215,11 +228,31 @@ export interface IConfigRepo {
    */
   readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
 
-  /** Read .meta/backends.json. */
+  /** Read backend topology (aggregated from .meta/backends/*.json). */
   getBackends(): Promise<BackendsMeta | null>;
 
-  /** Write .meta/backends.json. */
+  /** Write backend topology (writes each backend as .meta/backends/{id}.json). */
   updateBackends(meta: BackendsMeta): Promise<void>;
+
+  /**
+   * Dynamically add a replica backend.
+   * Creates the backend instance, saves its descriptor as `.meta/backends/{id}.json`,
+   * sets up bi-directional sync with the local IndexedDB primary, and triggers
+   * an initial sync.
+   * @param id Unique backend ID (e.g., "gitee-prod")
+   * @param type Backend type name (must be registered via `registerBackend()`)
+   * @param options Options passed to the backend constructor
+   * @param description Optional human-readable description
+   */
+  addBackend(id: string, type: string, options: Record<string, unknown>, description?: string): Promise<void>;
+
+  /**
+   * Dynamically remove a replica backend.
+   * Tears down the sync pair, removes the backend descriptor file, and disposes
+   * the backend instance. The local IndexedDB primary cannot be removed.
+   * @param id Backend ID to remove
+   */
+  removeBackend(id: string): Promise<void>;
 
   /**
    * Delete a file and record a tombstone for cross-backend sync.

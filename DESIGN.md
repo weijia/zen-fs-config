@@ -25,17 +25,21 @@ ConfigRepo (this library)
         └─ Backend Z (replica)
 ```
 
-### 2.2 No Global Primary
+### 2.2 IndexedDB as Local Primary (Offline-First)
 
-Globally, all backends are equal peers — none is the "source of truth."
+Every program instance uses **IndexedDB** as its local primary backend. All config reads and writes target IndexedDB directly, ensuring offline availability and fast local access.
 
-Locally, each program instance has a "primary backend" — the backend it directly reads/writes through. This is a per-instance choice, not a property of the backend itself.
+User-provided backends (Gitee, S3, RemoteStorage, etc.) are added as **replicas** — they receive bi-directional sync with the local IndexedDB but are never the direct target of config operations.
 
 ```
-Program A → Primary = Backend X, Replicas = [Y, Z]
-Program B → Primary = Backend Y, Replicas = [X, Z]
-Program C → Primary = Backend Z, Replicas = [X, Y]
+Program A → Primary = IndexedDB (local), Replicas = [Gitee, S3]
+Program B → Primary = IndexedDB (local), Replicas = [Gitee, S3]
 ```
+
+This means:
+- Config is always available offline (IndexedDB persists in the browser)
+- Remote backends accelerate multi-device sync, not local access
+- Re-opening the app requires zero backend parameters — IndexedDB + `.meta/backends/` contain everything needed
 
 ### 2.3 Self-Describing Configuration
 
@@ -47,18 +51,25 @@ External input at startup is limited to: **which backend to connect to** and opt
 
 ```
 /
-├─ .meta/                               [not synced]
-│  ├─ backends.json                     Backend topology (self-describing)
-│  ├─ sync-rules.json                   Sync rules
-│  └─ .conflicts/                       Conflict archives (safekeeping)
-│     └─ {timestamp}_{path}.from-{a}.to-{b}.json
+├─ .meta/                               [synced to replicas]
+│  ├─ backends/                          Backend topology (one file per backend)
+│  │  ├─ local-idb.json                  { id, type, options, description }
+│  │  ├─ gitee-prod.json
+│  │  └─ ...
+│  ├─ .deleted/                          Tombstones for deletion propagation
+│  │  └─ {encoded-path}.json
+│  └─ .conflicts/                        Conflict archives (safekeeping)
+│     └─ {timestamp}_{path}/
+│        ├─ meta.json
+│        ├─ source
+│        └─ target
 │
-├─ {appId}/                             [one-way: owner → replicas, no conflict]
+├─ {appId}/                             [synced: owner → replicas]
 │  ├─ db.json
 │  ├─ cache.json
 │  └─ .db.json.version                  Sidecar version file
 │
-├─ shared/                              [bi-directional, conflict possible]
+├─ shared/                              [synced: bi-directional]
 │  ├─ feature-flags.json
 │  ├─ api-version.json
 │  └─ .feature-flags.json.version
@@ -74,10 +85,10 @@ External input at startup is limited to: **which backend to connect to** and opt
 
 | Directory | Sync Direction | Conflict Risk | Purpose |
 |---|---|---|---|
-| `/{appId}/` | One-way (owner → replicas) | None (single writer) | Per-app private config |
+| `/{appId}/` | Bi-directional (primary ↔ replicas) | Low (single device) | Per-app private config |
 | `/shared/` | Bi-directional | Possible (multiple writers) | Cross-app shared config |
 | `/nodes/` | None (by default) | None | Per-node local config |
-| `/.meta/` | None | None | Topology, rules, conflict archives |
+| `/.meta/` | Bi-directional | None (topology files) | Backend topology, tombstones, conflict archives |
 
 ### 3.2 Config-to-File Mapping
 
@@ -101,29 +112,33 @@ The serializer is determined by file extension:
 
 Users can inject a custom `ConfigSerializer` for other formats.
 
-## 4. Backend Topology (`.meta/backends.json`)
+## 4. Backend Topology (`.meta/backends/*.json`)
 
+Each backend is stored as an individual JSON file in `.meta/backends/`. This allows atomic add/remove operations without rewriting the entire topology.
+
+**`.meta/backends/local-idb.json`** (always present):
 ```json
 {
-  "version": 1,
-  "backends": [
-    {
-      "id": "local-idb",
-      "type": "IndexedDB",
-      "options": { "dbName": "app-config" },
-      "description": "Browser local storage"
-    },
-    {
-      "id": "remote-s3",
-      "type": "S3Bucket",
-      "options": { "bucket": "app-config-bucket", "region": "us-east-1" },
-      "description": "Cloud backup"
-    }
-  ]
+  "id": "local-idb",
+  "type": "IndexedDB",
+  "options": { "storeName": "zen-fs-config-my-app" },
+  "description": "Local IndexedDB primary backend"
 }
 ```
 
-Each program instance selects one backend as its primary via `primaryBackendId`. Others become replicas.
+**`.meta/backends/gitee-prod.json`** (user-added replica):
+```json
+{
+  "id": "gitee-prod",
+  "type": "Gitee",
+  "options": { "token": "...", "owner": "...", "repo": "...", "branch": "main" },
+  "description": "Production Gitee config repo"
+}
+```
+
+The local IndexedDB backend (`local-idb`) is always the primary — all config operations target it directly. All other backends are replicas with bi-directional sync.
+
+**Migration**: If a legacy `.meta/backends.json` file exists (pre-0.4.0), it is automatically migrated to individual files on startup.
 
 ## 5. Sync Rules (`.meta/sync-rules.json`)
 
@@ -343,99 +358,116 @@ interface ConfigRepo {
   /** List conflict archives */
   listConflicts(): Promise<ConflictArchive[]>;
 
-  /** Dispose: stop sync, release cache FS */
+  /** Read backend topology (aggregated from .meta/backends/*.json) */
+  getBackends(): Promise<BackendsMeta | null>;
+
+  /** Write backend topology (writes each backend as individual file) */
+  updateBackends(meta: BackendsMeta): Promise<void>;
+
+  /** Dynamically add a replica backend */
+  addBackend(id: string, type: string, options: Record<string, unknown>, description?: string): Promise<void>;
+
+  /** Dynamically remove a replica backend */
+  removeBackend(id: string): Promise<void>;
+
+  /** Delete a file with tombstone (propagates deletion to all backends) */
+  deleteFile(path: string): Promise<void>;
+
+  /** Sync .meta/ files to all replicas */
+  syncMetaToReplicas(): Promise<void>;
+
+  /** Dispose: stop sync, release resources */
   dispose(): Promise<void>;
 }
 ```
 
 ## 10. Initialization
 
+### Zero-parameter (offline-first)
+
 ```typescript
 import { createConfigRepo } from 'zen-fs-config';
 
-const repo = await createConfigRepo('app-a', {
-  // The only required external input: which backend to connect to
-  primaryBackendId: 'local-idb',
+// No parameters needed — IndexedDB is always created as primary
+const repo = await createConfigRepo('my-app');
 
-  // Backend connection info (only for the primary)
+// Config is immediately available from IndexedDB
+repo.setConfig('/db/host', { hostname: 'localhost', port: 3306 });
+```
+
+### With initial replica backend
+
+```typescript
+const repo = await createConfigRepo('my-app', {
+  // Optional: provide a remote backend as initial replica
+  primaryBackendId: 'gitee-prod',
   backendInfo: {
-    type: 'IndexedDB',
-    options: { dbName: 'app-a-config' }
+    type: 'Gitee',
+    options: { token: '...', owner: '...', repo: '...', branch: 'main' },
   },
-
-  // Node ID (optional, see §8.2 for auto-detection)
+  // Optional: customize IndexedDB store name
+  idbStoreName: 'my-app-config',
+  // Optional: node ID (auto-detected if not provided)
   nodeId: 'server-1',
-
-  // Cache configuration (optional, defaults shown)
-  cache: {
-    storeType: 'MemoryCacheStore',
-    ttlMs: 60000
-  },
-
-  // Bootstrap data (only used when .meta/backends.json doesn't exist)
-  bootstrap: {
-    backends: [
-      { id: 'local-idb', type: 'IndexedDB', options: { dbName: 'app-config' } },
-      { id: 'remote-s3', type: 'S3Bucket', options: { bucket: 'app-config' } }
-    ],
-    syncRules: [
-      { prefix: '/app-a/', direction: 'one-way', conflictStrategy: 'source-wins', replicas: ['local-idb', 'remote-s3'] },
-      { prefix: '/shared/', direction: 'bi-directional', conflictStrategy: 'merge', replicas: ['local-idb', 'remote-s3'] },
-      { prefix: '/nodes/', direction: 'none' },
-      { prefix: '/.meta/', direction: 'none' }
-    ]
-  }
 });
 
-// Normal config operations
-repo.setConfig('/db/host', { hostname: 'localhost', port: 3306 });
-const dbConfig = repo.getConfig<{ hostname: string; port: number }>('/db/host');
+// Later, add more backends dynamically
+await repo.addBackend('s3-backup', 'S3Bucket', {
+  bucket: 'app-config',
+  region: 'us-east-1',
+}, 'S3 backup');
 
-// Node-local config
-repo.setNodeConfig('server-1', '/local.json', { ip: '10.0.0.1' });
-
-// Publish for debugging (one-time sync)
-await repo.publishNodeConfig('server-1');
+// Remove a backend
+await repo.removeBackend('gitee-prod');
 
 // Cleanup
 await repo.dispose();
 ```
 
+### Re-opening (zero parameters)
+
+```typescript
+// On subsequent opens, just pass appId
+// IndexedDB + .meta/backends/ contain all state
+const repo = await createConfigRepo('my-app');
+
+// All previously added backends are automatically reconnected
+const backends = await repo.getBackends();
+// backends.backends = [{ id: 'local-idb', ... }, { id: 's3-backup', ... }]
+```
+
 ## 11. Initialization Flow
 
 ```
-createConfigRepo('app-a', { primaryBackendId: 'X', backendInfo: {...}, bootstrap: {...} })
+createConfigRepo('my-app', options?)
   │
-  ├─ 1. Connect to primary backend (backendId = 'X')
+  ├─ 1. Create IndexedDB backend (always, ID = 'local-idb')
+  │     storeName = options.idbStoreName || `zen-fs-config-${appId}`
   │
-  ├─ 2. Wrap with zen-fs-cache → CachedFileSystem(primaryBackend, cacheStore, { ttlMs })
+  ├─ 2. Ensure /.meta/ directory exists
   │
-  ├─ 3. Configure ZenFS VFS: { '/': cachedFS }
+  ├─ 3. Migrate legacy .meta/backends.json → .meta/backends/*.json (if exists)
   │
-  ├─ 4. Read .meta/backends.json
-  │     ├─ Exists → parse topology, create replica backend instances
-  │     └─ Not exists → write bootstrap data to .meta/
+  ├─ 4. Ensure local-idb descriptor exists in .meta/backends/
   │
-  ├─ 5. Read .meta/sync-rules.json
-  │     ├─ Exists → parse rules
-  │     └─ Not exists → use bootstrap syncRules
+  ├─ 5. If options.backendInfo provided:
+  │     ├─ Generate replica ID (options.primaryBackendId or auto)
+  │     └─ Write descriptor to .meta/backends/{replicaId}.json (if not exists)
   │
-  ├─ 6. For each rule with direction != 'none':
-  │     ├─ Create SyncPair(
-  │     │     source: cachedFS,
-  │     │     target: replicaBackend,
-  │     │     { direction, conflictStrategy, filter: { includePrefixes: [rule.prefix] } }
-  │     │   )
-  │     └─ syncEngine.watch(pairId)
+  ├─ 6. Read all backend descriptors from .meta/backends/
   │
   ├─ 7. Determine nodeId (explicit > env > auto-generated .node-id file)
   │
-  ├─ 8. Create ZenFS Context:
-  │     ├─ Allowed paths: /{appId}/, /shared/, /nodes/{nodeId}/, /.meta/
-  │     ├─ Root chroot: /{appId}/ (for getConfig/setConfig)
-  │     └─ Full access for zen-fs-sync (unrestricted)
+  ├─ 8. Create ConfigRepo with primary = 'local-idb'
   │
-  └─ 9. Return ConfigRepo { fs, appId, nodeId, ... }
+  ├─ 9. setupSync: for each backend (except local-idb):
+  │     ├─ Create backend instance
+  │     ├─ Create SyncPair(IndexedDB, replica, bi-directional)
+  │     └─ syncEngine.watch(pairId)
+  │
+  ├─ 10. syncMetaToReplicas: push .meta/ changes to all replicas
+  │
+  └─ 11. Load config cache from IndexedDB
 ```
 
 ## 12. Data Flow
@@ -486,11 +518,12 @@ Application
 
 ## 13. Peer Dependencies
 
-| Package | Role | Version |
-|---|---|---|
-| `@zenfs/core` | Virtual file system, backends, VFS, Context | >=2.3.0 |
-| `zen-fs-cache` | Read caching with ETag/304 revalidation | >=1.0.0 |
-| `zen-fs-sync` | Cross-backend sync engine | >=0.1.0 |
+| Package | Role | Version | Required |
+|---|---|---|---|
+| `@zenfs/core` | Virtual file system, backends, VFS, Context | >=2.3.0 | Yes |
+| `@zenfs/dom` | IndexedDB backend (browser) | >=1.0.0 | Yes (browser) |
+| `zen-fs-sync` | Cross-backend sync engine | >=0.1.0 | Yes |
+| `zen-fs-cache` | Read caching with ETag/304 revalidation | >=1.0.0 | No (optional) |
 
 ## 14. Extension Points
 

@@ -6,7 +6,7 @@
  * Core principle: zen-fs-config does NOT hardcode every ZenFS backend.
  * Instead, it provides:
  *   1. A simple registry API (registerBackend, createBackend, etc.)
- *   2. One built-in backend (InMemory) — zero extra dependencies
+ *   2. Two built-in backends (InMemory + IndexedDB) — zero extra config
  *   3. A wrapZenFSFileSystem() helper to adapt any ZenFS FileSystem
  *      implementation into the BackendInstance interface
  *
@@ -157,8 +157,7 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
 // ---------------------------------------------------------------------------
 // Built-in: InMemory
 //
-// The only backend bundled with zen-fs-config.  No extra dependencies
-// beyond @zenfs/core (which is a peer dep anyway).
+// No extra dependencies beyond @zenfs/core (which is a peer dep anyway).
 // ---------------------------------------------------------------------------
 
 let inMemoryCounter = 0;
@@ -170,4 +169,22 @@ registerBackend('InMemory', async (options) => {
   const label = (options.label as string) ?? `zen-fs-config-${++inMemoryCounter}`;
 
   return wrapZenFSFileSystem({ backend: InMemory, maxSize, label });
+});
+
+// ---------------------------------------------------------------------------
+// Built-in: IndexedDB (browser)
+//
+// Used as the default local primary backend for offline-first operation.
+// Requires @zenfs/dom (optional peer dependency). In Node.js environments
+// where @zenfs/dom is not available, this backend will fail at creation
+// time with a clear error message.
+// ---------------------------------------------------------------------------
+
+registerBackend('IndexedDB', async (options) => {
+  const { IndexedDB } = await import('@zenfs/dom');
+
+  const storeName = (options.storeName as string) ?? 'zen-fs-config';
+  const label = (options.label as string) ?? storeName;
+
+  return wrapZenFSFileSystem({ backend: IndexedDB, storeName, label });
 });

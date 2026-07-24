@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-config",
-  "version": "0.3.30",
+  "version": "0.4.0",
   "description": "Distributed config management library built on ZenFS, zen-fs-cache, and zen-fs-sync",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -31,7 +31,9 @@
     "distributed",
     "sync",
     "filesystem",
-    "configuration-management"
+    "configuration-management",
+    "indexeddb",
+    "offline-first"
   ],
   "license": "MIT",
   "repository": {
@@ -40,11 +42,21 @@
   },
   "peerDependencies": {
     "@zenfs/core": ">=2.3.0",
+    "@zenfs/dom": ">=1.0.0",
     "zen-fs-cache": ">=1.0.0",
     "zen-fs-sync": ">=0.1.0"
   },
+  "peerDependenciesMeta": {
+    "@zenfs/dom": {
+      "optional": true
+    },
+    "zen-fs-cache": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@zenfs/core": "^2.5.7",
+    "@zenfs/dom": "^1.0.0",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^1.6.1",
