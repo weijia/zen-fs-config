@@ -1096,16 +1096,29 @@ var ConfigRepo = class {
   async getBackends() {
     this.assertNotDisposed();
     const descriptors = await this.readAllBackendDescriptors();
-    if (descriptors.length === 0) return null;
-    return { version: 1, backends: descriptors };
+    const fullList = [
+      {
+        id: LOCAL_IDB_BACKEND_ID,
+        type: "IndexedDB",
+        options: { storeName: "" },
+        // actual storeName is internal
+        description: "Local IndexedDB primary (implicit)"
+      },
+      ...descriptors
+    ];
+    return { version: 1, backends: fullList };
   }
   async updateBackends(meta) {
     this.assertNotDisposed();
+    const replicas = meta.backends.filter((b) => b.id !== LOCAL_IDB_BACKEND_ID);
+    if (replicas.length === 0 && meta.backends.length === 0) {
+      return;
+    }
     await this.ensureDir(`${BACKENDS_DIR}/.keep`);
-    for (const desc of meta.backends) {
+    for (const desc of replicas) {
       await this.writeBackendDescriptor(desc);
     }
-    const keepIds = new Set(meta.backends.map((b) => b.id));
+    const keepIds = new Set(replicas.map((b) => b.id));
     const current = await this.readAllBackendDescriptors();
     for (const desc of current) {
       if (!keepIds.has(desc.id)) {
@@ -1213,6 +1226,10 @@ async function createConfigRepo(appId, options = {}) {
     console.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
     await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
     for (const desc of oldBackendsMeta.backends) {
+      if (desc.id === LOCAL_IDB_BACKEND_ID || desc.type === "IndexedDB") {
+        console.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
+        continue;
+      }
       await tempRepo.writeBackendDescriptor(desc);
     }
     try {
@@ -1224,18 +1241,6 @@ async function createConfigRepo(appId, options = {}) {
     } catch {
     }
     console.log(`[createConfigRepo] Migration complete`);
-  }
-  await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
-  const existingBackends = await tempRepo.readAllBackendDescriptors();
-  const hasLocalIdb = existingBackends.some((b) => b.id === LOCAL_IDB_BACKEND_ID);
-  if (!hasLocalIdb) {
-    await tempRepo.writeBackendDescriptor({
-      id: LOCAL_IDB_BACKEND_ID,
-      type: "IndexedDB",
-      options: { storeName: idbStoreName },
-      description: "Local IndexedDB primary backend"
-    });
-    console.log(`[createConfigRepo] Created local-idb descriptor`);
   }
   if (options.backendInfo) {
     const replicaId = options.primaryBackendId || `${options.backendInfo.type}-replica`;
@@ -1253,7 +1258,7 @@ async function createConfigRepo(appId, options = {}) {
     }
   }
   const allBackends = await tempRepo.readAllBackendDescriptors();
-  console.log(`[createConfigRepo] Backends: ${allBackends.map((b) => b.id).join(", ")}`);
+  console.log(`[createConfigRepo] Replica backends: ${allBackends.map((b) => b.id).join(", ") || "(none)"}`);
   let nodeId = options.nodeId;
   if (!nodeId && typeof process !== "undefined" && process.env?.NODE_ID) {
     nodeId = process.env.NODE_ID;

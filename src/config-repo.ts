@@ -839,22 +839,37 @@ export class ConfigRepo implements IConfigRepo {
   async getBackends(): Promise<BackendsMeta | null> {
     this.assertNotDisposed();
     const descriptors = await this.readAllBackendDescriptors();
-    if (descriptors.length === 0) return null;
-    return { version: 1, backends: descriptors };
+    // Always include the implicit local IndexedDB primary at the front
+    const fullList: BackendDescriptor[] = [
+      {
+        id: LOCAL_IDB_BACKEND_ID,
+        type: 'IndexedDB',
+        options: { storeName: '' }, // actual storeName is internal
+        description: 'Local IndexedDB primary (implicit)',
+      },
+      ...descriptors,
+    ];
+    return { version: 1, backends: fullList };
   }
 
   async updateBackends(meta: BackendsMeta): Promise<void> {
     this.assertNotDisposed();
+    // Filter out the implicit local IndexedDB — it's never stored as a file
+    const replicas = meta.backends.filter(b => b.id !== LOCAL_IDB_BACKEND_ID);
+    if (replicas.length === 0 && meta.backends.length === 0) {
+      return;
+    }
+
     // Ensure backends directory exists
     await this.ensureDir(`${BACKENDS_DIR}/.keep`);
 
     // Write each backend as an individual file
-    for (const desc of meta.backends) {
+    for (const desc of replicas) {
       await this.writeBackendDescriptor(desc);
     }
 
     // Remove any backend files that are no longer in the list
-    const keepIds = new Set(meta.backends.map(b => b.id));
+    const keepIds = new Set(replicas.map(b => b.id));
     const current = await this.readAllBackendDescriptors();
     for (const desc of current) {
       if (!keepIds.has(desc.id)) {
@@ -1017,6 +1032,11 @@ export async function createConfigRepo(
     console.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
     await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
     for (const desc of oldBackendsMeta.backends) {
+      // Skip the local IndexedDB primary — it's implicit, not stored
+      if (desc.id === LOCAL_IDB_BACKEND_ID || desc.type === 'IndexedDB') {
+        console.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
+        continue;
+      }
       await tempRepo.writeBackendDescriptor(desc);
     }
     // Delete legacy file + version sidecar
@@ -1026,23 +1046,7 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 5: Ensure local-idb descriptor exists in .meta/backends/
-  // -------------------------------------------------------------------
-  await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
-  const existingBackends = await tempRepo.readAllBackendDescriptors();
-  const hasLocalIdb = existingBackends.some(b => b.id === LOCAL_IDB_BACKEND_ID);
-  if (!hasLocalIdb) {
-    await tempRepo.writeBackendDescriptor({
-      id: LOCAL_IDB_BACKEND_ID,
-      type: 'IndexedDB',
-      options: { storeName: idbStoreName },
-      description: 'Local IndexedDB primary backend',
-    });
-    console.log(`[createConfigRepo] Created local-idb descriptor`);
-  }
-
-  // -------------------------------------------------------------------
-  // Step 6: If backendInfo is provided, add as replica (if not present)
+  // Step 5: If backendInfo is provided, add as replica (if not present)
   // -------------------------------------------------------------------
   if (options.backendInfo) {
     const replicaId = options.primaryBackendId || `${options.backendInfo.type}-replica`;
@@ -1061,13 +1065,13 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 7: Read all backends (including local-idb)
+  // Step 6: Read all backends (replicas only, local-idb is implicit)
   // -------------------------------------------------------------------
   const allBackends = await tempRepo.readAllBackendDescriptors();
-  console.log(`[createConfigRepo] Backends: ${allBackends.map(b => b.id).join(', ')}`);
+  console.log(`[createConfigRepo] Replica backends: ${allBackends.map(b => b.id).join(', ') || '(none)'}`);
 
   // -------------------------------------------------------------------
-  // Step 8: Determine nodeId
+  // Step 7: Determine nodeId
   // -------------------------------------------------------------------
   let nodeId = options.nodeId;
   if (!nodeId && typeof process !== 'undefined' && process.env?.NODE_ID) {
@@ -1091,7 +1095,7 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 9: Create final ConfigRepo and set up sync
+  // Step 8: Create final ConfigRepo and set up sync
   // -------------------------------------------------------------------
   const serializer = createSerializerChain(options.serializer);
   const repo = new ConfigRepo(
