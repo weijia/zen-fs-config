@@ -399,7 +399,13 @@ declare class ConfigRepo implements IConfigRepo {
     readMetaFile<T>(path: string): Promise<T | null>;
     /** Path for a single backend descriptor: .meta/backends/{id}.json */
     backendFilePath(id: string): string;
-    /** Read all backend descriptors from .meta/backends/*.json */
+    /**
+     * Read all backend descriptors from .meta/backends/*.json.
+     *
+     * If duplicate backends are detected (same type + options but different id),
+     * only the first one (sorted by id) is kept and the rest are removed
+     * (including their version sidecar files).
+     */
     readAllBackendDescriptors(): Promise<BackendDescriptor[]>;
     /** Write a single backend descriptor as .meta/backends/{id}.json */
     writeBackendDescriptor(desc: BackendDescriptor): Promise<void>;

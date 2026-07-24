@@ -794,7 +794,13 @@ export class ConfigRepo implements IConfigRepo {
     return `${BACKENDS_DIR}/${id}.json`;
   }
 
-  /** Read all backend descriptors from .meta/backends/*.json */
+  /**
+   * Read all backend descriptors from .meta/backends/*.json.
+   *
+   * If duplicate backends are detected (same type + options but different id),
+   * only the first one (sorted by id) is kept and the rest are removed
+   * (including their version sidecar files).
+   */
   async readAllBackendDescriptors(): Promise<BackendDescriptor[]> {
     try {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
@@ -803,10 +809,40 @@ export class ConfigRepo implements IConfigRepo {
         if (!entry.endsWith('.json')) continue;
         try {
           const raw = await this.cachedFS.readFile(`${BACKENDS_DIR}/${entry}`);
-          descriptors.push(JSON.parse(new TextDecoder().decode(toUint8Array(raw))));
+          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          if (desc.id && desc.type) {
+            descriptors.push(desc);
+          }
         } catch { /* skip corrupt file */ }
       }
-      return descriptors;
+
+      // Deduplicate: same type + options but different id
+      // Group by "type + JSON.stringify(options)", keep the first (sorted by id)
+      const seen = new Map<string, string>(); // key -> kept id
+      const duplicates: string[] = [];
+
+      // Sort by id for deterministic result
+      descriptors.sort((a, b) => a.id.localeCompare(b.id));
+
+      for (const desc of descriptors) {
+        const key = `${desc.type}:${JSON.stringify(desc.options ?? {})}`;
+        if (seen.has(key)) {
+          duplicates.push(desc.id);
+        } else {
+          seen.set(key, desc.id);
+        }
+      }
+
+      if (duplicates.length > 0) {
+        console.log(
+          `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
+        );
+        for (const dupId of duplicates) {
+          await this.removeBackendDescriptor(dupId);
+        }
+      }
+
+      return descriptors.filter(d => !duplicates.includes(d.id));
     } catch {
       return []; // Directory doesn't exist yet
     }
