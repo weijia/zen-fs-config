@@ -803,32 +803,44 @@ export class ConfigRepo implements IConfigRepo {
   async readAllBackendDescriptors(): Promise<BackendDescriptor[]> {
     try {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
-      const descriptors: BackendDescriptor[] = [];
+      // Collect descriptor + file mtime for dedup
+      const items: { desc: BackendDescriptor; mtime: number }[] = [];
       for (const entry of entries) {
         if (!entry.endsWith('.json')) continue;
+        const filePath = `${BACKENDS_DIR}/${entry}`;
         try {
-          const raw = await this.cachedFS.readFile(`${BACKENDS_DIR}/${entry}`);
+          const raw = await this.cachedFS.readFile(filePath);
           const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
           if (desc.id && desc.type) {
-            descriptors.push(desc);
+            let mtime = 0;
+            try {
+              const stat = await this.cachedFS.stat(filePath);
+              mtime = stat.mtimeMs ?? 0;
+            } catch { /* mtime unknown */ }
+            items.push({ desc, mtime });
           }
         } catch { /* skip corrupt file */ }
       }
 
-      // Deduplicate: same type + options but different id
-      // Group by "type + JSON.stringify(options)", keep the first (sorted by id)
-      const seen = new Map<string, string>(); // key -> kept id
+      // Deduplicate: same type + options but different id.
+      // Keep the one with the earliest mtime (created first).
+      const seen = new Map<string, { desc: BackendDescriptor; mtime: number }>();
       const duplicates: string[] = [];
 
-      // Sort by id for deterministic result
-      descriptors.sort((a, b) => a.id.localeCompare(b.id));
-
-      for (const desc of descriptors) {
-        const key = `${desc.type}:${JSON.stringify(desc.options ?? {})}`;
-        if (seen.has(key)) {
-          duplicates.push(desc.id);
+      for (const item of items) {
+        const key = `${item.desc.type}:${JSON.stringify(item.desc.options ?? {})}`;
+        const existing = seen.get(key);
+        if (existing) {
+          if (item.mtime < existing.mtime) {
+            // New one is older — keep it, mark the existing as duplicate
+            duplicates.push(existing.desc.id);
+            seen.set(key, item);
+          } else {
+            // Existing is older (or same time) — keep existing, mark new as duplicate
+            duplicates.push(item.desc.id);
+          }
         } else {
-          seen.set(key, desc.id);
+          seen.set(key, item);
         }
       }
 
@@ -841,7 +853,7 @@ export class ConfigRepo implements IConfigRepo {
         }
       }
 
-      return descriptors.filter(d => !duplicates.includes(d.id));
+      return Array.from(seen.values()).map(i => i.desc);
     } catch {
       return []; // Directory doesn't exist yet
     }
@@ -1131,10 +1143,14 @@ export async function createConfigRepo(
 
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID);
 
-  // Push .meta/ files to all replicas so topology is available everywhere
-  await repo.syncMetaToReplicas();
-
+  // Load config cache from local IndexedDB (fast, no network)
   await repo.load();
+
+  // Sync to replicas in the background — watchers are already running,
+  // so this just speeds up the initial push. Don't block the caller.
+  repo.syncMetaToReplicas().catch((err) => {
+    console.error('[createConfigRepo] background syncMetaToReplicas failed:', err);
+  });
 
   return repo;
 }

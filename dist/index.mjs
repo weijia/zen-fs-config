@@ -1037,27 +1037,39 @@ var ConfigRepo = class {
   async readAllBackendDescriptors() {
     try {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
-      const descriptors = [];
+      const items = [];
       for (const entry of entries) {
         if (!entry.endsWith(".json")) continue;
+        const filePath = `${BACKENDS_DIR}/${entry}`;
         try {
-          const raw = await this.cachedFS.readFile(`${BACKENDS_DIR}/${entry}`);
+          const raw = await this.cachedFS.readFile(filePath);
           const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
           if (desc.id && desc.type) {
-            descriptors.push(desc);
+            let mtime = 0;
+            try {
+              const stat = await this.cachedFS.stat(filePath);
+              mtime = stat.mtimeMs ?? 0;
+            } catch {
+            }
+            items.push({ desc, mtime });
           }
         } catch {
         }
       }
       const seen = /* @__PURE__ */ new Map();
       const duplicates = [];
-      descriptors.sort((a, b) => a.id.localeCompare(b.id));
-      for (const desc of descriptors) {
-        const key = `${desc.type}:${JSON.stringify(desc.options ?? {})}`;
-        if (seen.has(key)) {
-          duplicates.push(desc.id);
+      for (const item of items) {
+        const key = `${item.desc.type}:${JSON.stringify(item.desc.options ?? {})}`;
+        const existing = seen.get(key);
+        if (existing) {
+          if (item.mtime < existing.mtime) {
+            duplicates.push(existing.desc.id);
+            seen.set(key, item);
+          } else {
+            duplicates.push(item.desc.id);
+          }
         } else {
-          seen.set(key, desc.id);
+          seen.set(key, item);
         }
       }
       if (duplicates.length > 0) {
@@ -1068,7 +1080,7 @@ var ConfigRepo = class {
           await this.removeBackendDescriptor(dupId);
         }
       }
-      return descriptors.filter((d) => !duplicates.includes(d.id));
+      return Array.from(seen.values()).map((i) => i.desc);
     } catch {
       return [];
     }
@@ -1280,8 +1292,10 @@ async function createConfigRepo(appId, options = {}) {
     options.onConflict
   );
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID);
-  await repo.syncMetaToReplicas();
   await repo.load();
+  repo.syncMetaToReplicas().catch((err) => {
+    console.error("[createConfigRepo] background syncMetaToReplicas failed:", err);
+  });
   return repo;
 }
 export {
