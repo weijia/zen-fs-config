@@ -169,6 +169,13 @@ export interface ConfigRepoOptions {
 
   /** Custom conflict handler. Called before auto-resolution. */
   onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>;
+
+  /**
+   * Sync polling interval in milliseconds.
+   * Controls how often the sync engine checks for remote changes.
+   * Default: 1800000 (30 minutes).
+   */
+  syncPollIntervalMs?: number;
 }
 
 // ---------------------------------------------------------------------------

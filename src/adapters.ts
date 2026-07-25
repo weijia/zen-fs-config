@@ -68,6 +68,11 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
     },
   };
 
+  // Pass through checkForUpdates if the backend implements it
+  if (typeof (backend as any).checkForUpdates === 'function') {
+    syncable.checkForUpdates = () => (backend as any).checkForUpdates();
+  }
+
   // Set backendName for zen-fs-sync logging
   if (name) {
     syncable.backendName = name;

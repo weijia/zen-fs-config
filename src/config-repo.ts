@@ -566,8 +566,9 @@ export class ConfigRepo implements IConfigRepo {
   async setupSync(
     backends: BackendDescriptor[],
     primaryBackendId: string,
+    pollIntervalMs?: number,
   ): Promise<void> {
-    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId}`);
+    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? 'default'}ms`);
 
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
@@ -587,6 +588,7 @@ export class ConfigRepo implements IConfigRepo {
           {
             direction: SyncDirection.BiDirectional,
             conflictStrategy: 'source-wins' as any,
+            pollIntervalMs,
           },
           '/',
         );
@@ -1141,7 +1143,7 @@ export async function createConfigRepo(
     options.onConflict,
   );
 
-  await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID);
+  await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
 
   // Load config cache from local IndexedDB (fast, no network)
   await repo.load();

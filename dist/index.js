@@ -263,6 +263,9 @@ function backendToSyncableFS(backend, name) {
       return backend.exists(path);
     }
   };
+  if (typeof backend.checkForUpdates === "function") {
+    syncable.checkForUpdates = () => backend.checkForUpdates();
+  }
   if (name) {
     syncable.backendName = name;
   } else if (backend.backendName) {
@@ -894,8 +897,8 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   // Internal — Setup
   // -----------------------------------------------------------------------
-  async setupSync(backends, primaryBackendId) {
-    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId}`);
+  async setupSync(backends, primaryBackendId, pollIntervalMs) {
+    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? "default"}ms`);
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
       if (desc.enabled === false) {
@@ -911,7 +914,8 @@ var ConfigRepo = class {
           syncable,
           {
             direction: import_zen_fs_sync.SyncDirection.BiDirectional,
-            conflictStrategy: "source-wins"
+            conflictStrategy: "source-wins",
+            pollIntervalMs
           },
           "/"
         );
@@ -1343,7 +1347,7 @@ async function createConfigRepo(appId, options = {}) {
     serializer,
     options.onConflict
   );
-  await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID);
+  await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
   await repo.load();
   repo.syncMetaToReplicas().catch((err) => {
     console.error("[createConfigRepo] background syncMetaToReplicas failed:", err);

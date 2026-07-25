@@ -125,6 +125,12 @@ interface ConfigRepoOptions {
     serializer?: ConfigSerializer;
     /** Custom conflict handler. Called before auto-resolution. */
     onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>;
+    /**
+     * Sync polling interval in milliseconds.
+     * Controls how often the sync engine checks for remote changes.
+     * Default: 1800000 (30 minutes).
+     */
+    syncPollIntervalMs?: number;
 }
 /** The main configuration repository interface. */
 interface IConfigRepo {
@@ -389,7 +395,7 @@ declare class ConfigRepo implements IConfigRepo {
     listConflicts(): Promise<ConflictArchive[]>;
     readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
     dispose(): Promise<void>;
-    setupSync(backends: BackendDescriptor[], primaryBackendId: string): Promise<void>;
+    setupSync(backends: BackendDescriptor[], primaryBackendId: string, pollIntervalMs?: number): Promise<void>;
     private persistConfig;
     private reloadConfigCache;
     private handleConflict;
