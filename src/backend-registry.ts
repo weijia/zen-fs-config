@@ -143,7 +143,14 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
   const zenfs = await import('@zenfs/core');
   const isolatedFS = await zenfs.resolveMountConfig(config);
 
-  return {
+  // --- onChange 推送：本地写入时通知 sync 引擎 ---
+  let changeCallback: (() => void) | null = null;
+
+  const notifyChange = (): void => {
+    if (changeCallback) changeCallback();
+  };
+
+  const backend: BackendInstance = {
     async readFile(path: string, ...args: any[]): Promise<any> {
       const st = await isolatedFS.stat(path);
       const size = st.size;
@@ -178,6 +185,8 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
       try {
         await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
       } catch { /* backend doesn't support touch — metadata is server-managed */ }
+      // 通知 sync 引擎：本地有变更
+      notifyChange();
     },
     async readdir(path: string): Promise<string[]> {
       return isolatedFS.readdir(path);
@@ -197,15 +206,26 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
       return isolatedFS.mkdir(path, options ?? { uid: 0, gid: 0, mode: 0o755 });
     },
     async unlink(path: string): Promise<void> {
-      return isolatedFS.unlink(path);
+      await isolatedFS.unlink(path);
+      // 通知 sync 引擎：本地有变更
+      notifyChange();
     },
     async rmdir(path: string): Promise<void> {
       return isolatedFS.rmdir(path);
     },
     async rename(oldPath: string, newPath: string): Promise<void> {
-      return isolatedFS.rename(oldPath, newPath);
+      await isolatedFS.rename(oldPath, newPath);
+      // 通知 sync 引擎：本地有变更
+      notifyChange();
     },
   };
+
+  // 挂载 onChange 方法，供 sync 引擎注册回调
+  (backend as any).onChange = (callback: () => void): void => {
+    changeCallback = callback;
+  };
+
+  return backend;
 }
 
 // ---------------------------------------------------------------------------

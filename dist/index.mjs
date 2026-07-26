@@ -211,6 +211,12 @@ function backendToSyncableFS(backend, name) {
       return backend.exists(path);
     }
   };
+  if (typeof backend.onChange === "function") {
+    syncable.onChange = (cb) => backend.onChange(cb);
+  }
+  if (typeof backend.shouldSync === "function") {
+    syncable.shouldSync = () => backend.shouldSync();
+  }
   if (typeof backend.checkForUpdates === "function") {
     syncable.checkForUpdates = () => backend.checkForUpdates();
   }
@@ -261,7 +267,11 @@ function listBackendMetadata() {
 async function wrapZenFSFileSystem(config) {
   const zenfs = await import("@zenfs/core");
   const isolatedFS = await zenfs.resolveMountConfig(config);
-  return {
+  let changeCallback = null;
+  const notifyChange = () => {
+    if (changeCallback) changeCallback();
+  };
+  const backend = {
     async readFile(path, ...args) {
       const st = await isolatedFS.stat(path);
       const size = st.size;
@@ -289,6 +299,7 @@ async function wrapZenFSFileSystem(config) {
         await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
       } catch {
       }
+      notifyChange();
     },
     async readdir(path) {
       return isolatedFS.readdir(path);
@@ -308,15 +319,21 @@ async function wrapZenFSFileSystem(config) {
       return isolatedFS.mkdir(path, options ?? { uid: 0, gid: 0, mode: 493 });
     },
     async unlink(path) {
-      return isolatedFS.unlink(path);
+      await isolatedFS.unlink(path);
+      notifyChange();
     },
     async rmdir(path) {
       return isolatedFS.rmdir(path);
     },
     async rename(oldPath, newPath) {
-      return isolatedFS.rename(oldPath, newPath);
+      await isolatedFS.rename(oldPath, newPath);
+      notifyChange();
     }
   };
+  backend.onChange = (callback) => {
+    changeCallback = callback;
+  };
+  return backend;
 }
 var inMemoryCounter = 0;
 registerBackend("InMemory", async (options) => {
