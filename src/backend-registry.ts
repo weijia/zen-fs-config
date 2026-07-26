@@ -172,7 +172,12 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
         await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
       }
       await isolatedFS.write(path, bytes, 0);
-      await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
+      // touch updates local Inode metadata (size/mtime). Some backends (e.g.
+      // RemoteStorage) don't support touch and throw — that's fine since their
+      // metadata is server-managed, so we silently ignore the error.
+      try {
+        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
+      } catch { /* backend doesn't support touch — metadata is server-managed */ }
     },
     async readdir(path: string): Promise<string[]> {
       return isolatedFS.readdir(path);

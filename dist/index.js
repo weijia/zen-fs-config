@@ -337,7 +337,10 @@ async function wrapZenFSFileSystem(config) {
         await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 420 });
       }
       await isolatedFS.write(path, bytes, 0);
-      await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
+      try {
+        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
+      } catch {
+      }
     },
     async readdir(path) {
       return isolatedFS.readdir(path);
