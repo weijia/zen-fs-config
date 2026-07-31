@@ -9,6 +9,13 @@ zen-fs-config is a distributed configuration management library built on top of:
 
 It allows multiple application instances (programs) running on different nodes to share configuration through a network of ZenFS backends, with per-app isolation, shared config spaces, node-local config, and conflict safety.
 
+zen-fs-config supports two types of **sync groups**, each backed by a multi-backend sync network but serving different purposes:
+
+- **Config-sync group** — Synchronizes the configuration repository itself: backend topology, app configs, shared configs, node-local configs. This is the "meta layer."
+- **Data-sync group** — Synchronizes application data only. A data-sync group can be used standalone, or referenced by a config-sync group as an app's data storage layer.
+
+A config-sync group can reference one or more data-sync groups per app, allowing apps to store bulk data on separate backends (e.g., a different repo/branch under the same account) while keeping configuration management unified.
+
 ## 2. Architecture
 
 ### 2.1 Three-Layer Stack
@@ -47,18 +54,67 @@ Backend topology and sync rules are stored **inside** the configuration reposito
 
 External input at startup is limited to: **which backend to connect to** and optionally **bootstrap data** (if the repo doesn't exist yet).
 
+### 2.4 Sync Group Types
+
+A **sync group** is a set of backends that synchronize with each other. There are two types:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Config-Sync Group                                              │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │ .meta/backends/         ← config-sync backends        │       │
+│  │ .meta/app-data-groups/  ← references to data-sync     │       │
+│  │ /{appId}/                ← app config data            │       │
+│  │ /shared/                 ← shared config              │       │
+│  │ /nodes/                  ← node-local config          │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │ references                            │
+│                          ▼                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │ Data-Sync Group (per-app)                             │       │
+│  │ .meta/backends/         ← data-sync backends          │       │
+│  │ /                        ← app data files             │       │
+│  └──────────────────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Config-sync group**:
+- Synced content: `.meta/` (topology), `/{appId}/` (app config), `/shared/`, `/nodes/`
+- Backends: full credentials + storage location (e.g., Gitee: token + owner + repo + branch)
+- Can reference data-sync groups via `.meta/app-data-groups/{appId}/`
+
+**Data-sync group**:
+- Synced content: application data files only (no config meta layer)
+- Backends: full credentials + storage location, but typically reusing the same account as a config-sync backend with a different storage target (e.g., same token/owner, different repo/branch)
+- Can be used standalone (no config-sync group needed)
+- Can be referenced by a config-sync group as an app's data storage
+
+**Group type detection**: When connecting to a backend, the library reads `.meta/group-type` to determine the group type. If the file is absent, the backend is treated as a new empty group and the caller decides which type to create.
+
+| `.meta/group-type` | Behavior |
+|---|---|
+| `config-sync` | Full system: IndexedDB primary + config replicas + optional data-sync groups |
+| `data-sync` | Lightweight: data backends only, direct read/write, no config meta layer |
+| absent | New empty backend; caller decides group type at creation time |
+
 ## 3. File System Structure
+
+### 3.1 Config-Sync Group
 
 ```
 /
 ├─ .meta/                               [synced to replicas]
-│  ├─ backends/                          Backend topology (one file per backend)
-│  │  ├─ local-idb.json                  { id, type, options, description }
+│  ├─ group-type                        Group type marker: "config-sync"
+│  ├─ backends/                         Backend topology (one file per backend)
+│  │  ├─ local-idb.json                 { id, type, options, description }
 │  │  ├─ gitee-prod.json
 │  │  └─ ...
-│  ├─ .deleted/                          Tombstones for deletion propagation
+│  ├─ app-data-groups/                  References to data-sync groups (per app)
+│  │  └─ {appId}/
+│  │     └─ {dataGroupId}.json          { groupType: "data-sync", backends: [...] }
+│  ├─ .deleted/                         Tombstones for deletion propagation
 │  │  └─ {encoded-path}.json
-│  └─ .conflicts/                        Conflict archives (safekeeping)
+│  └─ .conflicts/                       Conflict archives (safekeeping)
 │     └─ {timestamp}_{path}/
 │        ├─ meta.json
 │        ├─ source
@@ -81,7 +137,27 @@ External input at startup is limited to: **which backend to connect to** and opt
    └─ .node-id                           Current node's ID (auto-generated)
 ```
 
-### 3.1 Directory Semantics
+### 3.2 Data-Sync Group
+
+```
+/
+├─ .meta/                               [synced to replicas]
+│  ├─ group-type                        Group type marker: "data-sync"
+│  └─ backends/                         Data backend topology (one file per backend)
+│     ├─ gitee-data-1.json              { id, type, options, description }
+│     └─ gitee-data-2.json
+│
+└─ (application data files)             [synced: bi-directional]
+   ├─ documents/
+   │  ├─ note-1.json
+   │  └─ note-2.json
+   └─ media/
+      └─ config.json
+```
+
+A data-sync group has a much simpler structure: no version sidecars, no tombstones, no conflict archives — just raw data files and a minimal `.meta/` for backend topology and group type identification.
+
+### 3.3 Directory Semantics (Config-Sync Group)
 
 | Directory | Sync Direction | Conflict Risk | Purpose |
 |---|---|---|---|
@@ -90,7 +166,7 @@ External input at startup is limited to: **which backend to connect to** and opt
 | `/nodes/` | None (by default) | None | Per-node local config |
 | `/.meta/` | Bi-directional | None (topology files) | Backend topology, tombstones, conflict archives |
 
-### 3.2 Config-to-File Mapping
+### 3.4 Config-to-File Mapping
 
 Each config key maps to one file. The mapping is straightforward:
 
@@ -99,7 +175,7 @@ Each config key maps to one file. The mapping is straightforward:
 - Path is relative to the app's root (`/{appId}/`), with `.json` extension appended automatically
 - If path already has an extension (e.g., `/readme.md`), the extension is preserved
 
-### 3.3 Serialization
+### 3.5 Serialization
 
 The serializer is determined by file extension:
 
@@ -139,6 +215,53 @@ Each backend is stored as an individual JSON file in `.meta/backends/`. This all
 The local IndexedDB backend (`local-idb`) is always the primary — all config operations target it directly. All other backends are replicas with bi-directional sync.
 
 **Migration**: If a legacy `.meta/backends.json` file exists (pre-0.4.0), it is automatically migrated to individual files on startup.
+
+## 4.1 App Data Groups (`.meta/app-data-groups/{appId}/`)
+
+A config-sync group can reference data-sync groups on behalf of specific apps. Each reference is stored as a JSON file under `.meta/app-data-groups/{appId}/`.
+
+**`.meta/app-data-groups/my-app/data-store-1.json`**:
+```json
+{
+  "id": "data-store-1",
+  "groupType": "data-sync",
+  "backends": [
+    {
+      "id": "gitee-data",
+      "type": "Gitee",
+      "options": { "token": "...", "owner": "...", "repo": "my-app-data", "branch": "main" },
+      "accountBackendId": "gitee-prod",
+      "description": "App data on Gitee (reuses gitee-prod account)"
+    }
+  ]
+}
+```
+
+### Account Reuse
+
+The `accountBackendId` field (optional) references a config-sync backend whose account fields (e.g., `token`, `owner`, `baseUrl` for Gitee/GitHub) are reused. When present, the data-sync backend's `options` only need to specify the **storage location** fields (e.g., `repo`, `branch`); account fields are merged in from the referenced config-sync backend at creation time.
+
+When `accountBackendId` is absent or null, the data-sync backend must provide a complete set of options (including credentials).
+
+The `accountFields` metadata for each backend type (registered via `BackendMetadata.accountFields`) determines which fields are "account" vs "storage location":
+
+| Backend Type | Account Fields | Storage Location Fields |
+|---|---|---|
+| Gitee | `token`, `owner`, `baseUrl` | `repo`, `branch` |
+| GitHub | `token`, `owner`, `baseUrl` | `repo`, `branch` |
+| WebDAV | `url`, `username`, `password` | `rootPath` |
+| RemoteStorage | `userAddress`, `token` | (none) |
+
+### Standalone Data-Sync Group
+
+A data-sync group can also be used **without** a config-sync group. In this case:
+
+1. The user provides a single backend configuration (e.g., Gitee: token + owner + repo + branch)
+2. The library connects and reads `.meta/group-type` → `"data-sync"`
+3. The app directly reads/writes data files on these backends
+4. No config meta layer, no version sidecars, no tombstones — just raw data sync
+
+Multiple data-sync backends can be registered within a single data-sync group, providing redundancy and multi-device sync for app data.
 
 ## 5. Sync Rules (`.meta/sync-rules.json`)
 
@@ -376,8 +499,63 @@ interface ConfigRepo {
   /** Sync .meta/ files to all replicas */
   syncMetaToReplicas(): Promise<void>;
 
+  // --- App Data Storage (data-sync groups) ---
+
+  /**
+   * Create a data-sync group for this app, referencing a config-sync backend's account.
+   * The data-sync group gets its own set of backends (typically reusing an account
+   * from a config-sync backend but with different storage location like repo/branch).
+   *
+   * @param id Data group ID (e.g., "data-store-1")
+   * @param backends Array of backend descriptors for the data-sync group.
+   *                 Each can optionally specify `accountBackendId` to reuse credentials.
+   */
+  createAppDataGroup(
+    id: string,
+    backends: AppDataBackendDescriptor[],
+  ): Promise<AppDataGroup>;
+
+  /**
+   * Get an existing data-sync group for this app.
+   * Returns a handle with its own fs for reading/writing data files.
+   */
+  getAppDataGroup(id: string): Promise<AppDataGroup>;
+
+  /** List all data-sync groups registered for this app. */
+  listAppDataGroups(): Promise<AppDataGroupDescriptor[]>;
+
+  /** Remove a data-sync group (stops sync, removes descriptor). */
+  removeAppDataGroup(id: string): Promise<void>;
+
   /** Dispose: stop sync, release resources */
   dispose(): Promise<void>;
+}
+
+/**
+ * A data-sync group handle. Provides direct file system access
+ * to the app's data storage, independent of the config-sync layer.
+ */
+interface AppDataGroup {
+  readonly groupId: string;
+  readonly appId: string;
+  /** Direct fs for reading/writing data files (chroot to this group's root) */
+  readonly fs: typeof import('node:fs');
+  /** Get sync status for this data group's sync pairs */
+  getSyncStatuses(): Map<string, SyncPairStatus>;
+  /** Manually flush pending sync */
+  flush(): Promise<SyncResult[]>;
+  /** Stop sync and release resources */
+  dispose(): Promise<void>;
+}
+
+/** Descriptor for a backend within a data-sync group. */
+interface AppDataBackendDescriptor {
+  id: string;
+  type: string;
+  options: Record<string, unknown>;
+  /** Optional: reuse account fields from a config-sync backend */
+  accountBackendId?: string;
+  description?: string;
 }
 ```
 
@@ -436,7 +614,61 @@ const backends = await repo.getBackends();
 // backends.backends = [{ id: 'local-idb', ... }, { id: 's3-backup', ... }]
 ```
 
+### Standalone Data-Sync Group (no config layer)
+
+```typescript
+import { createDataSyncGroup } from 'zen-fs-config';
+
+// User provides a data backend directly — no config-sync layer needed
+const dataGroup = await createDataSyncGroup('my-app', {
+  backendInfo: {
+    type: 'Gitee',
+    options: { token: '...', owner: '...', repo: 'my-app-data', branch: 'main' },
+  },
+});
+
+// Read/write data files directly
+await dataGroup.fs.promises.writeFile('/notes/todo.json', JSON.stringify({ task: 'buy milk' }));
+const data = JSON.parse(await dataGroup.fs.promises.readFile('/notes/todo.json', 'utf-8'));
+
+// Add more data backends later (multi-backend sync)
+await dataGroup.addBackend('gitee-backup', 'Gitee', {
+  token: '...', owner: '...', repo: 'my-app-data-backup', branch: 'main',
+});
+
+// Cleanup
+await dataGroup.dispose();
+```
+
+### Config-Sync with App Data Group (account reuse)
+
+```typescript
+const repo = await createConfigRepo('my-app', {
+  backendInfo: {
+    type: 'Gitee',
+    options: { token: '...', owner: '...', repo: 'configs', branch: 'main' },
+  },
+});
+
+// Create a data-sync group that reuses the config backend's account
+// but stores data in a different repo
+await repo.createAppDataGroup('data-store-1', [
+  {
+    id: 'gitee-data',
+    type: 'Gitee',
+    accountBackendId: 'gitee-prod',  // reuse token + owner from this config backend
+    options: { repo: 'my-app-data', branch: 'main' },  // only storage location
+  },
+]);
+
+// Get the data group handle for direct file access
+const dataGroup = await repo.getAppDataGroup('data-store-1');
+await dataGroup.fs.promises.writeFile('/cache.json', '{"key":"value"}');
+```
+
 ## 11. Initialization Flow
+
+### 11.1 Config-Sync Group (`createConfigRepo`)
 
 ```
 createConfigRepo('my-app', options?)
@@ -446,9 +678,9 @@ createConfigRepo('my-app', options?)
   │
   ├─ 2. Ensure /.meta/ directory exists
   │
-  ├─ 3. Migrate legacy .meta/backends.json → .meta/backends/*.json (if exists)
+  ├─ 3. Write /.meta/group-type = "config-sync" (if not exists)
   │
-  ├─ 4. Ensure local-idb descriptor exists in .meta/backends/
+  ├─ 4. Migrate legacy .meta/backends.json → .meta/backends/*.json (if exists)
   │
   ├─ 5. If options.backendInfo provided:
   │     ├─ Generate replica ID (options.primaryBackendId or auto)
@@ -456,7 +688,7 @@ createConfigRepo('my-app', options?)
   │
   ├─ 6. Read all backend descriptors from .meta/backends/
   │
-  ├─ 7. Determine nodeId (explicit > env > auto-generated .node-id file)
+  ├─ 7. Determine nodeId (explicit > localStorage > auto-generated)
   │
   ├─ 8. Create ConfigRepo with primary = 'local-idb'
   │
@@ -465,9 +697,54 @@ createConfigRepo('my-app', options?)
   │     ├─ Create SyncPair(IndexedDB, replica, bi-directional)
   │     └─ syncEngine.watch(pairId)
   │
-  ├─ 10. syncMetaToReplicas: push .meta/ changes to all replicas
+  ├─ 10. Load app data group references from .meta/app-data-groups/{appId}/
+  │      For each referenced data-sync group:
+  │      ├─ Create data-sync backends (merge account fields if accountBackendId set)
+  │      ├─ Create SyncPair for each data backend
+  │      └─ syncEngine.watch(pairId)
   │
-  └─ 11. Load config cache from IndexedDB
+  ├─ 11. syncMetaToReplicas: push .meta/ changes to all replicas (background)
+  │
+  └─ 12. Load config cache from IndexedDB
+```
+
+### 11.2 Standalone Data-Sync Group (`createDataSyncGroup`)
+
+```
+createDataSyncGroup('my-app', options?)
+  │
+  ├─ 1. Connect to user-provided backend (options.backendInfo)
+  │
+  ├─ 2. Read /.meta/group-type
+  │     ├─ "data-sync" → existing group, read .meta/backends/ for all data backends
+  │     ├─ absent      → new group, write /.meta/group-type = "data-sync"
+  │     └─ "config-sync" → error: this is a config-sync backend, use createConfigRepo()
+  │
+  ├─ 3. Create IndexedDB as local primary (for offline access)
+  │
+  ├─ 4. Setup sync: IndexedDB ↔ each data backend (bi-directional)
+  │
+  └─ 5. Return DataSyncGroup handle with direct fs access
+```
+
+### 11.3 Group Type Auto-Detection
+
+When a user provides a backend configuration without knowing the group type:
+
+```
+connectToBackend(backendInfo)
+  │
+  ├─ Create temporary backend instance
+  ├─ Read /.meta/group-type
+  │
+  ├─ "config-sync" → return { groupType: "config-sync" }
+  │                  → caller should use createConfigRepo()
+  │
+  ├─ "data-sync"   → return { groupType: "data-sync" }
+  │                  → caller should use createDataSyncGroup()
+  │
+  └─ absent        → return { groupType: null }
+                   → caller decides which to create
 ```
 
 ## 12. Data Flow
