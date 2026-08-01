@@ -561,6 +561,26 @@ interface AppDataBackendDescriptor {
 
 ## 10. Initialization
 
+The recommended entry point is `connect`, which auto-detects the group type. The lower-level `createConfigRepo` and `createDataSyncGroup` are also available for explicit control.
+
+### `connect` (recommended — auto-detect)
+
+```typescript
+import { connect } from 'zen-fs-config';
+
+// User provides a backend — connect auto-detects config-sync vs data-sync
+const result = await connect('my-app', {
+  backendInfo: {
+    type: 'Gitee',
+    options: { token: '...', owner: '...', repo: '...', branch: 'main' },
+  },
+});
+
+// result.groupType → "config-sync" or "data-sync"
+// result.repo      → ConfigRepo (if config-sync)
+// result.dataGroup → DataSyncGroup (if data-sync)
+```
+
 ### Zero-parameter (offline-first)
 
 ```typescript
@@ -727,25 +747,73 @@ createDataSyncGroup('my-app', options?)
   └─ 5. Return DataSyncGroup handle with direct fs access
 ```
 
-### 11.3 Group Type Auto-Detection
+### 11.3 Unified Entry Point (`connect`)
 
-When a user provides a backend configuration without knowing the group type:
+`createConfigRepo` and `createDataSyncGroup` are lower-level factory functions. The recommended entry point is `connect`, which auto-detects the group type and dispatches to the appropriate factory:
 
 ```
-connectToBackend(backendInfo)
+connect('my-app', options?)
   │
-  ├─ Create temporary backend instance
-  ├─ Read /.meta/group-type
+  ├─ 1. Connect to user-provided backend (options.backendInfo)
   │
-  ├─ "config-sync" → return { groupType: "config-sync" }
-  │                  → caller should use createConfigRepo()
+  ├─ 2. Read /.meta/group-type
   │
-  ├─ "data-sync"   → return { groupType: "data-sync" }
-  │                  → caller should use createDataSyncGroup()
+  ├─ "config-sync" → dispatch to createConfigRepo()
+  │                  return { groupType: "config-sync", repo }
   │
-  └─ absent        → return { groupType: null }
-                   → caller decides which to create
+  ├─ "data-sync"   → dispatch to createDataSyncGroup()
+  │                  return { groupType: "data-sync", dataGroup }
+  │
+  └─ absent        → new empty backend
+     ├─ options.groupType === "data-sync" → dispatch to createDataSyncGroup()
+     ├─ options.groupType === "config-sync" (or omitted) → dispatch to createConfigRepo()
+     └─ default: config-sync
 ```
+
+**Usage**:
+
+```typescript
+import { connect } from 'zen-fs-config';
+
+// Auto-detect: connects to backend, reads group-type, dispatches accordingly
+const result = await connect('my-app', {
+  backendInfo: {
+    type: 'Gitee',
+    options: { token: '...', owner: '...', repo: '...', branch: 'main' },
+  },
+});
+
+if (result.groupType === 'config-sync') {
+  // result.repo is a ConfigRepo — full config system
+  const repo = result.repo;
+  repo.setConfig('/db/host', { hostname: 'localhost' });
+} else {
+  // result.dataGroup is a DataSyncGroup — lightweight data-only system
+  const dataGroup = result.dataGroup;
+  await dataGroup.fs.promises.writeFile('/data.json', '{"key":"value"}');
+}
+
+// Explicit override (skip detection, force a specific group type)
+const result = await connect('my-app', {
+  backendInfo: { type: 'Gitee', options: {...} },
+  groupType: 'data-sync',  // force data-sync even if backend has no group-type yet
+});
+```
+
+**Return type**:
+
+```typescript
+interface ConnectResult {
+  /** Detected or forced group type */
+  groupType: 'config-sync' | 'data-sync';
+  /** Present when groupType === "config-sync" */
+  repo?: ConfigRepo;
+  /** Present when groupType === "data-sync" */
+  dataGroup?: DataSyncGroup;
+}
+```
+
+**Offline / zero-parameter mode**: When no `backendInfo` is provided, `connect` defaults to `config-sync` and creates an IndexedDB-only repo (same as `createConfigRepo` with no options).
 
 ## 12. Data Flow
 
