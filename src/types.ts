@@ -179,6 +179,100 @@ export interface ConfigRepoOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Sync Group Types
+// ---------------------------------------------------------------------------
+
+/** Type of sync group. */
+export type SyncGroupType = 'config-sync' | 'data-sync';
+
+/** Descriptor for a backend within a data-sync group. */
+export interface AppDataBackendDescriptor {
+  id: string;
+  type: string;
+  options: Record<string, unknown>;
+  /** Optional: reuse account fields from a config-sync backend. */
+  accountBackendId?: string;
+  description?: string;
+}
+
+/** Descriptor for a data-sync group referenced by a config-sync group. */
+export interface AppDataGroupDescriptor {
+  id: string;
+  groupType: 'data-sync';
+  backends: AppDataBackendDescriptor[];
+}
+
+/** Handle to a data-sync group, providing direct fs access. */
+export interface AppDataGroup {
+  readonly groupId: string;
+  readonly appId: string;
+  /** Direct fs for reading/writing data files (chroot to this group's root). */
+  readonly fs: typeof import('node:fs');
+  /** Get sync status for this data group's sync pairs. */
+  getSyncStatuses(): Map<string, SyncPairStatus>;
+  /** Manually flush pending sync. */
+  flush(): Promise<SyncResult[]>;
+  /** Stop sync and release resources. */
+  dispose(): Promise<void>;
+
+  /**
+   * Dynamically add a data backend to this group.
+   * Creates the backend instance, sets up bi-directional sync, and triggers initial sync.
+   * @param id Unique backend ID within this group
+   * @param type Backend type name (must be registered)
+   * @param options Backend options (storage location fields; account fields can be resolved via accountBackendId in the descriptor)
+   * @param description Optional human-readable description
+   */
+  addBackend(
+    id: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<void>;
+
+  /**
+   * Dynamically remove a data backend from this group.
+   * Tears down the sync pair and disposes the backend instance.
+   * @param id Backend ID to remove
+   */
+  removeBackend(id: string): Promise<void>;
+
+  /** List all backend descriptors in this group. */
+  listBackends(): AppDataBackendDescriptor[];
+}
+
+// ---------------------------------------------------------------------------
+// Connect (unified entry point)
+// ---------------------------------------------------------------------------
+
+/** Options for the unified connect() entry point. */
+export interface ConnectOptions {
+  /** Connection info for a user-provided backend. */
+  backendInfo?: {
+    type: string;
+    options: Record<string, unknown>;
+  };
+  /** Force a specific group type (skips auto-detection for new backends). */
+  groupType?: SyncGroupType;
+  /** IndexedDB store name. Default: `zen-fs-config-{appId}` */
+  idbStoreName?: string;
+  /** Node identifier. */
+  nodeId?: string;
+  /** Sync polling interval in ms. Default: 1800000 (30 min). */
+  syncPollIntervalMs?: number;
+}
+
+/** Result of connect(). */
+export interface ConnectResult {
+  /** Detected or forced group type. */
+  groupType: SyncGroupType;
+  /** Present when groupType === "config-sync". */
+  repo?: IConfigRepo;
+  /** Present when groupType === "data-sync". */
+  dataGroup?: AppDataGroup;
+}
+
+// ---------------------------------------------------------------------------
 // ConfigRepo Interface
 // ---------------------------------------------------------------------------
 
@@ -273,6 +367,43 @@ export interface IConfigRepo {
    * Called automatically by createConfigRepo() after setupSync().
    */
   syncMetaToReplicas(): Promise<void>;
+
+  // --- App Data Storage (data-sync groups) ---
+
+  /**
+   * Create a data-sync group for this app.
+   * Each backend can optionally reference a config-sync backend's account
+   * via `accountBackendId` to reuse credentials.
+   */
+  createAppDataGroup(
+    id: string,
+    backends: AppDataBackendDescriptor[],
+  ): Promise<AppDataGroup>;
+
+  /** Get an existing data-sync group handle. */
+  getAppDataGroup(id: string): Promise<AppDataGroup>;
+
+  /** List all data-sync group descriptors for this app. */
+  listAppDataGroups(): Promise<AppDataGroupDescriptor[]>;
+
+  /** Remove a data-sync group (stops sync, removes descriptor). */
+  removeAppDataGroup(id: string): Promise<void>;
+
+  /**
+   * List config-sync backends that can be used as account sources
+   * for data-sync backends. Returns backends that have `accountFields`
+   * declared in their metadata (e.g., Gitee/GitHub with token+owner).
+   * Excludes the local IndexedDB primary.
+   */
+  listAccountBackends(): Promise<BackendDescriptor[]>;
+
+  // --- Group Type ---
+
+  /** Write the group-type marker file if it doesn't exist. */
+  ensureGroupType(type: SyncGroupType): Promise<void>;
+
+  /** Read the group-type marker. Returns null if not set. */
+  getGroupType(): Promise<SyncGroupType | null>;
 
   /** Dispose: stop all sync, release cache FS and resources. */
   dispose(): Promise<void>;

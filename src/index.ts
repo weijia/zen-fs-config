@@ -9,8 +9,15 @@
 // Factory & main class
 export { createConfigRepo, ConfigRepo, LOCAL_IDB_BACKEND_ID } from './config-repo';
 
+// Data-sync group (standalone)
+export { DataSyncGroup, createDataSyncGroup } from './data-sync-group';
+export type { DataSyncGroupOptions } from './data-sync-group';
+
+// Unified connect entry point
+export { connect } from './connect';
+
 // Backend registry
-export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, getBackendMetadata, listBackendMetadata, wrapZenFSFileSystem } from './backend-registry';
+export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, getBackendMetadata, listBackendMetadata, getAccountFields, mergeAccountFields, wrapZenFSFileSystem } from './backend-registry';
 export type { BackendFactory, BackendInstance, BackendMetadata, BackendParamDef } from './backend-registry';
 
 // Serializers
@@ -31,6 +38,12 @@ export type {
   CacheOptions,
   ConfigRepoOptions,
   IConfigRepo,
+  SyncGroupType,
+  AppDataBackendDescriptor,
+  AppDataGroupDescriptor,
+  AppDataGroup,
+  ConnectOptions,
+  ConnectResult,
 } from './types';
 
 // Re-export SyncResult and SyncPairStatus from zen-fs-sync for convenience

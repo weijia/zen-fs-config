@@ -1,4 +1,4 @@
-import { SyncResult, SyncPairStatus, ConflictStrategy, SyncableFS } from 'zen-fs-sync';
+import { SyncPairStatus, SyncResult, ConflictStrategy, SyncableFS } from 'zen-fs-sync';
 export { SyncPairStatus, SyncResult } from 'zen-fs-sync';
 import * as node_fs from 'node:fs';
 
@@ -132,6 +132,78 @@ interface ConfigRepoOptions {
      */
     syncPollIntervalMs?: number;
 }
+/** Type of sync group. */
+type SyncGroupType = 'config-sync' | 'data-sync';
+/** Descriptor for a backend within a data-sync group. */
+interface AppDataBackendDescriptor {
+    id: string;
+    type: string;
+    options: Record<string, unknown>;
+    /** Optional: reuse account fields from a config-sync backend. */
+    accountBackendId?: string;
+    description?: string;
+}
+/** Descriptor for a data-sync group referenced by a config-sync group. */
+interface AppDataGroupDescriptor {
+    id: string;
+    groupType: 'data-sync';
+    backends: AppDataBackendDescriptor[];
+}
+/** Handle to a data-sync group, providing direct fs access. */
+interface AppDataGroup {
+    readonly groupId: string;
+    readonly appId: string;
+    /** Direct fs for reading/writing data files (chroot to this group's root). */
+    readonly fs: typeof node_fs;
+    /** Get sync status for this data group's sync pairs. */
+    getSyncStatuses(): Map<string, SyncPairStatus>;
+    /** Manually flush pending sync. */
+    flush(): Promise<SyncResult[]>;
+    /** Stop sync and release resources. */
+    dispose(): Promise<void>;
+    /**
+     * Dynamically add a data backend to this group.
+     * Creates the backend instance, sets up bi-directional sync, and triggers initial sync.
+     * @param id Unique backend ID within this group
+     * @param type Backend type name (must be registered)
+     * @param options Backend options (storage location fields; account fields can be resolved via accountBackendId in the descriptor)
+     * @param description Optional human-readable description
+     */
+    addBackend(id: string, type: string, options: Record<string, unknown>, description?: string): Promise<void>;
+    /**
+     * Dynamically remove a data backend from this group.
+     * Tears down the sync pair and disposes the backend instance.
+     * @param id Backend ID to remove
+     */
+    removeBackend(id: string): Promise<void>;
+    /** List all backend descriptors in this group. */
+    listBackends(): AppDataBackendDescriptor[];
+}
+/** Options for the unified connect() entry point. */
+interface ConnectOptions {
+    /** Connection info for a user-provided backend. */
+    backendInfo?: {
+        type: string;
+        options: Record<string, unknown>;
+    };
+    /** Force a specific group type (skips auto-detection for new backends). */
+    groupType?: SyncGroupType;
+    /** IndexedDB store name. Default: `zen-fs-config-{appId}` */
+    idbStoreName?: string;
+    /** Node identifier. */
+    nodeId?: string;
+    /** Sync polling interval in ms. Default: 1800000 (30 min). */
+    syncPollIntervalMs?: number;
+}
+/** Result of connect(). */
+interface ConnectResult {
+    /** Detected or forced group type. */
+    groupType: SyncGroupType;
+    /** Present when groupType === "config-sync". */
+    repo?: IConfigRepo;
+    /** Present when groupType === "data-sync". */
+    dataGroup?: AppDataGroup;
+}
 /** The main configuration repository interface. */
 interface IConfigRepo {
     /** Application ID. */
@@ -204,6 +276,29 @@ interface IConfigRepo {
      * Called automatically by createConfigRepo() after setupSync().
      */
     syncMetaToReplicas(): Promise<void>;
+    /**
+     * Create a data-sync group for this app.
+     * Each backend can optionally reference a config-sync backend's account
+     * via `accountBackendId` to reuse credentials.
+     */
+    createAppDataGroup(id: string, backends: AppDataBackendDescriptor[]): Promise<AppDataGroup>;
+    /** Get an existing data-sync group handle. */
+    getAppDataGroup(id: string): Promise<AppDataGroup>;
+    /** List all data-sync group descriptors for this app. */
+    listAppDataGroups(): Promise<AppDataGroupDescriptor[]>;
+    /** Remove a data-sync group (stops sync, removes descriptor). */
+    removeAppDataGroup(id: string): Promise<void>;
+    /**
+     * List config-sync backends that can be used as account sources
+     * for data-sync backends. Returns backends that have `accountFields`
+     * declared in their metadata (e.g., Gitee/GitHub with token+owner).
+     * Excludes the local IndexedDB primary.
+     */
+    listAccountBackends(): Promise<BackendDescriptor[]>;
+    /** Write the group-type marker file if it doesn't exist. */
+    ensureGroupType(type: SyncGroupType): Promise<void>;
+    /** Read the group-type marker. Returns null if not set. */
+    getGroupType(): Promise<SyncGroupType | null>;
     /** Dispose: stop all sync, release cache FS and resources. */
     dispose(): Promise<void>;
 }
@@ -277,6 +372,8 @@ interface BackendInstance {
     rename?(oldPath: string, newPath: string): Promise<void>;
     readFileMeta?(path: string, opts?: any): Promise<any>;
     getRevision?(path: string): Promise<string | number | undefined>;
+    /** Optional: dispose backend resources (close connections, etc.) */
+    dispose?(): Promise<void>;
 }
 /** A single parameter field definition for a backend type. */
 interface BackendParamDef {
@@ -308,6 +405,12 @@ interface BackendMetadata {
     fields: BackendParamDef[];
     /** Default option values (merged into the form's initial state). */
     defaultOptions: Record<string, string>;
+    /**
+     * Fields that represent account credentials (e.g., token, owner, baseUrl).
+     * Used by data-sync groups to reuse account info from a config-sync backend.
+     * Fields not listed here are considered "storage location" fields.
+     */
+    accountFields?: string[];
 }
 declare function registerBackend(type: string, factory: BackendFactory, metadata?: BackendMetadata): void;
 declare function unregisterBackend(type: string): boolean;
@@ -318,6 +421,17 @@ declare function listBackends(): string[];
 declare function getBackendMetadata(type: string): BackendMetadata | undefined;
 /** List all backend types that have registered metadata. Used for dynamic form generation. */
 declare function listBackendMetadata(): BackendMetadata[];
+/**
+ * Get the set of account field names for a backend type.
+ * Falls back to an empty array if the backend has no accountFields metadata.
+ */
+declare function getAccountFields(type: string): string[];
+/**
+ * Merge account fields from a source backend's options into a target options object.
+ * Only fields listed in the backend type's `accountFields` metadata are copied.
+ * If a field already exists in target options, it is NOT overwritten.
+ */
+declare function mergeAccountFields(targetType: string, sourceOptions: Record<string, unknown>, targetOptions: Record<string, unknown>): Record<string, unknown>;
 declare function wrapZenFSFileSystem(config: any): Promise<BackendInstance>;
 
 /**
@@ -342,11 +456,13 @@ declare class ConfigRepo implements IConfigRepo {
     private serializer;
     private syncEngine;
     private replicaBackends;
+    private appDataGroups;
     private onConflictCallback?;
     private disposed;
     private configCache;
     private readonly primaryBackendId;
-    constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>);
+    private readonly pollIntervalMs?;
+    constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>, pollIntervalMs?: number);
     /** Full path to this node's directory on the primary backend. */
     get nodePath(): string;
     load(rawConfig?: string): Promise<void>;
@@ -421,10 +537,125 @@ declare class ConfigRepo implements IConfigRepo {
     updateBackends(meta: BackendsMeta): Promise<void>;
     addBackend(id: string, type: string, options: Record<string, unknown>, description?: string): Promise<void>;
     removeBackend(id: string): Promise<void>;
+    /** Write the group-type marker file if it doesn't exist. */
+    ensureGroupType(type: SyncGroupType): Promise<void>;
+    /** Read the group-type marker. Returns null if not set. */
+    getGroupType(): Promise<SyncGroupType | null>;
+    /** Path for a single app data group descriptor: .meta/app-data-groups/{appId}/{id}.json */
+    private appDataGroupFilePath;
+    /**
+     * Resolve a backend descriptor's options by merging account fields
+     * from the referenced config-sync backend (if accountBackendId is set).
+     */
+    private resolveAppDataBackendOptions;
+    createAppDataGroup(id: string, backends: AppDataBackendDescriptor[]): Promise<AppDataGroup>;
+    getAppDataGroup(id: string): Promise<AppDataGroup>;
+    listAppDataGroups(): Promise<AppDataGroupDescriptor[]>;
+    removeAppDataGroup(id: string): Promise<void>;
+    listAccountBackends(): Promise<BackendDescriptor[]>;
     private tryParse;
     private assertNotDisposed;
 }
 declare function createConfigRepo(appId: string, options?: ConfigRepoOptions): Promise<IConfigRepo>;
+
+/**
+ * zen-fs-config — Standalone Data-Sync Group
+ *
+ * A data-sync group provides direct file system access for app data,
+ * without the config-sync meta layer. It can be used standalone or
+ * referenced by a config-sync group via createAppDataGroup().
+ */
+
+/**
+ * A standalone data-sync group.
+ *
+ * Creates a local InMemory (or IndexedDB in browser) primary backend,
+ * sets up bi-directional sync with each registered data backend, and
+ * provides direct fs access for reading/writing data files.
+ */
+declare class DataSyncGroup implements AppDataGroup {
+    readonly groupId: string;
+    readonly appId: string;
+    fs: any;
+    private syncEngine;
+    private localFS;
+    private dataBackends;
+    private disposed;
+    constructor(appId: string, groupId: string, localFS: BackendInstance);
+    /**
+     * Add a data backend and set up bi-directional sync.
+     */
+    addBackend(id: string, type: string, options: Record<string, unknown>, description?: string): Promise<void>;
+    /**
+     * Remove a data backend.
+     */
+    removeBackend(id: string): Promise<void>;
+    getSyncStatuses(): Map<string, SyncPairStatus>;
+    flush(): Promise<SyncResult[]>;
+    listBackends(): BackendDescriptor[];
+    dispose(): Promise<void>;
+    /**
+     * Register a pre-created backend instance with the sync engine.
+     * Used internally by createDataSyncGroup() to avoid double-creating backends.
+     */
+    _registerBackend(id: string, instance: BackendInstance, syncable: SyncableFS, pollIntervalMs?: number): string;
+    /** Run syncAll on the internal engine. */
+    _syncAll(): Promise<void>;
+    /** Get the number of registered data backends. */
+    get _backendCount(): number;
+    private saveBackendDescriptor;
+    private ensureDir;
+}
+interface DataSyncGroupOptions {
+    /** Connection info for the initial data backend. */
+    backendInfo?: {
+        type: string;
+        options: Record<string, unknown>;
+    };
+    /** ID for the initial data backend. Default: auto-generated. */
+    primaryBackendId?: string;
+    /** Node identifier (for logging). */
+    nodeId?: string;
+    /** Sync polling interval in ms. */
+    pollIntervalMs?: number;
+}
+/**
+ * Create a standalone data-sync group.
+ *
+ * 1. Connects to the user-provided backend
+ * 2. Reads /.meta/group-type to verify it's a data-sync group (or new)
+ * 3. Creates a local primary (InMemory in Node.js)
+ * 4. Sets up bi-directional sync with all data backends
+ * 5. Returns a DataSyncGroup handle with direct fs access
+ */
+declare function createDataSyncGroup(appId: string, options?: DataSyncGroupOptions): Promise<DataSyncGroup>;
+
+/**
+ * zen-fs-config — Unified Connect Entry Point
+ *
+ * `connect()` auto-detects the sync group type (config-sync or data-sync)
+ * by reading `/.meta/group-type` from the user-provided backend, then
+ * dispatches to the appropriate factory function.
+ */
+
+/**
+ * Unified entry point for connecting to a zen-fs-config sync group.
+ *
+ * Flow:
+ * 1. If `backendInfo` is provided, connect to the backend and read
+ *    `/.meta/group-type` to detect the group type.
+ * 2. If group-type is "config-sync", dispatch to `createConfigRepo()`.
+ * 3. If group-type is "data-sync", dispatch to `createDataSyncGroup()`.
+ * 4. If group-type is absent (new backend), use `options.groupType`
+ *    or default to "config-sync".
+ * 5. If no `backendInfo` is provided, use `options.groupType` or
+ *    default to "config-sync" (local-only operation).
+ *
+ * @param appId Application identifier
+ * @param options Connection options
+ * @returns ConnectResult containing the group type and the appropriate handle
+ */
+declare function connect(appId: string, options?: ConnectOptions): Promise<ConnectResult>;
 
 /**
  * zen-fs-config — Sidecar Version File Management
@@ -468,4 +699,4 @@ declare function incrementVersion(fs: SyncableFS, configFilePath: string, newCon
  */
 declare function verifyOrRepairVersion(fs: SyncableFS, configFilePath: string, author: string): Promise<VersionMeta | null>;
 
-export { type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendMetadata, type BackendParamDef, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type IConfigRepo, LOCAL_IDB_BACKEND_ID, type TombstoneMeta, type VersionMeta, configKeyToFilePath, createBackend, createConfigRepo, createSerializerChain, getBackendMetadata, getExtension, hasBackend, incrementVersion, listBackendMetadata, listBackends, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };
+export { type AppDataBackendDescriptor, type AppDataGroup, type AppDataGroupDescriptor, type BackendDescriptor, type BackendFactory, type BackendInstance, type BackendMetadata, type BackendParamDef, type BackendsMeta, type CacheOptions, ConfigRepo, type ConfigRepoOptions, type ConfigSerializer, type ConflictArchive, type ConflictInfo, type ConnectOptions, type ConnectResult, DataSyncGroup, type DataSyncGroupOptions, type IConfigRepo, LOCAL_IDB_BACKEND_ID, type SyncGroupType, type TombstoneMeta, type VersionMeta, configKeyToFilePath, connect, createBackend, createConfigRepo, createDataSyncGroup, createSerializerChain, getAccountFields, getBackendMetadata, getExtension, hasBackend, incrementVersion, listBackendMetadata, listBackends, mergeAccountFields, readVersion, registerBackend, sha256, unregisterBackend, verifyOrRepairVersion, versionPathFor, wrapZenFSFileSystem, writeVersion };

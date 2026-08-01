@@ -21,12 +21,16 @@ import type {
   ConflictArchive,
   ConflictInfo,
   TombstoneMeta,
+  SyncGroupType,
+  AppDataBackendDescriptor,
+  AppDataGroupDescriptor,
+  AppDataGroup,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
 import type { PathAwareSerializer } from './serializer';
 import { backendToSyncableFS } from './adapters';
-import { createBackend, type BackendInstance } from './backend-registry';
+import { createBackend, mergeAccountFields, getAccountFields, type BackendInstance } from './backend-registry';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 
 // ---------------------------------------------------------------------------
@@ -34,8 +38,10 @@ import { versionPathFor, incrementVersion, writeVersion, readVersion } from './v
 // ---------------------------------------------------------------------------
 
 const META_DIR = '/.meta';
+const GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 const BACKENDS_FILE = `${META_DIR}/backends.json`; // Legacy single-file format (pre-0.4.0)
 const BACKENDS_DIR = `${META_DIR}/backends`;       // New: one JSON file per backend
+const APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`; // Per-app data-sync group references
 const CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 const DELETIONS_DIR = `${META_DIR}/.deleted`;
 const NODES_DIR = '/nodes';
@@ -83,10 +89,12 @@ export class ConfigRepo implements IConfigRepo {
   private serializer: PathAwareSerializer;
   private syncEngine: ZenFSSync;
   private replicaBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string }>;
+  private appDataGroups: Map<string, AppDataGroupImpl> = new Map();
   private onConflictCallback?: (conflict: ConflictInfo) => Promise<unknown | null>;
   private disposed = false;
   private configCache = new Map<string, unknown>();
   private readonly primaryBackendId: string;
+  private readonly pollIntervalMs?: number;
 
   constructor(
     appId: string,
@@ -95,6 +103,7 @@ export class ConfigRepo implements IConfigRepo {
     cachedFS: MinimalAsyncFS,
     serializer: PathAwareSerializer,
     onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>,
+    pollIntervalMs?: number,
   ) {
     this.appId = appId;
     this.nodeId = nodeId;
@@ -104,6 +113,7 @@ export class ConfigRepo implements IConfigRepo {
     this.syncEngine = new ZenFSSync();
     this.replicaBackends = new Map();
     this.onConflictCallback = onConflict;
+    this.pollIntervalMs = pollIntervalMs;
 
     this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
@@ -556,6 +566,11 @@ export class ConfigRepo implements IConfigRepo {
       }
     }
     this.replicaBackends.clear();
+
+    for (const [_id, group] of this.appDataGroups) {
+      await group.dispose();
+    }
+    this.appDataGroups.clear();
     this.configCache.clear();
   }
 
@@ -1008,6 +1023,188 @@ export class ConfigRepo implements IConfigRepo {
     console.log(`[ConfigRepo] removeBackend: ${id} removed`);
   }
 
+  // -----------------------------------------------------------------------
+  // IConfigRepo — Group Type
+  // -----------------------------------------------------------------------
+
+  /** Write the group-type marker file if it doesn't exist. */
+  async ensureGroupType(type: SyncGroupType): Promise<void> {
+    this.assertNotDisposed();
+    try {
+      const existing = await this.cachedFS.readFile(GROUP_TYPE_FILE, 'utf-8');
+      const current = (existing as string).trim();
+      if (current && current !== type) {
+        console.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
+        return;
+      }
+    } catch {
+      // File doesn't exist — write it
+    }
+    await this.ensureDir(GROUP_TYPE_FILE);
+    await this.cachedFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode(type));
+    console.log(`[ConfigRepo] group-type set to "${type}"`);
+  }
+
+  /** Read the group-type marker. Returns null if not set. */
+  async getGroupType(): Promise<SyncGroupType | null> {
+    this.assertNotDisposed();
+    try {
+      const raw = await this.cachedFS.readFile(GROUP_TYPE_FILE, 'utf-8');
+      const type = (raw as string).trim() as SyncGroupType;
+      if (type === 'config-sync' || type === 'data-sync') return type;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // IConfigRepo — App Data Groups (data-sync groups)
+  // -----------------------------------------------------------------------
+
+  /** Path for a single app data group descriptor: .meta/app-data-groups/{appId}/{id}.json */
+  private appDataGroupFilePath(id: string): string {
+    return `${APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
+  }
+
+  /**
+   * Resolve a backend descriptor's options by merging account fields
+   * from the referenced config-sync backend (if accountBackendId is set).
+   */
+  private async resolveAppDataBackendOptions(desc: AppDataBackendDescriptor): Promise<Record<string, unknown>> {
+    if (!desc.accountBackendId) {
+      return desc.options;
+    }
+    // Find the referenced config-sync backend's options
+    const allBackends = await this.readAllBackendDescriptors();
+    const accountBackend = allBackends.find(b => b.id === desc.accountBackendId);
+    if (!accountBackend) {
+      throw new Error(`Account backend "${desc.accountBackendId}" not found for data backend "${desc.id}"`);
+    }
+    // Merge account fields from the referenced backend into this backend's options
+    return mergeAccountFields(desc.type, accountBackend.options, desc.options);
+  }
+
+  async createAppDataGroup(
+    id: string,
+    backends: AppDataBackendDescriptor[],
+  ): Promise<AppDataGroup> {
+    this.assertNotDisposed();
+
+    if (this.appDataGroups.has(id)) {
+      throw new Error(`App data group "${id}" already exists. Use removeAppDataGroup() first.`);
+    }
+
+    console.log(`[ConfigRepo] createAppDataGroup: creating "${id}" with ${backends.length} backend(s)`);
+
+    // Resolve account fields for each backend
+    const resolvedBackends: AppDataBackendDescriptor[] = [];
+    for (const desc of backends) {
+      const mergedOptions = await this.resolveAppDataBackendOptions(desc);
+      resolvedBackends.push({ ...desc, options: mergedOptions });
+    }
+
+    // Create the data-sync group implementation
+    const group = new AppDataGroupImpl(
+      id,
+      this.appId,
+      resolvedBackends,
+      this.pollIntervalMs,
+    );
+    await group.init();
+
+    // Save descriptor to .meta/app-data-groups/{appId}/{id}.json
+    const descriptor: AppDataGroupDescriptor = {
+      id,
+      groupType: 'data-sync',
+      backends: resolvedBackends,
+    };
+    const descPath = this.appDataGroupFilePath(id);
+    await this.ensureDir(descPath);
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    await this.cachedFS.writeFile(descPath, bytes);
+
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
+    await this.ensureDir(versionPathFor(descPath));
+    await writeVersion(this.fullFS, versionPathFor(descPath), version);
+
+    this.appDataGroups.set(id, group);
+    console.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
+
+    return group;
+  }
+
+  async getAppDataGroup(id: string): Promise<AppDataGroup> {
+    this.assertNotDisposed();
+
+    // Return cached instance if available
+    const cached = this.appDataGroups.get(id);
+    if (cached) return cached;
+
+    // Load from descriptor
+    const descPath = this.appDataGroupFilePath(id);
+    try {
+      const raw = await this.cachedFS.readFile(descPath);
+      const descriptor = JSON.parse(new TextDecoder().decode(toUint8Array(raw))) as AppDataGroupDescriptor;
+      const group = new AppDataGroupImpl(
+        id,
+        this.appId,
+        descriptor.backends,
+        this.pollIntervalMs,
+      );
+      await group.init();
+      this.appDataGroups.set(id, group);
+      return group;
+    } catch {
+      throw new Error(`App data group "${id}" not found`);
+    }
+  }
+
+  async listAppDataGroups(): Promise<AppDataGroupDescriptor[]> {
+    this.assertNotDisposed();
+    const dir = `${APP_DATA_GROUPS_DIR}/${this.appId}`;
+    try {
+      const entries = await this.cachedFS.readdir(dir);
+      const descriptors: AppDataGroupDescriptor[] = [];
+      for (const entry of entries) {
+        if (!entry.endsWith('.json')) continue;
+        try {
+          const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
+          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          if (desc.id && desc.groupType === 'data-sync') {
+            descriptors.push(desc);
+          }
+        } catch { /* skip corrupt */ }
+      }
+      return descriptors;
+    } catch {
+      return [];
+    }
+  }
+
+  async removeAppDataGroup(id: string): Promise<void> {
+    this.assertNotDisposed();
+
+    const group = this.appDataGroups.get(id);
+    if (group) {
+      await group.dispose();
+      this.appDataGroups.delete(id);
+    }
+
+    const descPath = this.appDataGroupFilePath(id);
+    try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
+    try { await this.cachedFS.unlink(versionPathFor(descPath)); } catch { /* no version */ }
+    console.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
+  }
+
+  async listAccountBackends(): Promise<BackendDescriptor[]> {
+    this.assertNotDisposed();
+    const allBackends = await this.readAllBackendDescriptors();
+    // Only return backends whose type has accountFields declared
+    return allBackends.filter(b => getAccountFields(b.type).length > 0);
+  }
+
   private tryParse(content: string): unknown {
     try {
       return JSON.parse(content);
@@ -1020,6 +1217,172 @@ export class ConfigRepo implements IConfigRepo {
     if (this.disposed) {
       throw new Error('ConfigRepo has been disposed');
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AppDataGroupImpl — data-sync group implementation
+// ---------------------------------------------------------------------------
+
+/**
+ * A data-sync group that provides direct file system access for app data.
+ *
+ * Uses a separate IndexedDB store (or InMemory in Node.js) as local primary,
+ * with bi-directional sync to each registered data backend.
+ */
+class AppDataGroupImpl implements AppDataGroup {
+  readonly groupId: string;
+  readonly appId: string;
+  fs: any;
+
+  private syncEngine: ZenFSSync;
+  private localFS: BackendInstance;
+  private dataBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string; desc: AppDataBackendDescriptor }> = new Map();
+  private disposed = false;
+
+  constructor(
+    groupId: string,
+    appId: string,
+    backends: AppDataBackendDescriptor[],
+    pollIntervalMs?: number,
+  ) {
+    this.groupId = groupId;
+    this.appId = appId;
+    this.syncEngine = new ZenFSSync();
+    this.localFS = null as any;
+    this.fs = null as any;
+    this._backends = backends;
+    this._pollIntervalMs = pollIntervalMs;
+  }
+
+  private _backends: AppDataBackendDescriptor[];
+  private _pollIntervalMs?: number;
+
+  async init(): Promise<void> {
+    // Create local primary backend (InMemory for simplicity in tests/Node, IndexedDB in browser)
+    try {
+      this.localFS = await createBackend({
+        type: 'InMemory',
+        options: { label: `data-group-${this.groupId}-${Date.now()}` },
+      });
+    } catch {
+      throw new Error(`Failed to create local primary for data group "${this.groupId}"`);
+    }
+
+    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    this.fs = createChrootFS(this.localFS, '/');
+
+    // Setup sync with each data backend
+    for (const desc of this._backends) {
+      try {
+        const instance = await createBackend({ type: desc.type, options: desc.options });
+        const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
+        const pair = this.syncEngine.addPair(
+          localSyncable,
+          syncable,
+          {
+            direction: SyncDirection.BiDirectional,
+            conflictStrategy: 'source-wins' as any,
+            pollIntervalMs: this._pollIntervalMs,
+          },
+          '/',
+        );
+        this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
+        this.syncEngine.watch(pair.pairId);
+        console.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
+      } catch (err: any) {
+        console.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
+      }
+    }
+
+    // Initial sync — pull data from remote backends
+    try {
+      await this.syncEngine.syncAll();
+    } catch (err) {
+      console.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
+    }
+  }
+
+  getSyncStatuses(): Map<string, SyncPairStatus> {
+    return this.syncEngine.getStatusAll();
+  }
+
+  async flush(): Promise<SyncResult[]> {
+    const results = await this.syncEngine.syncAll();
+    return Array.from(results.values());
+  }
+
+  async addBackend(
+    id: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<void> {
+    if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    if (this.dataBackends.has(id)) {
+      throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
+    }
+
+    console.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
+    const instance = await createBackend({ type, options });
+    const syncable = backendToSyncableFS(instance, `${type}(${id})`);
+
+    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    const pair = this.syncEngine.addPair(
+      localSyncable,
+      syncable,
+      {
+        direction: SyncDirection.BiDirectional,
+        conflictStrategy: 'source-wins' as any,
+        pollIntervalMs: this._pollIntervalMs,
+      },
+      '/',
+    );
+
+    const desc: AppDataBackendDescriptor = { id, type, options, description };
+    this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
+    this.syncEngine.watch(pair.pairId);
+    console.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
+
+    // Initial sync
+    try {
+      await this.syncEngine.sync(pair.pairId);
+    } catch (err) {
+      console.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
+    }
+  }
+
+  async removeBackend(id: string): Promise<void> {
+    if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    const backend = this.dataBackends.get(id);
+    if (!backend) {
+      throw new Error(`Backend "${id}" not found in data group "${this.groupId}"`);
+    }
+
+    this.syncEngine.removePair(backend.pairId);
+    this.dataBackends.delete(id);
+
+    if (backend.instance?.dispose) {
+      await backend.instance.dispose();
+    }
+
+    console.log(`[AppDataGroup:${this.groupId}] removeBackend: ${id} removed`);
+  }
+
+  listBackends(): AppDataBackendDescriptor[] {
+    return Array.from(this.dataBackends.values()).map(b => b.desc);
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.syncEngine.dispose();
+    for (const [_id, backend] of this.dataBackends) {
+      if (backend.instance?.dispose) {
+        await backend.instance.dispose();
+      }
+    }
+    this.dataBackends.clear();
   }
 }
 
@@ -1067,10 +1430,26 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
+  // Step 2b: Write group-type = "config-sync" (if not already set)
+  // -------------------------------------------------------------------
+  try {
+    const groupTypeBytes = new TextEncoder().encode('config-sync');
+    // Check if already exists
+    try {
+      await primaryInstance.readFile(`${META_DIR}/group-type`);
+    } catch {
+      await primaryInstance.writeFile(`${META_DIR}/group-type`, groupTypeBytes);
+      console.log(`[createConfigRepo] group-type set to "config-sync"`);
+    }
+  } catch (err: any) {
+    console.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
+  }
+
+  // -------------------------------------------------------------------
   // Step 3: Create temp repo for meta operations (nodeId not yet known)
   // -------------------------------------------------------------------
   const tempRepo = new ConfigRepo(
-    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined,
+    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs,
   );
 
   // -------------------------------------------------------------------
@@ -1141,6 +1520,7 @@ export async function createConfigRepo(
     cachedFS,
     serializer,
     options.onConflict,
+    options.syncPollIntervalMs,
   );
 
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);

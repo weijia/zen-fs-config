@@ -41,6 +41,8 @@ export interface BackendInstance {
   rename?(oldPath: string, newPath: string): Promise<void>;
   readFileMeta?(path: string, opts?: any): Promise<any>;
   getRevision?(path: string): Promise<string | number | undefined>;
+  /** Optional: dispose backend resources (close connections, etc.) */
+  dispose?(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +77,12 @@ export interface BackendMetadata {
   fields: BackendParamDef[];
   /** Default option values (merged into the form's initial state). */
   defaultOptions: Record<string, string>;
+  /**
+   * Fields that represent account credentials (e.g., token, owner, baseUrl).
+   * Used by data-sync groups to reuse account info from a config-sync backend.
+   * Fields not listed here are considered "storage location" fields.
+   */
+  accountFields?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +134,35 @@ export function getBackendMetadata(type: string): BackendMetadata | undefined {
 /** List all backend types that have registered metadata. Used for dynamic form generation. */
 export function listBackendMetadata(): BackendMetadata[] {
   return Array.from(metadataRegistry.values());
+}
+
+/**
+ * Get the set of account field names for a backend type.
+ * Falls back to an empty array if the backend has no accountFields metadata.
+ */
+export function getAccountFields(type: string): string[] {
+  return metadataRegistry.get(type)?.accountFields ?? [];
+}
+
+/**
+ * Merge account fields from a source backend's options into a target options object.
+ * Only fields listed in the backend type's `accountFields` metadata are copied.
+ * If a field already exists in target options, it is NOT overwritten.
+ */
+export function mergeAccountFields(
+  targetType: string,
+  sourceOptions: Record<string, unknown>,
+  targetOptions: Record<string, unknown>,
+): Record<string, unknown> {
+  const accountFields = getAccountFields(targetType);
+  if (accountFields.length === 0) return targetOptions;
+  const merged: Record<string, unknown> = { ...targetOptions };
+  for (const field of accountFields) {
+    if (sourceOptions[field] !== undefined && merged[field] === undefined) {
+      merged[field] = sourceOptions[field];
+    }
+  }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------

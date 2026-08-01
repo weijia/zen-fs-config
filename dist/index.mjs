@@ -264,6 +264,20 @@ function getBackendMetadata(type) {
 function listBackendMetadata() {
   return Array.from(metadataRegistry.values());
 }
+function getAccountFields(type) {
+  return metadataRegistry.get(type)?.accountFields ?? [];
+}
+function mergeAccountFields(targetType, sourceOptions, targetOptions) {
+  const accountFields = getAccountFields(targetType);
+  if (accountFields.length === 0) return targetOptions;
+  const merged = { ...targetOptions };
+  for (const field of accountFields) {
+    if (sourceOptions[field] !== void 0 && merged[field] === void 0) {
+      merged[field] = sourceOptions[field];
+    }
+  }
+  return merged;
+}
 async function wrapZenFSFileSystem(config) {
   const zenfs = await import("@zenfs/core");
   const isolatedFS = await zenfs.resolveMountConfig(config);
@@ -451,8 +465,10 @@ async function verifyOrRepairVersion(fs, configFilePath, author) {
 
 // src/config-repo.ts
 var META_DIR = "/.meta";
+var GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 var BACKENDS_FILE = `${META_DIR}/backends.json`;
 var BACKENDS_DIR = `${META_DIR}/backends`;
+var APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`;
 var CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 var DELETIONS_DIR = `${META_DIR}/.deleted`;
 var NODES_DIR = "/nodes";
@@ -472,11 +488,13 @@ var ConfigRepo = class {
   serializer;
   syncEngine;
   replicaBackends;
+  appDataGroups = /* @__PURE__ */ new Map();
   onConflictCallback;
   disposed = false;
   configCache = /* @__PURE__ */ new Map();
   primaryBackendId;
-  constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict) {
+  pollIntervalMs;
+  constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict, pollIntervalMs) {
     this.appId = appId;
     this.nodeId = nodeId;
     this.primaryBackendId = primaryBackendId;
@@ -485,6 +503,7 @@ var ConfigRepo = class {
     this.syncEngine = new ZenFSSync();
     this.replicaBackends = /* @__PURE__ */ new Map();
     this.onConflictCallback = onConflict;
+    this.pollIntervalMs = pollIntervalMs;
     this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
     this.rootFS = createChrootFS(cachedFS, "/");
@@ -860,6 +879,10 @@ var ConfigRepo = class {
       }
     }
     this.replicaBackends.clear();
+    for (const [_id, group] of this.appDataGroups) {
+      await group.dispose();
+    }
+    this.appDataGroups.clear();
     this.configCache.clear();
   }
   // -----------------------------------------------------------------------
@@ -1221,6 +1244,160 @@ var ConfigRepo = class {
     await this.removeBackendDescriptor(id);
     console.log(`[ConfigRepo] removeBackend: ${id} removed`);
   }
+  // -----------------------------------------------------------------------
+  // IConfigRepo — Group Type
+  // -----------------------------------------------------------------------
+  /** Write the group-type marker file if it doesn't exist. */
+  async ensureGroupType(type) {
+    this.assertNotDisposed();
+    try {
+      const existing = await this.cachedFS.readFile(GROUP_TYPE_FILE, "utf-8");
+      const current = existing.trim();
+      if (current && current !== type) {
+        console.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
+        return;
+      }
+    } catch {
+    }
+    await this.ensureDir(GROUP_TYPE_FILE);
+    await this.cachedFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode(type));
+    console.log(`[ConfigRepo] group-type set to "${type}"`);
+  }
+  /** Read the group-type marker. Returns null if not set. */
+  async getGroupType() {
+    this.assertNotDisposed();
+    try {
+      const raw = await this.cachedFS.readFile(GROUP_TYPE_FILE, "utf-8");
+      const type = raw.trim();
+      if (type === "config-sync" || type === "data-sync") return type;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  // -----------------------------------------------------------------------
+  // IConfigRepo — App Data Groups (data-sync groups)
+  // -----------------------------------------------------------------------
+  /** Path for a single app data group descriptor: .meta/app-data-groups/{appId}/{id}.json */
+  appDataGroupFilePath(id) {
+    return `${APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
+  }
+  /**
+   * Resolve a backend descriptor's options by merging account fields
+   * from the referenced config-sync backend (if accountBackendId is set).
+   */
+  async resolveAppDataBackendOptions(desc) {
+    if (!desc.accountBackendId) {
+      return desc.options;
+    }
+    const allBackends = await this.readAllBackendDescriptors();
+    const accountBackend = allBackends.find((b) => b.id === desc.accountBackendId);
+    if (!accountBackend) {
+      throw new Error(`Account backend "${desc.accountBackendId}" not found for data backend "${desc.id}"`);
+    }
+    return mergeAccountFields(desc.type, accountBackend.options, desc.options);
+  }
+  async createAppDataGroup(id, backends) {
+    this.assertNotDisposed();
+    if (this.appDataGroups.has(id)) {
+      throw new Error(`App data group "${id}" already exists. Use removeAppDataGroup() first.`);
+    }
+    console.log(`[ConfigRepo] createAppDataGroup: creating "${id}" with ${backends.length} backend(s)`);
+    const resolvedBackends = [];
+    for (const desc of backends) {
+      const mergedOptions = await this.resolveAppDataBackendOptions(desc);
+      resolvedBackends.push({ ...desc, options: mergedOptions });
+    }
+    const group = new AppDataGroupImpl(
+      id,
+      this.appId,
+      resolvedBackends,
+      this.pollIntervalMs
+    );
+    await group.init();
+    const descriptor = {
+      id,
+      groupType: "data-sync",
+      backends: resolvedBackends
+    };
+    const descPath = this.appDataGroupFilePath(id);
+    await this.ensureDir(descPath);
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    await this.cachedFS.writeFile(descPath, bytes);
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
+    await this.ensureDir(versionPathFor(descPath));
+    await writeVersion(this.fullFS, versionPathFor(descPath), version);
+    this.appDataGroups.set(id, group);
+    console.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
+    return group;
+  }
+  async getAppDataGroup(id) {
+    this.assertNotDisposed();
+    const cached = this.appDataGroups.get(id);
+    if (cached) return cached;
+    const descPath = this.appDataGroupFilePath(id);
+    try {
+      const raw = await this.cachedFS.readFile(descPath);
+      const descriptor = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+      const group = new AppDataGroupImpl(
+        id,
+        this.appId,
+        descriptor.backends,
+        this.pollIntervalMs
+      );
+      await group.init();
+      this.appDataGroups.set(id, group);
+      return group;
+    } catch {
+      throw new Error(`App data group "${id}" not found`);
+    }
+  }
+  async listAppDataGroups() {
+    this.assertNotDisposed();
+    const dir = `${APP_DATA_GROUPS_DIR}/${this.appId}`;
+    try {
+      const entries = await this.cachedFS.readdir(dir);
+      const descriptors = [];
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        try {
+          const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
+          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          if (desc.id && desc.groupType === "data-sync") {
+            descriptors.push(desc);
+          }
+        } catch {
+        }
+      }
+      return descriptors;
+    } catch {
+      return [];
+    }
+  }
+  async removeAppDataGroup(id) {
+    this.assertNotDisposed();
+    const group = this.appDataGroups.get(id);
+    if (group) {
+      await group.dispose();
+      this.appDataGroups.delete(id);
+    }
+    const descPath = this.appDataGroupFilePath(id);
+    try {
+      await this.cachedFS.unlink(descPath);
+    } catch {
+    }
+    try {
+      await this.cachedFS.unlink(versionPathFor(descPath));
+    } catch {
+    }
+    console.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
+  }
+  async listAccountBackends() {
+    this.assertNotDisposed();
+    const allBackends = await this.readAllBackendDescriptors();
+    return allBackends.filter((b) => getAccountFields(b.type).length > 0);
+  }
   tryParse(content) {
     try {
       return JSON.parse(content);
@@ -1232,6 +1409,127 @@ var ConfigRepo = class {
     if (this.disposed) {
       throw new Error("ConfigRepo has been disposed");
     }
+  }
+};
+var AppDataGroupImpl = class {
+  groupId;
+  appId;
+  fs;
+  syncEngine;
+  localFS;
+  dataBackends = /* @__PURE__ */ new Map();
+  disposed = false;
+  constructor(groupId, appId, backends, pollIntervalMs) {
+    this.groupId = groupId;
+    this.appId = appId;
+    this.syncEngine = new ZenFSSync();
+    this.localFS = null;
+    this.fs = null;
+    this._backends = backends;
+    this._pollIntervalMs = pollIntervalMs;
+  }
+  _backends;
+  _pollIntervalMs;
+  async init() {
+    try {
+      this.localFS = await createBackend({
+        type: "InMemory",
+        options: { label: `data-group-${this.groupId}-${Date.now()}` }
+      });
+    } catch {
+      throw new Error(`Failed to create local primary for data group "${this.groupId}"`);
+    }
+    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    this.fs = createChrootFS(this.localFS, "/");
+    for (const desc of this._backends) {
+      try {
+        const instance = await createBackend({ type: desc.type, options: desc.options });
+        const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
+        const pair = this.syncEngine.addPair(
+          localSyncable,
+          syncable,
+          {
+            direction: SyncDirection.BiDirectional,
+            conflictStrategy: "source-wins",
+            pollIntervalMs: this._pollIntervalMs
+          },
+          "/"
+        );
+        this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
+        this.syncEngine.watch(pair.pairId);
+        console.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
+      } catch (err) {
+        console.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
+      }
+    }
+    try {
+      await this.syncEngine.syncAll();
+    } catch (err) {
+      console.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
+    }
+  }
+  getSyncStatuses() {
+    return this.syncEngine.getStatusAll();
+  }
+  async flush() {
+    const results = await this.syncEngine.syncAll();
+    return Array.from(results.values());
+  }
+  async addBackend(id, type, options, description) {
+    if (this.disposed) throw new Error("DataSyncGroup has been disposed");
+    if (this.dataBackends.has(id)) {
+      throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
+    }
+    console.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
+    const instance = await createBackend({ type, options });
+    const syncable = backendToSyncableFS(instance, `${type}(${id})`);
+    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    const pair = this.syncEngine.addPair(
+      localSyncable,
+      syncable,
+      {
+        direction: SyncDirection.BiDirectional,
+        conflictStrategy: "source-wins",
+        pollIntervalMs: this._pollIntervalMs
+      },
+      "/"
+    );
+    const desc = { id, type, options, description };
+    this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
+    this.syncEngine.watch(pair.pairId);
+    console.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
+    try {
+      await this.syncEngine.sync(pair.pairId);
+    } catch (err) {
+      console.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
+    }
+  }
+  async removeBackend(id) {
+    if (this.disposed) throw new Error("DataSyncGroup has been disposed");
+    const backend = this.dataBackends.get(id);
+    if (!backend) {
+      throw new Error(`Backend "${id}" not found in data group "${this.groupId}"`);
+    }
+    this.syncEngine.removePair(backend.pairId);
+    this.dataBackends.delete(id);
+    if (backend.instance?.dispose) {
+      await backend.instance.dispose();
+    }
+    console.log(`[AppDataGroup:${this.groupId}] removeBackend: ${id} removed`);
+  }
+  listBackends() {
+    return Array.from(this.dataBackends.values()).map((b) => b.desc);
+  }
+  async dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.syncEngine.dispose();
+    for (const [_id, backend] of this.dataBackends) {
+      if (backend.instance?.dispose) {
+        await backend.instance.dispose();
+      }
+    }
+    this.dataBackends.clear();
   }
 };
 function toUint8Array(raw) {
@@ -1255,13 +1553,25 @@ async function createConfigRepo(appId, options = {}) {
   } catch (err) {
     console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
   }
+  try {
+    const groupTypeBytes = new TextEncoder().encode("config-sync");
+    try {
+      await primaryInstance.readFile(`${META_DIR}/group-type`);
+    } catch {
+      await primaryInstance.writeFile(`${META_DIR}/group-type`, groupTypeBytes);
+      console.log(`[createConfigRepo] group-type set to "config-sync"`);
+    }
+  } catch (err) {
+    console.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
+  }
   const tempRepo = new ConfigRepo(
     appId,
     "",
     LOCAL_IDB_BACKEND_ID,
     cachedFS,
     createSerializerChain(),
-    void 0
+    void 0,
+    options.syncPollIntervalMs
   );
   const oldBackendsMeta = await tempRepo.readMetaFile(BACKENDS_FILE);
   if (oldBackendsMeta && oldBackendsMeta.backends?.length > 0) {
@@ -1313,7 +1623,8 @@ async function createConfigRepo(appId, options = {}) {
     LOCAL_IDB_BACKEND_ID,
     cachedFS,
     serializer,
-    options.onConflict
+    options.onConflict,
+    options.syncPollIntervalMs
   );
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
   await repo.load();
@@ -1322,19 +1633,370 @@ async function createConfigRepo(appId, options = {}) {
   });
   return repo;
 }
+
+// src/data-sync-group.ts
+import {
+  ZenFSSync as ZenFSSync2,
+  SyncDirection as SyncDirection2
+} from "zen-fs-sync";
+
+// src/logger.ts
+var isDebug = (() => {
+  if (typeof process !== "undefined" && process.env?.ZEN_FS_CONFIG_DEBUG) {
+    return true;
+  }
+  if (typeof localStorage !== "undefined") {
+    try {
+      return localStorage.getItem("ZEN_FS_CONFIG_DEBUG") === "1";
+    } catch {
+      return false;
+    }
+  }
+  return false;
+})();
+function createLogger(prefix) {
+  if (!isDebug) {
+    return () => {
+    };
+  }
+  return (...args) => {
+    console.log(`[${prefix}]`, ...args);
+  };
+}
+
+// src/data-sync-group.ts
+var log = createLogger("data-sync-group");
+var META_DIR2 = "/.meta";
+var GROUP_TYPE_FILE2 = `${META_DIR2}/group-type`;
+var BACKENDS_DIR2 = `${META_DIR2}/backends`;
+var DataSyncGroup = class {
+  groupId;
+  appId;
+  fs;
+  syncEngine;
+  localFS;
+  dataBackends = /* @__PURE__ */ new Map();
+  disposed = false;
+  constructor(appId, groupId, localFS) {
+    this.appId = appId;
+    this.groupId = groupId;
+    this.syncEngine = new ZenFSSync2();
+    this.localFS = localFS;
+    this.fs = createChrootFS(localFS, "/");
+  }
+  /**
+   * Add a data backend and set up bi-directional sync.
+   */
+  async addBackend(id, type, options, description) {
+    if (this.disposed) throw new Error("DataSyncGroup has been disposed");
+    if (this.dataBackends.has(id)) {
+      throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
+    }
+    log(`addBackend: creating ${id} (${type})...`);
+    const instance = await createBackend({ type, options });
+    const syncable = backendToSyncableFS(instance, `${type}(${id})`);
+    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    const pair = this.syncEngine.addPair(
+      localSyncable,
+      syncable,
+      {
+        direction: SyncDirection2.BiDirectional,
+        conflictStrategy: "source-wins"
+      },
+      "/"
+    );
+    this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc: { id, type, options, description } });
+    this.syncEngine.watch(pair.pairId);
+    log(`addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
+    await this.saveBackendDescriptor(id, type, options, description);
+    try {
+      await this.syncEngine.sync(pair.pairId);
+    } catch (err) {
+      log(`addBackend: initial sync failed for ${id}:`, err);
+    }
+  }
+  /**
+   * Remove a data backend.
+   */
+  async removeBackend(id) {
+    if (this.disposed) throw new Error("DataSyncGroup has been disposed");
+    const backend = this.dataBackends.get(id);
+    if (!backend) {
+      throw new Error(`Backend "${id}" not found in data group "${this.groupId}"`);
+    }
+    this.syncEngine.removePair(backend.pairId);
+    this.dataBackends.delete(id);
+    if (backend.instance?.dispose) {
+      await backend.instance.dispose();
+    }
+    try {
+      await this.localFS.unlink(`${BACKENDS_DIR2}/${id}.json`);
+    } catch {
+    }
+    log(`removeBackend: ${id} removed`);
+  }
+  getSyncStatuses() {
+    return this.syncEngine.getStatusAll();
+  }
+  async flush() {
+    const results = await this.syncEngine.syncAll();
+    return Array.from(results.values());
+  }
+  listBackends() {
+    return Array.from(this.dataBackends.values()).map((b) => b.desc);
+  }
+  async dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.syncEngine.dispose();
+    for (const [_id, backend] of this.dataBackends) {
+      if (backend.instance?.dispose) {
+        await backend.instance.dispose();
+      }
+    }
+    this.dataBackends.clear();
+    log(`disposed`);
+  }
+  // -----------------------------------------------------------------------
+  // Internal — used by the factory function
+  // -----------------------------------------------------------------------
+  /**
+   * Register a pre-created backend instance with the sync engine.
+   * Used internally by createDataSyncGroup() to avoid double-creating backends.
+   */
+  _registerBackend(id, instance, syncable, pollIntervalMs) {
+    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    const pair = this.syncEngine.addPair(
+      localSyncable,
+      syncable,
+      {
+        direction: SyncDirection2.BiDirectional,
+        conflictStrategy: "source-wins",
+        pollIntervalMs
+      },
+      "/"
+    );
+    this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc: { id, type: instance.constructor?.name || "unknown", options: {} } });
+    this.syncEngine.watch(pair.pairId);
+    return pair.pairId;
+  }
+  /** Run syncAll on the internal engine. */
+  async _syncAll() {
+    await this.syncEngine.syncAll();
+  }
+  /** Get the number of registered data backends. */
+  get _backendCount() {
+    return this.dataBackends.size;
+  }
+  // -----------------------------------------------------------------------
+  // Internal — descriptor persistence
+  // -----------------------------------------------------------------------
+  async saveBackendDescriptor(id, type, options, description) {
+    const desc = { id, type, options, description };
+    const path = `${BACKENDS_DIR2}/${id}.json`;
+    await this.ensureDir(path);
+    const bytes = new TextEncoder().encode(JSON.stringify(desc, null, 2));
+    await this.localFS.writeFile(path, bytes);
+  }
+  async ensureDir(filePath) {
+    const parts = filePath.split("/").filter(Boolean);
+    parts.pop();
+    let current = "";
+    for (const part of parts) {
+      current += `/${part}`;
+      try {
+        await this.localFS.mkdir(current);
+      } catch {
+      }
+    }
+  }
+};
+async function createDataSyncGroup(appId, options = {}) {
+  const groupId = `data-${appId}-${Date.now().toString(36)}`;
+  log(`createDataSyncGroup: appId=${appId} groupId=${groupId}`);
+  const localFS = await createBackend({
+    type: "InMemory",
+    options: { label: `data-sync-${appId}-${Date.now()}` }
+  });
+  try {
+    await localFS.mkdir(META_DIR2);
+  } catch {
+  }
+  if (options.backendInfo) {
+    const remoteBackend = await createBackend({
+      type: options.backendInfo.type,
+      options: options.backendInfo.options
+    });
+    try {
+      const raw = await remoteBackend.readFile(GROUP_TYPE_FILE2, "utf-8");
+      const remoteType = raw.trim();
+      if (remoteType === "config-sync") {
+        throw new Error(
+          `Backend is a config-sync group, not data-sync. Use createConfigRepo() instead.`
+        );
+      }
+    } catch (err) {
+      if (err.message?.includes("config-sync")) throw err;
+      try {
+        await remoteBackend.writeFile(
+          GROUP_TYPE_FILE2,
+          new TextEncoder().encode("data-sync")
+        );
+      } catch (writeErr) {
+        log(`Could not write group-type on remote: ${writeErr.message}`);
+      }
+    }
+    let remoteBackendDescs = [];
+    try {
+      const entries = await remoteBackend.readdir(BACKENDS_DIR2);
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        try {
+          const raw = await remoteBackend.readFile(`${BACKENDS_DIR2}/${entry}`);
+          const desc2 = JSON.parse(new TextDecoder().decode(raw instanceof Uint8Array ? raw : new Uint8Array(raw)));
+          if (desc2.id && desc2.type) remoteBackendDescs.push(desc2);
+        } catch {
+        }
+      }
+    } catch {
+    }
+    const group2 = new DataSyncGroup(appId, groupId, localFS);
+    try {
+      await localFS.writeFile(GROUP_TYPE_FILE2, new TextEncoder().encode("data-sync"));
+    } catch {
+    }
+    const backendId = options.primaryBackendId || `${options.backendInfo.type}-primary`;
+    const desc = {
+      id: backendId,
+      type: options.backendInfo.type,
+      options: options.backendInfo.options
+    };
+    try {
+      await localFS.mkdir(BACKENDS_DIR2);
+    } catch {
+    }
+    await localFS.writeFile(
+      `${BACKENDS_DIR2}/${backendId}.json`,
+      new TextEncoder().encode(JSON.stringify(desc, null, 2))
+    );
+    const remoteSyncable = backendToSyncableFS(remoteBackend, `${options.backendInfo.type}(${backendId})`);
+    group2._registerBackend(backendId, remoteBackend, remoteSyncable, options.pollIntervalMs);
+    for (const rdesc of remoteBackendDescs) {
+      if (rdesc.id === backendId) continue;
+      try {
+        const instance = await createBackend({ type: rdesc.type, options: rdesc.options });
+        const syncable = backendToSyncableFS(instance, `${rdesc.type}(${rdesc.id})`);
+        group2._registerBackend(rdesc.id, instance, syncable, options.pollIntervalMs);
+      } catch (err) {
+        log(`Failed to add remote backend ${rdesc.id}:`, err);
+      }
+    }
+    try {
+      await group2._syncAll();
+    } catch (err) {
+      log(`Initial sync failed:`, err);
+    }
+    log(`createDataSyncGroup: ready with ${group2._backendCount} backend(s)`);
+    return group2;
+  }
+  const group = new DataSyncGroup(appId, groupId, localFS);
+  try {
+    await localFS.writeFile(GROUP_TYPE_FILE2, new TextEncoder().encode("data-sync"));
+  } catch {
+  }
+  log(`createDataSyncGroup: local-only group created`);
+  return group;
+}
+
+// src/connect.ts
+var log2 = createLogger("connect");
+var META_DIR3 = "/.meta";
+var GROUP_TYPE_FILE3 = `${META_DIR3}/group-type`;
+async function detectGroupType(type, options) {
+  log2(`detectGroupType: connecting to ${type}...`);
+  const tempBackend = await createBackend({ type, options });
+  try {
+    const raw = await tempBackend.readFile(GROUP_TYPE_FILE3, "utf-8");
+    const groupType = raw.trim();
+    if (groupType === "config-sync" || groupType === "data-sync") {
+      log2(`detectGroupType: detected "${groupType}"`);
+      return groupType;
+    }
+    log2(`detectGroupType: unknown group-type value "${groupType}", treating as null`);
+    return null;
+  } catch {
+    log2(`detectGroupType: no group-type file found (new backend)`);
+    return null;
+  } finally {
+    if (tempBackend?.dispose) {
+      await tempBackend.dispose();
+    }
+  }
+}
+async function connect(appId, options = {}) {
+  log2(`connect: appId=${appId}`);
+  if (!options.backendInfo) {
+    const groupType2 = options.groupType ?? "config-sync";
+    log2(`connect: no backendInfo, using groupType="${groupType2}"`);
+    if (groupType2 === "data-sync") {
+      const dataGroup = await createDataSyncGroup(appId, {});
+      return { groupType: "data-sync", dataGroup };
+    }
+    const repo2 = await createConfigRepo(appId, {
+      idbStoreName: options.idbStoreName,
+      nodeId: options.nodeId,
+      syncPollIntervalMs: options.syncPollIntervalMs
+    });
+    return { groupType: "config-sync", repo: repo2 };
+  }
+  const { type, options: backendOptions } = options.backendInfo;
+  const detectedType = await detectGroupType(type, backendOptions);
+  let groupType;
+  if (detectedType) {
+    if (options.groupType && options.groupType !== detectedType) {
+      throw new Error(
+        `Group type mismatch: remote backend is "${detectedType}" but options.groupType is "${options.groupType}"`
+      );
+    }
+    groupType = detectedType;
+  } else {
+    groupType = options.groupType ?? "config-sync";
+    log2(`connect: new backend, using groupType="${groupType}"`);
+  }
+  if (groupType === "data-sync") {
+    const dataGroup = await createDataSyncGroup(appId, {
+      backendInfo: options.backendInfo,
+      primaryBackendId: options.idbStoreName,
+      nodeId: options.nodeId
+    });
+    return { groupType: "data-sync", dataGroup };
+  }
+  const repo = await createConfigRepo(appId, {
+    backendInfo: options.backendInfo,
+    idbStoreName: options.idbStoreName,
+    nodeId: options.nodeId,
+    syncPollIntervalMs: options.syncPollIntervalMs
+  });
+  return { groupType: "config-sync", repo };
+}
 export {
   ConfigRepo,
+  DataSyncGroup,
   LOCAL_IDB_BACKEND_ID,
   configKeyToFilePath,
+  connect,
   createBackend,
   createConfigRepo,
+  createDataSyncGroup,
   createSerializerChain,
+  getAccountFields,
   getBackendMetadata,
   getExtension,
   hasBackend,
   incrementVersion,
   listBackendMetadata,
   listBackends,
+  mergeAccountFields,
   readVersion,
   registerBackend,
   sha256,

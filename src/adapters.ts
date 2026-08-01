@@ -70,17 +70,17 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
 
   // 透传 onChange（本地后端用，writeFile/unlink 时推送变更通知）
   if (typeof (backend as any).onChange === 'function') {
-    syncable.onChange = (cb: () => void) => (backend as any).onChange(cb);
+    (syncable as any).onChange = (cb: () => void) => (backend as any).onChange(cb);
   }
 
   // 透传 shouldSync（远程后端用，检查远端是否有外部变更）
   if (typeof (backend as any).shouldSync === 'function') {
-    syncable.shouldSync = () => (backend as any).shouldSync();
+    (syncable as any).shouldSync = () => (backend as any).shouldSync();
   }
 
   // 透传 checkForUpdates（已废弃，保留兼容）
   if (typeof (backend as any).checkForUpdates === 'function') {
-    syncable.checkForUpdates = () => (backend as any).checkForUpdates();
+    (syncable as any).checkForUpdates = () => (backend as any).checkForUpdates();
   }
 
   // Set backendName for zen-fs-sync logging
