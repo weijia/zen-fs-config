@@ -973,12 +973,19 @@ export class ConfigRepo implements IConfigRepo {
       await this.writeBackendDescriptor(desc);
     }
 
-    // Remove any backend files that are no longer in the list
+    // Remove any backend files that are no longer in the list.
+    // Use deleteFile (tombstone) to prevent sync from re-introducing
+    // the deleted descriptor from a remote that still has it.
     const keepIds = new Set(replicas.map(b => b.id));
     const current = await this.readAllBackendDescriptors();
     for (const desc of current) {
       if (!keepIds.has(desc.id)) {
-        await this.removeBackendDescriptor(desc.id);
+        const descPath = this.backendFilePath(desc.id);
+        try {
+          await this.deleteFile(descPath);
+        } catch {
+          await this.removeBackendDescriptor(desc.id);
+        }
       }
     }
   }
@@ -1056,21 +1063,42 @@ export class ConfigRepo implements IConfigRepo {
       throw new Error(`Backend "${id}" is not a registered replica`);
     }
 
-    // Stop watching and remove sync pair
+    // 1. Delete the descriptor file on the remote backend DIRECTLY.
+    //    This must happen BEFORE removing the sync pair, because once the
+    //    sync pair is gone, we can no longer reach the remote through the
+    //    normal sync flow. Without this, the remote keeps the file and
+    //    another backend's sync pair would pull it back.
+    const descPath = this.backendFilePath(id);
+    try {
+      await replica.instance.unlink(descPath);
+    } catch { /* not on remote */ }
+    try {
+      await replica.instance.unlink(versionPathFor(descPath));
+    } catch { /* no version sidecar */ }
+
+    // 2. Create a tombstone + delete the local file.
+    //    The tombstone ensures that if another backend syncs to the same
+    //    remote, the deleted file won't be re-introduced.
+    try {
+      await this.deleteFile(descPath);
+    } catch {
+      // deleteFile might fail in edge cases — fall back to plain unlink
+      await this.removeBackendDescriptor(id);
+    }
+
+    // 3. Stop watching and remove sync pair
     this.syncEngine.removePair(replica.pairId);
     console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
 
-    // Remove from replica map
+    // 4. Remove from replica map
     this.replicaBackends.delete(id);
 
-    // Dispose backend instance
+    // 5. Dispose backend instance
     if (replica.instance?.dispose) {
       await replica.instance.dispose();
     }
 
-    // Remove descriptor file
-    await this.removeBackendDescriptor(id);
-    console.log(`[ConfigRepo] removeBackend: ${id} removed`);
+    console.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
   }
 
   // -----------------------------------------------------------------------
