@@ -704,31 +704,206 @@ createConfigRepo('my-app', options?)
   │
   ├─ 5. If options.backendInfo provided:
   │     ├─ Generate replica ID (options.primaryBackendId or auto)
-  │     └─ Write descriptor to .meta/backends/{replicaId}.json (if not exists)
+  │     ├─ Dedup check: same type + options (stable key) already registered?
+  │     └─ Write descriptor to .meta/backends/{replicaId}.json (if not duplicate)
   │
   ├─ 6. Read all backend descriptors from .meta/backends/
+  │     └─ Dedup: remove duplicates (same type + options, different ID)
+  │        ├─ Delete duplicate files on ALL replicas directly
+  │        └─ Create tombstone + delete local file
   │
-  ├─ 7. Determine nodeId (explicit > localStorage > auto-generated)
+  ├─ 7. Determine nodeId (explicit parameter > auto-generated)
   │
-  ├─ 8. Create ConfigRepo with primary = 'local-idb'
+  ├─ 8. Create final ConfigRepo instance (primary = 'local-idb')
   │
-  ├─ 9. setupSync: for each backend (except local-idb):
-  │     ├─ Create backend instance
-  │     ├─ Create SyncPair(IndexedDB, replica, bi-directional)
-  │     └─ syncEngine.watch(pairId)
+  ├─ 9. setupSync: for each replica backend:
+  │     ├─ Create backend instance (e.g., Gitee, RemoteStorage)
+  │     ├─ Create SyncPair(IndexedDB ↔ replica, bi-directional)
+  │     ├─ Register conflict handler
+  │     └─ NOTE: Does NOT call watch() yet (see §11.4 for why)
   │
-  ├─ 10. Load app data group references from .meta/app-data-groups/{appId}/
-  │      For each referenced data-sync group:
-  │      ├─ Create data-sync backends (merge account fields if accountBackendId set)
-  │      ├─ Create SyncPair for each data backend
-  │      └─ syncEngine.watch(pairId)
+  ├─ 10. Load config cache from IndexedDB (fast, local-only)
   │
-  ├─ 11. syncMetaToReplicas: push .meta/ changes to all replicas (background)
+  ├─ 11. initialSyncAndDedup() — only if replicas exist:
+  │     ├─ unwatchAll()      — safety: clear any stale snapshots
+  │     ├─ syncAll()         — full bidirectional sync (no cached snapshot
+  │     │                      → every file is compared, remote-only files
+  │     │                      are pulled to local)
+  │     ├─ readAllBackendDescriptors() — dedup duplicates pulled from remote
+  │     │   ├─ Delete dup files on ALL replicas directly
+  │     │   └─ Create tombstones for deduped descriptors
+  │     ├─ processTombstones() — delete deduped files on all replicas
+  │     └─ watchAll()       — start monitoring for future changes
+  │         (snapshots now reflect the fully synced state)
   │
-  └─ 12. Load config cache from IndexedDB
+  ├─ 12. syncMetaToReplicas() — background push of .meta/ changes
+  │     (watchers already running, this just speeds up initial propagation)
+  │
+  └─ 13. Return ConfigRepo instance
 ```
 
-### 11.2 Standalone Data-Sync Group (`createDataSyncGroup`)
+### 11.2 Why "Sync Before Watch" (Critical Design Decision)
+
+The sync engine (`zen-fs-sync`) uses **snapshot-based change detection**. When `watch()` is called on a SyncPair, it triggers `buildInitialSnapshots()` which:
+
+1. Builds a snapshot of the source (IndexedDB) — walks all files, records `path`, `size`, `mtimeMs`
+2. Builds a snapshot of the target (remote backend) — same process
+3. **Merges** both snapshots into one map (`source ∪ target`)
+4. Caches this merged snapshot as `sourceSnapshots`
+
+On the next `syncAll()`, `syncBidirectional()` compares the current merged snapshot with the cached one. If all paths, sizes, and mtimes match → **"unchanged" → skip sync entirely**.
+
+**The problem**: `buildInitialSnapshots()` only *reads* file metadata — it does NOT copy any files. So if the remote has files that the local doesn't (e.g., duplicate backend descriptors written by another node), the merged snapshot includes them from the remote side. The subsequent sync sees "the merged snapshot already has this file" and skips — the file is never actually copied to local, and local-only dedup logic never runs.
+
+**The fix**: Always perform a full `syncAll()` **before** `watch()`. With no cached snapshot, `syncBidirectional()` does a complete comparison and copies all missing files. After sync completes, `watch()` builds snapshots from the now-consistent state.
+
+This pattern is applied in three places:
+- `createConfigRepo()` → `initialSyncAndDedup()` (sync → dedup → watch)
+- `addBackend()` → `syncMetaToReplicas()` then `watch()` (sync → watch)
+- `AppDataGroupImpl.connect()` → `syncAll()` then `watchAll()` (sync → watch)
+
+### 11.3 `flush()` — Manual Sync Trigger
+
+```
+flush()
+  │
+  ├─ 1. processTombstones()
+  │     For each tombstone in /.meta/.deleted/:
+  │     ├─ Delete the actual file on primary (in case re-created)
+  │     ├─ Delete the actual file on ALL replicas
+  │     └─ Delete version sidecars on all replicas
+  │
+  ├─ 2. syncAll()
+  │     For each SyncPair (IndexedDB ↔ replica):
+  │     ├─ Build current snapshots of both sides
+  │     ├─ Compare with cached snapshot (if any)
+  │     ├─ Detect changes: Created / Modified / Deleted
+  │     ├─ Resolve conflicts (source-wins strategy)
+  │     └─ Copy files in both directions as needed
+  │
+  ├─ 3. readAllBackendDescriptors() — post-sync dedup
+  │     Sync may have pulled duplicate backend descriptors from remote.
+  │     Re-run dedup to catch and remove them.
+  │     ├─ Delete dup files on ALL replicas directly
+  │     └─ Create tombstones for deduped descriptors
+  │
+  ├─ 4. processTombstones() — process any new tombstones from step 3
+  │
+  ├─ 5. updateTombstoneConfirmations()
+  │     Mark each tombstone as confirmed by all replica backends
+  │
+  ├─ 6. gcTombstones()
+  │     Remove tombstones confirmed by ALL backends in the topology
+  │
+  └─ Return SyncResult[] (one per sync pair)
+```
+
+### 11.4 Tombstone-Based Deletion Propagation
+
+When a file is deleted via `deleteFile(path)`:
+
+```
+deleteFile('/.meta/backends/old-backend.json')
+  │
+  ├─ 1. Write tombstone: /.meta/.deleted/++meta__backends__old-backend++json.json
+  │     { path, deletedAt, deletedBy, confirmedBy: [primaryBackendId] }
+  │
+  ├─ 2. Delete the actual file on primary (IndexedDB)
+  │
+  └─ 3. Delete version sidecar (.old-backend.json.version) on primary
+```
+
+On the next `processTombstones()` (called by `flush()` or `initialSyncAndDedup()`):
+
+```
+For each tombstone:
+  ├─ Delete file on primary (in case sync re-created it)
+  ├─ Delete file on ALL replicas
+  ├─ Delete version sidecar on ALL replicas
+  └─ Tombstone file itself is synced to replicas via syncAll()
+     → Late-joining replicas see the tombstone and delete the file
+```
+
+**Why tombstones?** Without them, bi-directional sync treats a deleted local file as "missing → needs to be copied from remote". The tombstone explicitly signals "this file was intentionally deleted" so all replicas honor the deletion. Tombstones are garbage-collected after all backends confirm receipt.
+
+### 11.5 Backend Deduplication
+
+When `readAllBackendDescriptors()` detects two backends with the same `type` + `options` (using stable key ordering) but different IDs:
+
+```
+Detected: rs-1 and rs-2 have identical type + options
+  │
+  ├─ 1. Keep the one with the earliest mtime (created first)
+  │
+  ├─ 2. For each duplicate:
+  │     ├─ Delete descriptor file on ALL replicas directly
+  │     │   (prevents sync from pulling it back)
+  │     ├─ Delete version sidecar on ALL replicas
+  │     └─ Create tombstone + delete local file
+  │
+  └─ 3. Return deduplicated list (duplicates removed)
+```
+
+The stable key function (`backendDedupKey`) sorts object keys recursively, so `{ token: 'a', owner: 'b' }` and `{ owner: 'b', token: 'a' }` produce the same key and are correctly detected as duplicates.
+
+### 11.6 Dynamic Backend Management
+
+**`addBackend(id, type, options)`**:
+
+```
+  ├─ 1. Dedup check: reject if same type+options already registered
+  ├─ 2. Create backend instance
+  ├─ 3. Write descriptor to .meta/backends/{id}.json
+  ├─ 4. Create SyncPair (IndexedDB ↔ new replica, bi-directional)
+  ├─ 5. syncMetaToReplicas() — full sync FIRST (pull + push)
+  └─ 6. watch(pairId) — start monitoring AFTER sync completes
+```
+
+**`removeBackend(id)`**:
+
+```
+  ├─ 1. Delete descriptor file on the remote backend DIRECTLY
+  │     (must happen before removing sync pair — otherwise can't reach remote)
+  ├─ 2. Delete version sidecar on remote
+  ├─ 3. Create tombstone + delete local descriptor file
+  ├─ 4. Remove sync pair (stops watching + disposes)
+  ├─ 5. Remove from replicaBackends map
+  ├─ 6. Dispose backend instance
+  ├─ 7. processTombstones() — propagate deletion to remaining replicas
+  └─ 8. flush() — sync + GC tombstones
+```
+
+### 11.7 Watch Mode (Auto-Sync)
+
+After initialization, each SyncPair runs in **watch mode** with hybrid change detection:
+
+```
+watch() triggers:
+  │
+  ├─ 1. Register onChange callbacks (if backend supports it)
+  │     Local backends (IndexedDB) push change notifications
+  │     → triggers debounced sync (default 300ms)
+  │
+  ├─ 2. buildInitialSnapshots()
+  │     ├─ BiDirectional: merge source + target snapshots
+  │     └─ OneWay: snapshot source only
+  │
+  └─ 3. Start poll timers (if backend supports shouldSync)
+       ├─ Remote backends poll shouldSync() every pollIntervalMs (default 30min)
+       └─ Fallback: if no onChange and no shouldSync, poll every interval
+```
+
+**State guard**: If `unwatch()` is called during `buildInitialSnapshots()` (which is async), the snapshots are discarded — they won't be cached. This prevents stale snapshots from causing sync skips.
+
+**Snapshot comparison** in `syncBidirectional()`:
+1. Build current snapshots of both sides
+2. Merge into `currentMerged = source ∪ target`
+3. Compare with cached `sourceSnapshots`:
+   - If all paths + mtimes + sizes match → "unchanged" → skip
+   - Otherwise → proceed with full diff and file operations
+4. Cache `currentMerged` for next comparison
+
+### 11.8 Standalone Data-Sync Group (`createDataSyncGroup`)
 
 ```
 createDataSyncGroup('my-app', options?)
@@ -743,11 +918,16 @@ createDataSyncGroup('my-app', options?)
   ├─ 3. Create IndexedDB as local primary (for offline access)
   │
   ├─ 4. Setup sync: IndexedDB ↔ each data backend (bi-directional)
+  │     NOTE: Does NOT watch yet — sync first
   │
-  └─ 5. Return DataSyncGroup handle with direct fs access
+  ├─ 5. syncAll() — pull data from remote backends
+  │
+  ├─ 6. watchAll() — start monitoring AFTER sync completes
+  │
+  └─ 7. Return DataSyncGroup handle with direct fs access
 ```
 
-### 11.3 Unified Entry Point (`connect`)
+### 11.9 Unified Entry Point (`connect`)
 
 `createConfigRepo` and `createDataSyncGroup` are lower-level factory functions. The recommended entry point is `connect`, which auto-detects the group type and dispatches to the appropriate factory:
 
