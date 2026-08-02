@@ -533,6 +533,22 @@ var LOCAL_IDB_BACKEND_ID = "local-idb";
 function tombstoneFileName(filePath) {
   return filePath.replace(/^\//, "").replace(/\//g, "__").replace(/\./g, "++") + ".json";
 }
+function stableOptionsKey(options) {
+  if (!options || typeof options !== "object") return "{}";
+  return JSON.stringify(sortKeysDeep(options));
+}
+function sortKeysDeep(obj) {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(sortKeysDeep);
+  const sorted = {};
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortKeysDeep(obj[key]);
+  }
+  return sorted;
+}
+function backendDedupKey(desc) {
+  return `${desc.type}:${stableOptionsKey(desc.options)}`;
+}
 var ConfigRepo = class {
   appId;
   nodeId;
@@ -1163,7 +1179,7 @@ var ConfigRepo = class {
       const seen = /* @__PURE__ */ new Map();
       const duplicates = [];
       for (const item of items) {
-        const key = `${item.desc.type}:${JSON.stringify(item.desc.options ?? {})}`;
+        const key = backendDedupKey(item.desc);
         const existing = seen.get(key);
         if (existing) {
           if (item.mtime < existing.mtime) {
@@ -1181,7 +1197,12 @@ var ConfigRepo = class {
           `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(", ")}`
         );
         for (const dupId of duplicates) {
-          await this.removeBackendDescriptor(dupId);
+          const descPath = this.backendFilePath(dupId);
+          try {
+            await this.deleteFile(descPath);
+          } catch {
+            await this.removeBackendDescriptor(dupId);
+          }
         }
       }
       return Array.from(seen.values()).map((i) => i.desc);
@@ -1259,6 +1280,13 @@ var ConfigRepo = class {
     const existing = await this.readAllBackendDescriptors();
     if (existing.some((b) => b.id === id)) {
       throw new Error(`Backend "${id}" already exists. Use removeBackend() first.`);
+    }
+    const newKey = backendDedupKey({ id, type, options });
+    const dup = existing.find((b) => backendDedupKey(b) === newKey);
+    if (dup) {
+      throw new Error(
+        `Backend "${id}" has the same configuration as existing backend "${dup.id}" (type=${type}). Use removeBackend("${dup.id}") first, or connect with the existing backend's ID.`
+      );
     }
     console.log(`[ConfigRepo] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
@@ -1655,13 +1683,21 @@ async function createConfigRepo(appId, options = {}) {
     const replicaId = options.primaryBackendId || `${options.backendInfo.type}-replica`;
     const allBackends2 = await tempRepo.readAllBackendDescriptors();
     const hasReplica = allBackends2.some((b) => b.id === replicaId);
-    if (!hasReplica) {
+    const newKey = backendDedupKey({
+      id: replicaId,
+      type: options.backendInfo.type,
+      options: options.backendInfo.options
+    });
+    const dupConfig = allBackends2.find((b) => backendDedupKey(b) === newKey);
+    if (!hasReplica && !dupConfig) {
       await tempRepo.writeBackendDescriptor({
         id: replicaId,
         type: options.backendInfo.type,
         options: options.backendInfo.options
       });
       console.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
+    } else if (dupConfig) {
+      console.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
     } else {
       console.log(`[createConfigRepo] Replica ${replicaId} already registered`);
     }

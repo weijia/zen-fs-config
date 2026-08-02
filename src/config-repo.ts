@@ -66,6 +66,38 @@ function decodeTombstoneFileName(name: string): string {
     .replace(/__/g, '/');
 }
 
+/**
+ * Produce a stable string representation of a backend descriptor's options.
+ * Object keys are sorted recursively so that two objects with the same
+ * key-value pairs but different insertion order produce the same string.
+ *
+ * This is critical for deduplication: without stable key ordering,
+ * `JSON.stringify({ token: 'a', owner: 'b' })` !== `JSON.stringify({ owner: 'b', token: 'a' })`,
+ * causing the dedup logic to miss duplicates.
+ */
+function stableOptionsKey(options: Record<string, unknown> | undefined): string {
+  if (!options || typeof options !== 'object') return '{}';
+  return JSON.stringify(sortKeysDeep(options));
+}
+
+function sortKeysDeep(obj: unknown): unknown {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(sortKeysDeep);
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj as Record<string, unknown>).sort()) {
+    sorted[key] = sortKeysDeep((obj as Record<string, unknown>)[key]);
+  }
+  return sorted;
+}
+
+/**
+ * Generate a dedup key for a backend descriptor.
+ * Two backends with the same type + options (regardless of key ordering) produce the same key.
+ */
+function backendDedupKey(desc: BackendDescriptor): string {
+  return `${desc.type}:${stableOptionsKey(desc.options)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Minimal async FS interface for internal use
 // ---------------------------------------------------------------------------
@@ -839,13 +871,13 @@ export class ConfigRepo implements IConfigRepo {
         } catch { /* skip corrupt file */ }
       }
 
-      // Deduplicate: same type + options but different id.
+      // Deduplicate: same type + options (stable key) but different id.
       // Keep the one with the earliest mtime (created first).
       const seen = new Map<string, { desc: BackendDescriptor; mtime: number }>();
       const duplicates: string[] = [];
 
       for (const item of items) {
-        const key = `${item.desc.type}:${JSON.stringify(item.desc.options ?? {})}`;
+        const key = backendDedupKey(item.desc);
         const existing = seen.get(key);
         if (existing) {
           if (item.mtime < existing.mtime) {
@@ -866,7 +898,16 @@ export class ConfigRepo implements IConfigRepo {
           `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
         );
         for (const dupId of duplicates) {
-          await this.removeBackendDescriptor(dupId);
+          // Use deleteFile (tombstone) instead of plain unlink to prevent
+          // bi-directional sync from re-introducing the duplicate from remote.
+          const descPath = this.backendFilePath(dupId);
+          try {
+            await this.deleteFile(descPath);
+          } catch {
+            // deleteFile might fail if called before sync engine is set up
+            // (e.g. during createConfigRepo's tempRepo phase). Fall back to plain unlink.
+            await this.removeBackendDescriptor(dupId);
+          }
         }
       }
 
@@ -953,10 +994,19 @@ export class ConfigRepo implements IConfigRepo {
       throw new Error(`Cannot add backend with reserved ID "${LOCAL_IDB_BACKEND_ID}"`);
     }
 
-    // Check if already exists
+    // Check if already exists — by ID AND by type+options
     const existing = await this.readAllBackendDescriptors();
     if (existing.some(b => b.id === id)) {
       throw new Error(`Backend "${id}" already exists. Use removeBackend() first.`);
+    }
+    // Check for duplicate configuration (same type + options, different ID)
+    const newKey = backendDedupKey({ id, type, options });
+    const dup = existing.find(b => backendDedupKey(b) === newKey);
+    if (dup) {
+      throw new Error(
+        `Backend "${id}" has the same configuration as existing backend "${dup.id}" (type=${type}). ` +
+        `Use removeBackend("${dup.id}") first, or connect with the existing backend's ID.`,
+      );
     }
 
     // Create backend instance
@@ -1480,13 +1530,22 @@ export async function createConfigRepo(
     const replicaId = options.primaryBackendId || `${options.backendInfo.type}-replica`;
     const allBackends = await tempRepo.readAllBackendDescriptors();
     const hasReplica = allBackends.some(b => b.id === replicaId);
-    if (!hasReplica) {
+    // Also check for duplicate configuration (same type + options, different ID)
+    const newKey = backendDedupKey({
+      id: replicaId,
+      type: options.backendInfo.type,
+      options: options.backendInfo.options,
+    });
+    const dupConfig = allBackends.find(b => backendDedupKey(b) === newKey);
+    if (!hasReplica && !dupConfig) {
       await tempRepo.writeBackendDescriptor({
         id: replicaId,
         type: options.backendInfo.type,
         options: options.backendInfo.options,
       });
       console.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
+    } else if (dupConfig) {
+      console.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
     } else {
       console.log(`[createConfigRepo] Replica ${replicaId} already registered`);
     }
