@@ -585,6 +585,10 @@ var ConfigRepo = class {
   get nodePath() {
     return `/nodes/${this.nodeId}`;
   }
+  /** Number of replica backends registered (excludes the local primary). */
+  get replicaCount() {
+    return this.replicaBackends.size;
+  }
   // -----------------------------------------------------------------------
   // IConfigRepo — Load
   // -----------------------------------------------------------------------
@@ -723,6 +727,8 @@ var ConfigRepo = class {
     this.assertNotDisposed();
     await this.processTombstones();
     const resultsMap = await this.syncEngine.syncAll();
+    await this.readAllBackendDescriptors();
+    await this.processTombstones();
     await this.updateTombstoneConfirmations();
     await this.gcTombstones();
     return Array.from(resultsMap.values());
@@ -810,6 +816,22 @@ var ConfigRepo = class {
         console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
       }
     }
+  }
+  /** Public wrapper for processTombstones — used by createConfigRepo. */
+  async processTombstonesPublic() {
+    await this.processTombstones();
+  }
+  /**
+   * Perform a full sync + dedup cycle without the watch snapshot cache.
+   * Used by createConfigRepo to pull remote-only files (like duplicate
+   * backend descriptors) that watch()'s initial snapshot would skip.
+   */
+  async initialSyncAndDedup() {
+    this.syncEngine.unwatchAll();
+    await this.syncEngine.syncAll();
+    await this.readAllBackendDescriptors();
+    await this.processTombstones();
+    this.syncEngine.watchAll();
   }
   /**
    * After sync: mark each tombstone as confirmed by all replica backends.
@@ -988,7 +1010,6 @@ var ConfigRepo = class {
           this.handleConflict(event);
         };
         this.syncEngine.on(pair.pairId, "conflict", conflictHandler);
-        this.syncEngine.watch(pair.pairId);
         console.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
       } catch (err) {
         console.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
@@ -1198,6 +1219,16 @@ var ConfigRepo = class {
         );
         for (const dupId of duplicates) {
           const descPath = this.backendFilePath(dupId);
+          for (const [replicaId, replica] of this.replicaBackends) {
+            try {
+              await replica.instance.unlink(descPath);
+            } catch {
+            }
+            try {
+              await replica.instance.unlink(versionPathFor(descPath));
+            } catch {
+            }
+          }
           try {
             await this.deleteFile(descPath);
           } catch {
@@ -1265,7 +1296,12 @@ var ConfigRepo = class {
     const current = await this.readAllBackendDescriptors();
     for (const desc of current) {
       if (!keepIds.has(desc.id)) {
-        await this.removeBackendDescriptor(desc.id);
+        const descPath = this.backendFilePath(desc.id);
+        try {
+          await this.deleteFile(descPath);
+        } catch {
+          await this.removeBackendDescriptor(desc.id);
+        }
       }
     }
   }
@@ -1307,9 +1343,9 @@ var ConfigRepo = class {
       this.handleConflict(event);
     };
     this.syncEngine.on(pair.pairId, "conflict", conflictHandler);
-    this.syncEngine.watch(pair.pairId);
     console.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
     await this.syncMetaToReplicas();
+    this.syncEngine.watch(pair.pairId);
   }
   async removeBackend(id) {
     this.assertNotDisposed();
@@ -1320,14 +1356,27 @@ var ConfigRepo = class {
     if (!replica) {
       throw new Error(`Backend "${id}" is not a registered replica`);
     }
+    const descPath = this.backendFilePath(id);
+    try {
+      await replica.instance.unlink(descPath);
+    } catch {
+    }
+    try {
+      await replica.instance.unlink(versionPathFor(descPath));
+    } catch {
+    }
+    try {
+      await this.deleteFile(descPath);
+    } catch {
+      await this.removeBackendDescriptor(id);
+    }
     this.syncEngine.removePair(replica.pairId);
     console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
     this.replicaBackends.delete(id);
     if (replica.instance?.dispose) {
       await replica.instance.dispose();
     }
-    await this.removeBackendDescriptor(id);
-    console.log(`[ConfigRepo] removeBackend: ${id} removed`);
+    console.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
   }
   // -----------------------------------------------------------------------
   // IConfigRepo — Group Type
@@ -1541,7 +1590,6 @@ var AppDataGroupImpl = class {
           "/"
         );
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
-        this.syncEngine.watch(pair.pairId);
         console.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err) {
         console.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
@@ -1552,6 +1600,7 @@ var AppDataGroupImpl = class {
     } catch (err) {
       console.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
     }
+    this.syncEngine.watchAll();
   }
   getSyncStatuses() {
     return this.syncEngine.getStatusAll();
@@ -1581,13 +1630,13 @@ var AppDataGroupImpl = class {
     );
     const desc = { id, type, options, description };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
-    this.syncEngine.watch(pair.pairId);
     console.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
     try {
       await this.syncEngine.sync(pair.pairId);
     } catch (err) {
       console.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
     }
+    this.syncEngine.watch(pair.pairId);
   }
   async removeBackend(id) {
     if (this.disposed) throw new Error("DataSyncGroup has been disposed");
@@ -1721,6 +1770,10 @@ async function createConfigRepo(appId, options = {}) {
   );
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
   await repo.load();
+  if (repo.replicaCount > 0) {
+    console.log("[createConfigRepo] Initial sync + dedup cycle...");
+    await repo.initialSyncAndDedup();
+  }
   repo.syncMetaToReplicas().catch((err) => {
     console.error("[createConfigRepo] background syncMetaToReplicas failed:", err);
   });

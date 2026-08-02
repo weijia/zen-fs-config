@@ -325,6 +325,78 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
   });
 });
 
+describe('dedup during createConfigRepo — survives sync re-introduction', () => {
+  it('two identical backends on remote: createConfigRepo deduplicates and sync does not bring back the deleted one', async () => {
+    const appId = 'test-dedup-survives-sync';
+    const sharedStoreKey = `shared-${appId}-${Date.now()}`;
+    const idbStore = `persistent-${appId}`;
+
+    // Phase 1: Create a repo with one MockShared backend "rs-1"
+    // This pushes rs-1.json to the shared remote store.
+    const repo1 = await createConfigRepo(appId, {
+      idbStoreName: idbStore,
+      backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
+      primaryBackendId: 'rs-1',
+      nodeId: 'node-1',
+    }) as ConfigRepo;
+
+    await new Promise(r => setTimeout(r, 100));
+    await repo1.flush();
+    await repo1.dispose();
+
+    // Phase 2: Manually write a SECOND descriptor with same config but different ID
+    // directly into the shared store, simulating a pre-existing duplicate.
+    const remoteStore = sharedMockStores.get(sharedStoreKey)!;
+    const rs2Desc = JSON.stringify({
+      id: 'rs-2',
+      type: 'MockShared',
+      options: { storeKey: sharedStoreKey },
+    }, null, 2);
+    remoteStore.set('/.meta/backends/rs-2.json', new TextEncoder().encode(rs2Desc));
+    // Also add a version sidecar like writeBackendDescriptor would
+    remoteStore.set('/.meta/backends/.rs-2.json.version', new TextEncoder().encode(
+      JSON.stringify({ version: 1, hash: 'fake', author: 'test', timestamp: Date.now() }),
+    ));
+
+    // Verify both exist on remote
+    expect(remoteStore.has('/.meta/backends/rs-1.json')).toBe(true);
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
+
+    // Phase 3: Reconnect. createConfigRepo will:
+    //   Step 6: readAllBackendDescriptors → dedup (rs-1 and rs-2 have same config)
+    //   Step 8: setupSync (only surviving backend gets a sync pair)
+    //   syncMetaToReplicas → flush → processTombstones + syncAll
+    //
+    // The key question: does the deleted duplicate (rs-2) survive the sync,
+    // or does syncAll bring it back from remote?
+    const repo2 = await createConfigRepo(appId, {
+      idbStoreName: idbStore,
+      nodeId: 'node-2',
+    }) as ConfigRepo;
+
+    // Wait for background sync
+    await new Promise(r => setTimeout(r, 200));
+
+    // Check: only ONE backend should exist
+    const backends = await repo2.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
+
+    // Check: rs-2 should NOT exist on remote anymore
+    // (processTombstones should have deleted it via rs-1's sync pair)
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
+
+    // Check: rs-2 should NOT exist on local either
+    expect(persistentStores.get(idbStore)!.has('/.meta/backends/rs-2.json')).toBe(false);
+
+    // Flush again to make sure it doesn't come back
+    await repo2.flush();
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
+    expect(persistentStores.get(idbStore)!.has('/.meta/backends/rs-2.json')).toBe(false);
+
+    await repo2.dispose();
+  });
+});
+
 describe('removeBackend — tombstone-based deletion', () => {
   it('creates a tombstone file when removing a backend (not plain unlink)', async () => {
     const appId = 'test-remove-tombstone';
@@ -419,26 +491,25 @@ describe('removeBackend — tombstone-based deletion', () => {
       options: { storeKey: sharedStoreKey },
     });
 
-    // Flush to push rs-2 to remote as well
+    // Flush — this now includes post-sync dedup, which will detect rs-1 and
+    // rs-2 as duplicates and remove rs-2 (keeping rs-1, the older one).
+    // So after flush, only rs-1 should exist on remote.
     await repo.flush();
 
-    // Verify both descriptors exist on remote
+    // Verify: rs-1 exists, rs-2 was deduped
     const remoteStore = sharedMockStores.get(sharedStoreKey)!;
     expect(remoteStore.has('/.meta/backends/rs-1.json')).toBe(true);
-    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
 
     // Now remove rs-1 via removeBackend (uses deleteFile → tombstone)
     await repo.removeBackend('rs-1');
 
-    // Flush — tombstone should propagate to remote via rs-2's sync pair
-    // (rs-1's sync pair was removed, but rs-2 is still active)
-    // Wait — rs-2 was written via writeBackendDescriptor, not addBackend,
-    // so it doesn't have a sync pair. Let's reconnect to pick it up.
+    // Flush — tombstone should propagate to remote
+    await repo.flush();
+
     await repo.dispose();
 
-    // Reconnect — createConfigRepo will readAllBackendDescriptors which
-    // deduplicates (rs-1 and rs-2 have same config). rs-1 was already
-    // tombstoned, so only rs-2 should remain and get a sync pair.
+    // Reconnect — no backends should remain
     const repo2 = await createConfigRepo(appId, {
       idbStoreName: idbStore,
       nodeId: 'node-2',
@@ -450,13 +521,12 @@ describe('removeBackend — tombstone-based deletion', () => {
     // rs-1 should NOT exist on remote (tombstone propagated)
     expect(remoteStore.has('/.meta/backends/rs-1.json')).toBe(false);
 
-    // rs-2 should still exist
-    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
+    // rs-2 was already deduped, so it should not exist either
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
 
-    // Only rs-2 should be in the backend list
+    // No backends should remain
     const backends = await repo2.readAllBackendDescriptors();
-    expect(backends.length).toBe(1);
-    expect(backends[0].id).toBe('rs-2');
+    expect(backends.length).toBe(0);
 
     await repo2.dispose();
   });

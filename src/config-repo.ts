@@ -158,6 +158,11 @@ export class ConfigRepo implements IConfigRepo {
     return `/nodes/${this.nodeId}`;
   }
 
+  /** Number of replica backends registered (excludes the local primary). */
+  get replicaCount(): number {
+    return this.replicaBackends.size;
+  }
+
   // -----------------------------------------------------------------------
   // IConfigRepo — Load
   // -----------------------------------------------------------------------
@@ -324,7 +329,13 @@ export class ConfigRepo implements IConfigRepo {
     await this.processTombstones();
     // 2. Run normal sync (syncs data files + tombstone files)
     const resultsMap = await this.syncEngine.syncAll();
-    // 3. Update tombstone confirmations + GC
+    // 3. Post-sync dedup: sync may have pulled duplicate backend descriptors
+    //    from remote. Re-run readAllBackendDescriptors to detect and remove
+    //    any duplicates that arrived via sync, then process their tombstones
+    //    so the deletion propagates back to remote.
+    await this.readAllBackendDescriptors();
+    await this.processTombstones();
+    // 4. Update tombstone confirmations + GC
     await this.updateTombstoneConfirmations();
     await this.gcTombstones();
     return Array.from(resultsMap.values());
@@ -419,6 +430,24 @@ export class ConfigRepo implements IConfigRepo {
         console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
       }
     }
+  }
+
+  /** Public wrapper for processTombstones — used by createConfigRepo. */
+  async processTombstonesPublic(): Promise<void> {
+    await this.processTombstones();
+  }
+
+  /**
+   * Perform a full sync + dedup cycle without the watch snapshot cache.
+   * Used by createConfigRepo to pull remote-only files (like duplicate
+   * backend descriptors) that watch()'s initial snapshot would skip.
+   */
+  async initialSyncAndDedup(): Promise<void> {
+    this.syncEngine.unwatchAll();
+    await this.syncEngine.syncAll();
+    await this.readAllBackendDescriptors();
+    await this.processTombstones();
+    this.syncEngine.watchAll();
   }
 
   /**
@@ -647,7 +676,13 @@ export class ConfigRepo implements IConfigRepo {
           this.handleConflict(event);
         };
         this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
-        this.syncEngine.watch(pair.pairId);
+
+        // NOTE: Do NOT call watch() here. watch() triggers buildInitialSnapshots()
+        // which caches a merged (source ∪ target) snapshot WITHOUT actually
+        // syncing files. This causes subsequent syncAll() to see "unchanged"
+        // and skip, leaving remote-only files (like duplicate backend
+        // descriptors) un-pulled. The caller (createConfigRepo) will do an
+        // initial sync first, then call watchAll().
 
         console.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
       } catch (err: any) {
@@ -898,9 +933,24 @@ export class ConfigRepo implements IConfigRepo {
           `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
         );
         for (const dupId of duplicates) {
-          // Use deleteFile (tombstone) instead of plain unlink to prevent
-          // bi-directional sync from re-introducing the duplicate from remote.
           const descPath = this.backendFilePath(dupId);
+
+          // 1. Delete the descriptor file on ALL known replicas directly.
+          //    This is critical: if we only write a tombstone + delete locally,
+          //    the sync engine will see "remote has file, local doesn't" and
+          //    copy it back — re-creating the duplicate in an infinite loop.
+          //    By deleting on all replicas NOW, both sides are clean.
+          for (const [replicaId, replica] of this.replicaBackends) {
+            try {
+              await replica.instance.unlink(descPath);
+            } catch { /* not on this replica */ }
+            try {
+              await replica.instance.unlink(versionPathFor(descPath));
+            } catch { /* no version sidecar */ }
+          }
+
+          // 2. Create a tombstone + delete the local file.
+          //    The tombstone ensures late-joining replicas also delete the file.
           try {
             await this.deleteFile(descPath);
           } catch {
@@ -1043,12 +1093,14 @@ export class ConfigRepo implements IConfigRepo {
       this.handleConflict(event);
     };
     this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
-    this.syncEngine.watch(pair.pairId);
 
     console.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
 
-    // Trigger initial sync to pull/push data
+    // Trigger initial sync FIRST (pulls remote-only files, pushes local files).
+    // Then start watching. If we watch before syncing, buildInitialSnapshots()
+    // caches a merged snapshot without copying, causing syncAll() to skip.
     await this.syncMetaToReplicas();
+    this.syncEngine.watch(pair.pairId);
   }
 
   async removeBackend(id: string): Promise<void> {
@@ -1366,19 +1418,22 @@ class AppDataGroupImpl implements AppDataGroup {
           '/',
         );
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
-        this.syncEngine.watch(pair.pairId);
+        // NOTE: Don't watch yet — sync first, then watch (same pattern as ConfigRepo)
         console.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err: any) {
         console.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
       }
     }
 
-    // Initial sync — pull data from remote backends
+    // Initial sync — pull data from remote backends (before watching)
     try {
       await this.syncEngine.syncAll();
     } catch (err) {
       console.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
     }
+
+    // Now start watching — snapshots will reflect the synced state
+    this.syncEngine.watchAll();
   }
 
   getSyncStatuses(): Map<string, SyncPairStatus> {
@@ -1419,15 +1474,15 @@ class AppDataGroupImpl implements AppDataGroup {
 
     const desc: AppDataBackendDescriptor = { id, type, options, description };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
-    this.syncEngine.watch(pair.pairId);
     console.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 
-    // Initial sync
+    // Initial sync FIRST, then watch (same pattern as ConfigRepo.addBackend)
     try {
       await this.syncEngine.sync(pair.pairId);
     } catch (err) {
       console.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
     }
+    this.syncEngine.watch(pair.pairId);
   }
 
   async removeBackend(id: string): Promise<void> {
@@ -1614,6 +1669,19 @@ export async function createConfigRepo(
 
   // Load config cache from local IndexedDB (fast, no network)
   await repo.load();
+
+  // Step 8b: Initial sync + dedup cycle.
+  // setupSync creates sync pairs WITHOUT calling watch() (to avoid
+  // buildInitialSnapshots caching a stale merged snapshot). Now we:
+  //   1. unwatchAll() — safety: ensures no stale snapshots (no-op if never watched)
+  //   2. syncAll() — full bidirectional sync, pulls remote-only files to local
+  //   3. readAllBackendDescriptors() — dedup any duplicates pulled from remote
+  //   4. processTombstones() — delete deduped files on all replicas
+  //   5. watchAll() — start monitoring for future changes
+  if (repo.replicaCount > 0) {
+    console.log('[createConfigRepo] Initial sync + dedup cycle...');
+    await repo.initialSyncAndDedup();
+  }
 
   // Sync to replicas in the background — watchers are already running,
   // so this just speeds up the initial push. Don't block the caller.

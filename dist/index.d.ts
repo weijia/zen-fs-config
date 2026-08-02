@@ -465,6 +465,8 @@ declare class ConfigRepo implements IConfigRepo {
     constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>, pollIntervalMs?: number);
     /** Full path to this node's directory on the primary backend. */
     get nodePath(): string;
+    /** Number of replica backends registered (excludes the local primary). */
+    get replicaCount(): number;
     load(rawConfig?: string): Promise<void>;
     getConfig<T = unknown>(path: string): T;
     setConfig(path: string, data: unknown): void;
@@ -489,6 +491,14 @@ declare class ConfigRepo implements IConfigRepo {
      * This prevents bi-directional sync from copying the file back.
      */
     private processTombstones;
+    /** Public wrapper for processTombstones — used by createConfigRepo. */
+    processTombstonesPublic(): Promise<void>;
+    /**
+     * Perform a full sync + dedup cycle without the watch snapshot cache.
+     * Used by createConfigRepo to pull remote-only files (like duplicate
+     * backend descriptors) that watch()'s initial snapshot would skip.
+     */
+    initialSyncAndDedup(): Promise<void>;
     /**
      * After sync: mark each tombstone as confirmed by all replica backends.
      */
