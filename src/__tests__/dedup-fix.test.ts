@@ -325,6 +325,134 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
   });
 });
 
+describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
+  it('detects and removes corrupted backend descriptor files (malformed JSON)', async () => {
+    const appId = 'test-corrupt-json-cleanup';
+    const idbStore = `persistent-${appId}`;
+
+    const repo = await createConfigRepo(appId, {
+      idbStoreName: idbStore,
+      nodeId: 'node-1',
+    }) as ConfigRepo;
+
+    // Write a valid backend descriptor
+    await repo.writeBackendDescriptor({
+      id: 'valid-backend',
+      type: 'InMemory',
+      options: { label: 'test-store' },
+    });
+
+    // Manually write a CORRUPTED descriptor file (malformed JSON with trailing garbage)
+    // This simulates the real-world issue found in the Gitee configs repository where
+    // remotestorage.json had trailing garbage '}步"' after the closing brace.
+    const corruptContent = '{"id":"corrupt-rs","type":"RemoteStorage","options":{"href":"https://storage.example.com/","token":"abc","basePath":"/configs"}}garbage';
+    const localStore = persistentStores.get(idbStore)!;
+    localStore.set('/.meta/backends/corrupt-rs.json', new TextEncoder().encode(corruptContent));
+
+    // readAllBackendDescriptors should detect the corrupted file and clean it up
+    const result = await repo.readAllBackendDescriptors();
+
+    // Only the valid backend should remain
+    expect(result.length).toBe(1);
+    expect(result[0].id).toBe('valid-backend');
+
+    // The corrupted file should have been deleted locally
+    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+
+    // A tombstone should have been created for the corrupted file
+    const deletedEntries = await repo.rootFS.promises.readdir('/.meta/.deleted').catch(() => []);
+    const corruptTombstone = deletedEntries.find((f: string) => f.includes('corrupt-rs'));
+    expect(corruptTombstone).toBeDefined();
+
+    await repo.dispose();
+  });
+
+  it('detects and removes descriptors missing required id/type fields', async () => {
+    const appId = 'test-missing-fields-cleanup';
+    const idbStore = `persistent-${appId}`;
+
+    const repo = await createConfigRepo(appId, {
+      idbStoreName: idbStore,
+      nodeId: 'node-1',
+    }) as ConfigRepo;
+
+    // Write a valid backend descriptor
+    await repo.writeBackendDescriptor({
+      id: 'good-backend',
+      type: 'InMemory',
+      options: { label: 'good-store' },
+    });
+
+    // Write a descriptor file with valid JSON but missing 'type' field
+    const incompleteContent = JSON.stringify({
+      id: 'incomplete-backend',
+      options: { label: 'some-store' },
+      // missing "type" field
+    }, null, 2);
+    const localStore = persistentStores.get(idbStore)!;
+    localStore.set('/.meta/backends/incomplete-backend.json', new TextEncoder().encode(incompleteContent));
+
+    const result = await repo.readAllBackendDescriptors();
+
+    // Only the valid backend should remain
+    expect(result.length).toBe(1);
+    expect(result[0].id).toBe('good-backend');
+
+    // The incomplete file should have been deleted
+    expect(localStore.has('/.meta/backends/incomplete-backend.json')).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('corrupted file does not reappear after flush (tombstone prevents re-sync)', async () => {
+    const appId = 'test-corrupt-no-resync';
+    const sharedStoreKey = `shared-${appId}-${Date.now()}`;
+    const idbStore = `persistent-${appId}`;
+
+    // Create a repo with a MockShared backend
+    const repo = await createConfigRepo(appId, {
+      idbStoreName: idbStore,
+      backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
+      primaryBackendId: 'rs-1',
+      nodeId: 'node-1',
+    }) as ConfigRepo;
+
+    await new Promise(r => setTimeout(r, 100));
+    await repo.flush();
+
+    // Manually inject a corrupted descriptor into the REMOTE store
+    const remoteStore = sharedMockStores.get(sharedStoreKey)!;
+    const corruptContent = '{"id":"corrupt-rs","type":"MockShared","options":{"storeKey":"' + sharedStoreKey + '"}}TRAILING_GARBAGE';
+    remoteStore.set('/.meta/backends/corrupt-rs.json', new TextEncoder().encode(corruptContent));
+    remoteStore.set('/.meta/backends/.corrupt-rs.json.version', new TextEncoder().encode(
+      JSON.stringify({ version: 1, hash: 'fake', author: 'remote', timestamp: Date.now() }),
+    ));
+
+    // Flush — sync will pull the corrupted file from remote,
+    // then readAllBackendDescriptors (called in post-sync dedup) should detect and clean it
+    await repo.flush();
+
+    // The corrupted file should be gone from local
+    const localStore = persistentStores.get(idbStore)!;
+    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+
+    // The corrupted file should also be gone from remote (deleted by dedup cleanup)
+    expect(remoteStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+
+    // Flush again to make sure it doesn't come back
+    await repo.flush();
+    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+    expect(remoteStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+
+    // Only rs-1 should remain
+    const backends = await repo.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
+    expect(backends[0].id).toBe('rs-1');
+
+    await repo.dispose();
+  });
+});
+
 describe('dedup during createConfigRepo — survives sync re-introduction', () => {
   it('two identical backends on remote: createConfigRepo deduplicates and sync does not bring back the deleted one', async () => {
     const appId = 'test-dedup-survives-sync';

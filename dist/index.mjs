@@ -1122,6 +1122,7 @@ var ConfigRepo = class {
     try {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
       const items = [];
+      const corruptFiles = [];
       for (const entry of entries) {
         if (!entry.endsWith(".json")) continue;
         const filePath = `${BACKENDS_DIR}/${entry}`;
@@ -1136,8 +1137,37 @@ var ConfigRepo = class {
             } catch {
             }
             items.push({ desc, mtime });
+          } else {
+            console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+            corruptFiles.push(filePath);
           }
+        } catch (parseErr) {
+          console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+          corruptFiles.push(filePath);
+        }
+      }
+      for (const corruptPath of corruptFiles) {
+        for (const [, replica] of this.replicaBackends) {
+          try {
+            await replica.instance.unlink(corruptPath);
+          } catch {
+          }
+          try {
+            await replica.instance.unlink(versionPathFor(corruptPath));
+          } catch {
+          }
+        }
+        try {
+          await this.deleteFile(corruptPath);
         } catch {
+          try {
+            await this.cachedFS.unlink(corruptPath);
+          } catch {
+          }
+          try {
+            await this.cachedFS.unlink(versionPathFor(corruptPath));
+          } catch {
+          }
         }
       }
       const seen = /* @__PURE__ */ new Map();

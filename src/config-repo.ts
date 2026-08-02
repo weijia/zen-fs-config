@@ -889,6 +889,7 @@ export class ConfigRepo implements IConfigRepo {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
       // Collect descriptor + file mtime for dedup
       const items: { desc: BackendDescriptor; mtime: number }[] = [];
+      const corruptFiles: string[] = [];
       for (const entry of entries) {
         if (!entry.endsWith('.json')) continue;
         const filePath = `${BACKENDS_DIR}/${entry}`;
@@ -902,8 +903,38 @@ export class ConfigRepo implements IConfigRepo {
               mtime = stat.mtimeMs ?? 0;
             } catch { /* mtime unknown */ }
             items.push({ desc, mtime });
+          } else {
+            // Valid JSON but missing required fields — treat as corrupt
+            console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+            corruptFiles.push(filePath);
           }
-        } catch { /* skip corrupt file */ }
+        } catch (parseErr) {
+          // JSON.parse failed — the file is corrupted.
+          // This was the root cause of the "duplicate RemoteStorage backend" issue:
+          // a corrupted .json file could never be parsed, so it was never recognized
+          // as a duplicate, never got tombstoned, and kept being re-synced from remote.
+          // Now we proactively delete corrupted files on all replicas + create a tombstone.
+          console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+          corruptFiles.push(filePath);
+        }
+      }
+
+      // Clean up corrupted descriptor files: delete on all replicas, tombstone, delete locally.
+      // This prevents corrupted files from persisting and being re-synced indefinitely.
+      for (const corruptPath of corruptFiles) {
+        // 1. Delete on all known replicas directly
+        for (const [, replica] of this.replicaBackends) {
+          try { await replica.instance.unlink(corruptPath); } catch { /* not on this replica */ }
+          try { await replica.instance.unlink(versionPathFor(corruptPath)); } catch { /* no version sidecar */ }
+        }
+        // 2. Create a tombstone + delete locally
+        try {
+          await this.deleteFile(corruptPath);
+        } catch {
+          // deleteFile might fail if sync engine isn't set up yet — fall back to plain unlink
+          try { await this.cachedFS.unlink(corruptPath); } catch { /* already gone */ }
+          try { await this.cachedFS.unlink(versionPathFor(corruptPath)); } catch { /* no sidecar */ }
+        }
       }
 
       // Deduplicate: same type + options (stable key) but different id.
