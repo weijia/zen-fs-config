@@ -43,6 +43,10 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
       return backend.writeFile(path, data);
     },
 
+    async writeFileWithMtime(path: string, data: string | Uint8Array, mtime: number): Promise<void> {
+      return backend.writeFile(path, data, { mtime });
+    },
+
     async unlink(path: string): Promise<void> {
       return backend.unlink(path);
     },
@@ -121,6 +125,17 @@ export function zenfsPromisesToSyncableFS(promises: Record<string, any>): Syncab
       return promises.writeFile(path, data);
     },
 
+    async writeFileWithMtime(path: string, data: string | Uint8Array, mtime: number): Promise<void> {
+      await promises.writeFile(path, data);
+      // VFS promises doesn't support mtime in writeFile; use utimes as fallback
+      const time = new Date(mtime);
+      try {
+        await promises.utimes(path, time, time);
+      } catch {
+        // utimes may fail on some backends — non-fatal
+      }
+    },
+
     async unlink(path: string): Promise<void> {
       return promises.unlink(path);
     },
@@ -178,6 +193,11 @@ export function cachedFSToSyncableFS(cached: any, name?: string): SyncableFS {
 
     async writeFile(path: string, data: string | Uint8Array): Promise<void> {
       return cached.writeFile(path, data);
+    },
+
+    async writeFileWithMtime(path: string, data: string | Uint8Array, mtime: number): Promise<void> {
+      // CachedFileSystem wraps a backend; pass mtime through writeFile options
+      return cached.writeFile(path, data, { mtime });
     },
 
     async unlink(path: string): Promise<void> {

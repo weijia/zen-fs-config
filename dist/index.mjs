@@ -193,6 +193,9 @@ function backendToSyncableFS(backend, name) {
     async writeFile(path, data) {
       return backend.writeFile(path, data);
     },
+    async writeFileWithMtime(path, data, mtime) {
+      return backend.writeFile(path, data, { mtime });
+    },
     async unlink(path) {
       return backend.unlink(path);
     },
@@ -310,7 +313,7 @@ async function wrapZenFSFileSystem(config) {
       }
       await isolatedFS.write(path, bytes, 0);
       try {
-        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
+        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: _options?.mtime ?? Date.now() });
       } catch {
       }
       notifyChange();

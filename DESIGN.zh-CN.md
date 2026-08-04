@@ -432,3 +432,75 @@ syncBidirectional()
 | `/shared/` | 双向 | 可能（多写入者） | 跨应用共享配置 |
 | `/nodes/` | 无（默认） | 无 | 节点本地配置 |
 | `/.meta/` | 双向 | 无（拓扑文件） | 后端拓扑、墓碑、冲突归档 |
+
+## 5. 同步中的 mtime 保留
+
+### 5.1 问题
+
+同步引擎在将文件从源端复制到目标端时，调用 `writeFile(path, data)`。目标后端会设置自己的 mtime（通常是 `Date.now()`），丢失源文件的原始 mtime。这导致下一个同步周期检测到"已修改"的文件（源 mtime ≠ 目标 mtime），每次同步都触发不必要的复制。
+
+### 5.2 解决方案
+
+在 `SyncableFS` 接口上添加可选的 `writeFileWithMtime` 方法，未实现时自动回退到 `writeFile`：
+
+```typescript
+interface SyncableFS {
+  // ... 现有方法 ...
+
+  /**
+   * 可选：写入文件时保留精确 mtime。
+   * 如果实现此方法，同步引擎将使用它代替 writeFile，
+   * 传入源文件的 mtime 使目标端可以保留。
+   * 不支持精确 mtime 的后端不应实现此方法 —
+   * 同步引擎会回退到普通 writeFile。
+   */
+  writeFileWithMtime?(path: string, data: string | Uint8Array, mtime: number): Promise<void>;
+}
+```
+
+### 5.3 同步引擎（zen-fs-sync）
+
+中心化的辅助函数处理回退逻辑：
+
+```javascript
+async function writeFileWithMtimeFallback(fs, path, data, mtimeMs) {
+  if (mtimeMs !== undefined && typeof fs.writeFileWithMtime === "function") {
+    await fs.writeFileWithMtime(path, data, mtimeMs);
+  } else {
+    await fs.writeFile(path, data);
+  }
+}
+```
+
+此辅助函数在 `copyFile()`、`syncOneWay()` 和 `writeFileBoth()` 中使用。源文件的 mtime 通过 `stat()` 获取，然后传递给目标端。
+
+### 5.4 适配器（zen-fs-config）
+
+所有三个 `SyncableFS` 适配器都实现了 `writeFileWithMtime`：
+
+| 适配器 | 实现方式 |
+|---|---|
+| `backendToSyncableFS` | 将 `{ mtime }` 作为 options 传给 `backend.writeFile()` — 后端的 `writeFile` 调用 `touch()` 设置 mtime |
+| `zenfsPromisesToSyncableFS` | 先 `promises.writeFile()`，再用 `promises.utimes()` 作为回退（部分 VFS 后端不支持 writeFile 中传 mtime） |
+| `cachedFSToSyncableFS` | 将 `{ mtime }` 作为 options 传给 `cached.writeFile()` — mtime 透传到底层后端 |
+
+### 5.5 RemoteStorage 后端（zen-fs-remotestoragejs）
+
+`writeFileWithMtime` 委托给 `writeFile(path, data, { mtime })`，后者写入 `.mtime` sidecar 文件以保留毫秒级精度的 mtime（详见 RemoteStorage DESIGN.md §2）。
+
+### 5.6 数据流
+
+```
+源文件: /app-a/db.json (mtime=1700000000123)
+  │
+  ├─ 同步引擎: stat("/app-a/db.json") → mtimeMs=1700000000123
+  ├─ 同步引擎: readFile("/app-a/db.json") → data
+  ├─ 同步引擎: writeFileWithMtimeFallback(target, "/app-a/db.json", data, 1700000000123)
+  │   ├─ target 有 writeFileWithMtime? → 是 → target.writeFileWithMtime(path, data, 1700000000123)
+  │   │                                    → backend.writeFile(path, data, { mtime: 1700000000123 })
+  │   │                                    → touch(path, { mtimeMs: 1700000000123 })
+  │   └─ target 有 writeFileWithMtime? → 否 → target.writeFile(path, data) [回退]
+  │
+  └─ 目标文件: /app-a/db.json (mtime=1700000000123) ← 已保留！
+     → 下次同步: source.mtimeMs === target.mtimeMs → 跳过（无多余复制）
+```

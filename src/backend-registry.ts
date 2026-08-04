@@ -219,8 +219,9 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
       // touch updates local Inode metadata (size/mtime). Some backends (e.g.
       // RemoteStorage) don't support touch and throw — that's fine since their
       // metadata is server-managed, so we silently ignore the error.
+      // If caller provided mtime (e.g. from sync), preserve it; otherwise use now.
       try {
-        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: Date.now() });
+        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: _options?.mtime ?? Date.now() });
       } catch { /* backend doesn't support touch — metadata is server-managed */ }
       // 通知 sync 引擎：本地有变更
       notifyChange();

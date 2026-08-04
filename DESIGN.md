@@ -1041,6 +1041,67 @@ Application
   → Dispose temporary SyncPair
 ```
 
+### Mtime Preservation During Sync
+
+**Problem**: When the sync engine copies a file from source to target, it calls `writeFile(path, data)`. The target backend sets its own mtime (typically `Date.now()`), losing the source file's original mtime. This causes the next sync cycle to detect a "modified" file (source mtime ≠ target mtime), triggering unnecessary copies on every sync.
+
+**Solution**: An optional `writeFileWithMtime` method on the `SyncableFS` interface, with automatic fallback to `writeFile` when not implemented:
+
+```typescript
+interface SyncableFS {
+  // ... existing methods ...
+
+  /**
+   * Optional: write file with precise mtime.
+   * If implemented, the sync engine uses this instead of writeFile,
+   * passing the source file's mtime so the target can preserve it.
+   * Backends that don't support precise mtime should not implement this —
+   * the sync engine falls back to plain writeFile.
+   */
+  writeFileWithMtime?(path: string, data: string | Uint8Array, mtime: number): Promise<void>;
+}
+```
+
+**Sync engine (`zen-fs-sync`)**: A central helper function handles the fallback:
+
+```javascript
+async function writeFileWithMtimeFallback(fs, path, data, mtimeMs) {
+  if (mtimeMs !== undefined && typeof fs.writeFileWithMtime === "function") {
+    await fs.writeFileWithMtime(path, data, mtimeMs);
+  } else {
+    await fs.writeFile(path, data);
+  }
+}
+```
+
+This helper is used in `copyFile()`, `syncOneWay()`, and `writeFileBoth()`. The source file's mtime is obtained via `stat()` before writing, then passed through to the target.
+
+**Adapters (`zen-fs-config`)**: All three `SyncableFS` adapters implement `writeFileWithMtime`:
+
+| Adapter | Implementation |
+|---|---|
+| `backendToSyncableFS` | Passes `{ mtime }` as options to `backend.writeFile()` — the backend's `writeFile` calls `touch()` with the provided mtime |
+| `zenfsPromisesToSyncableFS` | Calls `promises.writeFile()` then `promises.utimes()` as a fallback (some VFS backends don't support mtime in writeFile) |
+| `cachedFSToSyncableFS` | Passes `{ mtime }` as options to `cached.writeFile()` — mtime flows through to the underlying backend |
+
+**RemoteStorage backend (`zen-fs-remotestoragejs`)**: `writeFileWithMtime` delegates to `writeFile(path, data, { mtime })`, which writes the `.mtime` sidecar file to preserve millisecond-precision mtime (see RemoteStorage DESIGN.md §2 for details).
+
+**Data flow**:
+```
+Source file: /app-a/db.json (mtime=1700000000123)
+  │
+  ├─ sync engine: stat("/app-a/db.json") → mtimeMs=1700000000123
+  ├─ sync engine: readFile("/app-a/db.json") → data
+  ├─ sync engine: writeFileWithMtimeFallback(target, "/app-a/db.json", data, 1700000000123)
+  │   ├─ target has writeFileWithMtime? → YES → target.writeFileWithMtime(path, data, 1700000000123)
+  │   │                                      → backend.writeFile(path, data, { mtime: 1700000000123 })
+  │   │                                      → touch(path, { mtimeMs: 1700000000123 })
+  │   └─ target has writeFileWithMtime? → NO  → target.writeFile(path, data) [fallback]
+  │
+  └─ Target file: /app-a/db.json (mtime=1700000000123) ← preserved!
+     → Next sync: source.mtimeMs === target.mtimeMs → skip (no spurious copy)
+```
+
 ## 13. Peer Dependencies
 
 | Package | Role | Version | Required |
