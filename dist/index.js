@@ -274,6 +274,12 @@ function backendToSyncableFS(backend, name) {
   if (typeof backend.shouldSync === "function") {
     syncable.shouldSync = () => backend.shouldSync();
   }
+  if (typeof backend.createSnapshot === "function") {
+    syncable.createSnapshot = (root, filter) => backend.createSnapshot(root, filter);
+  }
+  if (typeof backend.writeFileWithMtime === "function") {
+    syncable.writeFileWithMtime = (path, data, mtimeMs) => backend.writeFileWithMtime(path, data, mtimeMs);
+  }
   if (typeof backend.checkForUpdates === "function") {
     syncable.checkForUpdates = () => backend.checkForUpdates();
   }
@@ -404,6 +410,12 @@ async function wrapZenFSFileSystem(config) {
   backend.onChange = (callback) => {
     changeCallback = callback;
   };
+  if (typeof isolatedFS.createSnapshot === "function") {
+    backend.createSnapshot = (root, filter) => isolatedFS.createSnapshot(root, filter);
+  }
+  if (typeof isolatedFS.writeFileWithMtime === "function") {
+    backend.writeFileWithMtime = (path, data, mtimeMs) => isolatedFS.writeFileWithMtime(path, data, mtimeMs);
+  }
   return backend;
 }
 var inMemoryCounter = 0;

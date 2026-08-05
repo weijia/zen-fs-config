@@ -748,12 +748,11 @@ The sync engine (`zen-fs-sync`) uses **snapshot-based change detection**. When `
 
 1. Builds a snapshot of the source (IndexedDB) — walks all files, records `path`, `size`, `mtimeMs`
 2. Builds a snapshot of the target (remote backend) — same process
-3. **Merges** both snapshots into one map (`source ∪ target`)
-4. Caches this merged snapshot as `sourceSnapshots`
+3. Caches **separate** snapshots: `prevSrcSnap` (source) and `prevTgtSnap` (target)
 
-On the next `syncAll()`, `syncBidirectional()` compares the current merged snapshot with the cached one. If all paths, sizes, and mtimes match → **"unchanged" → skip sync entirely**.
+On the next `syncAll()`, `syncBidirectional()` compares each side's current snapshot with its own previous snapshot independently. If both sides are unchanged → **"unchanged" → skip sync entirely**.
 
-**The problem**: `buildInitialSnapshots()` only *reads* file metadata — it does NOT copy any files. So if the remote has files that the local doesn't (e.g., duplicate backend descriptors written by another node), the merged snapshot includes them from the remote side. The subsequent sync sees "the merged snapshot already has this file" and skips — the file is never actually copied to local, and local-only dedup logic never runs.
+**The problem**: `buildInitialSnapshots()` only *reads* file metadata — it does NOT copy any files. So if the remote has files that the local doesn't (e.g., duplicate backend descriptors written by another node), the cached snapshots reflect the un-synced state. The subsequent sync sees "snapshots already match this state" and skips — the file is never actually copied to local, and local-only dedup logic never runs.
 
 **The fix**: Always perform a full `syncAll()` **before** `watch()`. With no cached snapshot, `syncBidirectional()` does a complete comparison and copies all missing files. After sync completes, `watch()` builds snapshots from the now-consistent state.
 
@@ -885,8 +884,8 @@ watch() triggers:
   │     → triggers debounced sync (default 300ms)
   │
   ├─ 2. buildInitialSnapshots()
-  │     ├─ BiDirectional: merge source + target snapshots
-  │     └─ OneWay: snapshot source only
+  │     ├─ BiDirectional: cache separate source and target snapshots
+  │     └─ OneWay: cache source snapshot only
   │
   └─ 3. Start poll timers (if backend supports shouldSync)
        ├─ Remote backends poll shouldSync() every pollIntervalMs (default 30min)
@@ -896,12 +895,15 @@ watch() triggers:
 **State guard**: If `unwatch()` is called during `buildInitialSnapshots()` (which is async), the snapshots are discarded — they won't be cached. This prevents stale snapshots from causing sync skips.
 
 **Snapshot comparison** in `syncBidirectional()`:
-1. Build current snapshots of both sides
-2. Merge into `currentMerged = source ∪ target`
-3. Compare with cached `sourceSnapshots`:
-   - If all paths + mtimes + sizes match → "unchanged" → skip
-   - Otherwise → proceed with full diff and file operations
-4. Cache `currentMerged` for next comparison
+1. Build current snapshots of both sides (via `getSnapshot()`)
+2. Compare each side independently against its own previous snapshot:
+   - `srcChanged = !snapshotsEqual(prevSrcSnap, currentSrcSnap)`
+   - `tgtChanged = !snapshotsEqual(prevTgtSnap, currentTgtSnap)`
+   - If neither changed and both previous snapshots exist → skip sync entirely
+3. Cache current snapshots as `prevSrcSnap` and `prevTgtSnap` for next comparison
+4. If either side changed, proceed with full diff and file operations
+
+**Key difference from previous design**: The old approach merged source and target snapshots into a single map (`source ∪ target`), which lost information about which filesystem a file belonged to. The new approach keeps them separate, enabling precise per-side change detection and bidirectional deletion propagation (see §11.10).
 
 ### 11.8 Standalone Data-Sync Group (`createDataSyncGroup`)
 
@@ -994,6 +996,110 @@ interface ConnectResult {
 ```
 
 **Offline / zero-parameter mode**: When no `backendInfo` is provided, `connect` defaults to `config-sync` and creates an IndexedDB-only repo (same as `createConfigRepo` with no options).
+
+### 11.10 Snapshot Optimization Design
+
+This section describes three interrelated optimizations to the sync engine's snapshot mechanism.
+
+#### 11.10.1 FS-Provided `createSnapshot()`
+
+The `SyncableFS` interface now includes an optional `createSnapshot()` method:
+
+```typescript
+interface SyncableFS {
+  // ... existing methods ...
+
+  /**
+   * Optional: Build a filesystem snapshot.
+   * Returns a map of relative path → {size, mtimeMs} for all files under root.
+   * Returns null if the filesystem is unreachable.
+   *
+   * Backends that can provide a more efficient snapshot than the generic
+   * walkFiles+stat approach should implement this method.
+   */
+  createSnapshot?(root: string, filter?: SyncFilter): Promise<Map<string, FileSnapshot> | null>;
+}
+```
+
+The sync engine's `getSnapshot()` helper dispatches to the FS-provided method when available, falling back to the generic `buildSnapshot()` (walkFiles + stat) otherwise:
+
+```typescript
+private async getSnapshot(fs: SyncableFS): Promise<Map<string, FileSnapshot> | null> {
+  if (fs.createSnapshot) {
+    return fs.createSnapshot(this.root, this.options.filter);
+  }
+  return buildSnapshot(fs, this.root, this.options.filter);
+}
+```
+
+**Optimization examples**:
+- **Gitee/GitHub**: Use Git tree API to fetch all file metadata in a single request instead of walking files one by one
+- **IndexedDB**: Use `getAll()` for batch querying instead of individual `stat()` calls
+- **InMemory**: Directly iterate the internal Map (no async I/O overhead)
+
+Backends that do not implement `createSnapshot()` are fully supported — the generic fallback produces identical results.
+
+#### 11.10.2 Separate Source and Target Snapshots
+
+**Previous design** (merged snapshots):
+- `buildInitialSnapshots()` merged source and target into a single map: `sourceSnapshots = new Map([...srcSnap, ...tgtSnap])`
+- `syncBidirectional()` compared `currentMerged` with the cached merged snapshot
+- **Problem**: The merged map lost which filesystem a file belonged to. A file present on target but not source could be "new on target" or "deleted from source" — the merged snapshot couldn't distinguish.
+
+**New design** (separate snapshots):
+- `buildInitialSnapshots()` caches two independent maps: `prevSrcSnap` and `prevTgtSnap`
+- `syncBidirectional()` compares each side independently:
+  ```
+  srcChanged = !snapshotsEqual(prevSrcSnap, currentSrcSnap)
+  tgtChanged = !snapshotsEqual(prevTgtSnap, currentTgtSnap)
+  if (!srcChanged && !tgtChanged && prevSrcSnap && prevTgtSnap) → skip sync
+  ```
+- Each side's change is detected independently, preserving file-location information
+
+#### 11.10.3 Bidirectional Deletion Propagation
+
+When a file exists on one side but not the other, the sync engine uses previous snapshots to distinguish "created" from "deleted":
+
+```
+File on target, not on source:
+  ├─ Was it on source in the previous snapshot (prevSrcSnap)?
+  │   ├─ Yes → file was deleted from source → delete from target too (propagate deletion)
+  │   └─ No  → file was created on target → copy to source
+
+File on source, not on target:
+  ├─ Was it on target in the previous snapshot (prevTgtSnap)?
+  │   ├─ Yes → file was deleted from target → delete from source too (propagate deletion)
+  │   └─ No  → file was created on source → copy to target
+```
+
+**Without this mechanism**, deleting a file on one side would cause the sync engine to see "the other side still has it → copy it back", effectively undoing the deletion.
+
+**Relationship with tombstones**: The tombstone mechanism (§11.4) and bidirectional deletion propagation operate at different layers and complement each other:
+
+| Mechanism | Layer | Trigger | How It Works |
+|-----------|-------|---------|--------------|
+| Tombstone | `zen-fs-config` (application) | Application calls `deleteFile()` | Writes a `.meta/.deleted/` marker, physically deletes file on all replicas **before** sync runs |
+| Deletion propagation | `zen-fs-sync` (engine) | Sync detects one-side-only file | Compares with previous snapshot to determine if file was created or deleted |
+
+Tombstones handle application-initiated deletions (the common case). Deletion propagation handles deletions that bypass the tombstone flow — e.g., external modifications on the remote backend, or files removed by other sync mechanisms.
+
+#### 11.10.4 `shouldSync()` vs Snapshot Comparison
+
+These two mechanisms are complementary, not interchangeable:
+
+| Mechanism | Purpose | Cost | When Used |
+|-----------|---------|------|-----------|
+| `shouldSync()` | Fast "has anything changed?" boolean | O(1) for remote (ETag/commit check) | `onRemotePoll()` — decide whether to trigger sync at all |
+| Snapshot comparison | "What exactly changed?" detail | O(n) filesystem traversal | `syncBidirectional()` — decide what to copy/delete |
+
+`shouldSync()` is **not** part of the snapshot comparison because:
+1. `shouldSync()` updates its internal baseline after each call — calling it again during sync would return stale results
+2. `shouldSync()` returning false doesn't guarantee the snapshot is unchanged — it means the FS's own change detection says nothing changed, which could miss edge cases
+3. `shouldSync()` returning true doesn't tell us **which** files changed — snapshots are still needed for that
+
+The two-level optimization works as follows:
+1. **Level 1**: `shouldSync()` in remote poll → if false, skip sync trigger entirely (saves the O(n) snapshot build)
+2. **Level 2**: Separate snapshot comparison in sync → if both sides unchanged, skip file operations (saves I/O)
 
 ## 12. Data Flow
 
