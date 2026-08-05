@@ -263,6 +263,18 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
     changeCallback = callback;
   };
 
+  // 透传 createSnapshot（如底层 ZenFS FS 实现了此方法）
+  if (typeof (isolatedFS as any).createSnapshot === 'function') {
+    (backend as any).createSnapshot = (root: string, filter?: any) =>
+      (isolatedFS as any).createSnapshot(root, filter);
+  }
+
+  // 透传 writeFileWithMtime（如底层 ZenFS FS 实现了此方法）
+  if (typeof (isolatedFS as any).writeFileWithMtime === 'function') {
+    (backend as any).writeFileWithMtime = (path: string, data: string | Uint8Array, mtimeMs: number) =>
+      (isolatedFS as any).writeFileWithMtime(path, data, mtimeMs);
+  }
+
   return backend;
 }
 

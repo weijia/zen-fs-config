@@ -82,6 +82,18 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
     (syncable as any).shouldSync = () => (backend as any).shouldSync();
   }
 
+  // 透传 createSnapshot（后端提供的高效快照方法）
+  if (typeof (backend as any).createSnapshot === 'function') {
+    (syncable as any).createSnapshot = (root: string, filter?: any) =>
+      (backend as any).createSnapshot(root, filter);
+  }
+
+  // 透传 writeFileWithMtime（写入文件时保留指定 mtime，如 Gitee 的 sidecar 方式）
+  if (typeof (backend as any).writeFileWithMtime === 'function') {
+    (syncable as any).writeFileWithMtime = (path: string, data: string | Uint8Array, mtimeMs: number) =>
+      (backend as any).writeFileWithMtime(path, data, mtimeMs);
+  }
+
   // 透传 checkForUpdates（已废弃，保留兼容）
   if (typeof (backend as any).checkForUpdates === 'function') {
     (syncable as any).checkForUpdates = () => (backend as any).checkForUpdates();

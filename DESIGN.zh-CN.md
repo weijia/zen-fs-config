@@ -66,12 +66,11 @@ createConfigRepo('my-app', options?)
 
 1. 构建源端（IndexedDB）的快照 — 遍历所有文件，记录 `path`、`size`、`mtimeMs`
 2. 构建目标端（远程后端）的快照 — 同样的过程
-3. **合并**两端快照为一个 Map（`source ∪ target`）
-4. 将合并后的快照缓存为 `sourceSnapshots`
+3. 缓存**分离的**快照：`prevSrcSnap`（源端）和 `prevTgtSnap`（目标端）
 
-在下一次 `syncAll()` 时，`syncBidirectional()` 会将当前合并快照与缓存快照比较。如果所有路径、大小、修改时间都匹配 → **判定"无变化" → 跳过同步**。
+在下一次 `syncAll()` 时，`syncBidirectional()` 会将每端的当前快照与各自的上次快照独立比较。如果两端都没有变化 → **判定"无变化" → 跳过同步**。
 
-**问题所在**：`buildInitialSnapshots()` 只是*读取*文件元数据 — 它**不会复制任何文件**。如果远端有本地没有的文件（例如其他节点写入的重复后端描述符），合并快照会从远端侧包含这些文件。后续同步看到"合并快照中已有此文件"就跳过了 — 文件从未被真正复制到本地，本地的去重逻辑也永远不会执行。
+**问题所在**：`buildInitialSnapshots()` 只是*读取*文件元数据 — 它**不会复制任何文件**。如果远端有本地没有的文件（例如其他节点写入的重复后端描述符），缓存的快照反映的是未同步的状态。后续同步看到"快照已经匹配这个状态"就跳过了 — 文件从未被真正复制到本地，本地的去重逻辑也永远不会执行。
 
 **修复方案**：始终在 `watch()` **之前**执行完整的 `syncAll()`。没有缓存快照时，`syncBidirectional()` 会进行完整比较并复制所有缺失的文件。同步完成后，`watch()` 从已一致的状态构建快照。
 
@@ -203,7 +202,7 @@ watch() 触发：
   │     → 触发防抖同步（默认 300ms）
   │
   ├─ 2. buildInitialSnapshots()
-  │     ├─ 双向：合并 source + target 快照
+  │     ├─ 双向：缓存分离的 source 和 target 快照
   │     └─ 单向：仅快照 source
   │
   └─ 3. 启动轮询定时器（如后端支持 shouldSync）
@@ -214,12 +213,15 @@ watch() 触发：
 **状态守卫**：如果在 `buildInitialSnapshots()`（异步操作）执行期间调用了 `unwatch()`，快照会被丢弃 — 不会被缓存。这防止了过期快照导致同步跳过。
 
 **快照比较** 在 `syncBidirectional()` 中的逻辑：
-1. 构建两端当前快照
-2. 合并为 `currentMerged = source ∪ target`
-3. 与缓存的 `sourceSnapshots` 比较：
-   - 如果所有路径 + mtime + size 都匹配 → "无变化" → 跳过
-   - 否则 → 执行完整差异比较和文件操作
-4. 缓存 `currentMerged` 供下次比较
+1. 构建两端当前快照（通过 `getSnapshot()`）
+2. 将每端与各自的上次快照独立比较：
+   - `srcChanged = !snapshotsEqual(prevSrcSnap, currentSrcSnap)`
+   - `tgtChanged = !snapshotsEqual(prevTgtSnap, currentTgtSnap)`
+   - 如果两端都没变且都有上次快照 → 跳过同步
+3. 缓存当前快照为 `prevSrcSnap` 和 `prevTgtSnap` 供下次比较
+4. 如果任一端有变化，执行完整差异比较和文件操作
+
+**与旧设计的区别**：旧方法将 source 和 target 快照合并为一个 Map（`source ∪ target`），丢失了文件属于哪个文件系统的信息。新方法保持分离，实现了精确的按端变更检测和双向删除传播（见 §1.10）。
 
 ### 1.8 独立 Data-Sync Group（`createDataSyncGroup`）
 
@@ -304,19 +306,20 @@ connect('my-app', options?)
 ```
 syncBidirectional()
   │
-  ├─ 1. 并行构建两端快照
-  │     srcSnap = buildSnapshot(source)  → Map<path, {size, mtimeMs}>
-  │     tgtSnap = buildSnapshot(target)  → Map<path, {size, mtimeMs}>
+  ├─ 1. 并行构建两端快照（通过 getSnapshot()）
+  │     srcSnap = getSnapshot(source)  → Map<path, {size, mtimeMs}>
+  │     tgtSnap = getSnapshot(target)  → Map<path, {size, mtimeMs}>
   │     如任一端不可达（返回 null）→ 跳过同步
   │
-  ├─ 2. 快照快速比较
-  │     currentMerged = new Map([...srcSnap, ...tgtSnap])
-  │     如有缓存 sourceSnapshots：
-  │       如 currentMerged 与 sourceSnapshots 完全一致（路径+mtime+size）
-  │       → 判定"无变化"，直接返回（跳过同步）
+  ├─ 2. 分离快照比较
+  │     srcChanged = !snapshotsEqual(prevSrcSnap, srcSnap)
+  │     tgtChanged = !snapshotsEqual(prevTgtSnap, tgtSnap)
+  │     如两端都没变且都有上次快照 → 判定"无变化"，直接返回（跳过同步）
   │
-  ├─ 3. 缓存当前合并快照
-  │     sourceSnapshots = currentMerged
+  ├─ 3. 保存旧快照引用（用于删除传播判断）
+  │     oldPrevSrcSnap = prevSrcSnap
+  │     oldPrevTgtSnap = prevTgtSnap
+  │     缓存当前快照：prevSrcSnap = srcSnap, prevTgtSnap = tgtSnap
   │
   ├─ 4. 遍历所有路径（srcSnap ∪ tgtSnap 的并集）
   │     对每个路径：
@@ -325,8 +328,12 @@ syncBidirectional()
   │     │   └─ mtime/size 不同 → 冲突检测
   │     │       ├─ 内容相同 → 跳过（仅更新 mtime）
   │     │       └─ 内容不同 → 冲突解决（source-wins / merge）
-  │     ├─ 仅 source 有 → 复制到 target（Created）
-  │     └─ 仅 target 有 → 复制到 source（反向 Created）
+  │     ├─ 仅 source 有：
+  │     │   ├─ 上次 target 快照中有此文件 → target 删除了 → 从 source 也删除（传播删除）
+  │     │   └─ 上次 target 快照中没有 → source 新建的 → 复制到 target
+  │     └─ 仅 target 有：
+  │         ├─ 上次 source 快照中有此文件 → source 删除了 → 从 target 也删除（传播删除）
+  │         └─ 上次 source 快照中没有 → target 新建的 → 复制到 source
   │
   └─ 5. 返回 SyncResult
        { filesCreated, filesUpdated, filesDeleted, filesSkipped, conflicts }
@@ -433,74 +440,107 @@ syncBidirectional()
 | `/nodes/` | 无（默认） | 无 | 节点本地配置 |
 | `/.meta/` | 双向 | 无（拓扑文件） | 后端拓扑、墓碑、冲突归档 |
 
-## 5. 同步中的 mtime 保留
+---
 
-### 5.1 问题
+## 5. 快照优化设计
 
-同步引擎在将文件从源端复制到目标端时，调用 `writeFile(path, data)`。目标后端会设置自己的 mtime（通常是 `Date.now()`），丢失源文件的原始 mtime。这导致下一个同步周期检测到"已修改"的文件（源 mtime ≠ 目标 mtime），每次同步都触发不必要的复制。
+本节描述同步引擎快照机制的三个相互关联的优化。
 
-### 5.2 解决方案
+### 5.1 FS 提供的 `createSnapshot()`
 
-在 `SyncableFS` 接口上添加可选的 `writeFileWithMtime` 方法，未实现时自动回退到 `writeFile`：
+`SyncableFS` 接口新增了可选的 `createSnapshot()` 方法：
 
 ```typescript
 interface SyncableFS {
-  // ... 现有方法 ...
+  // ... 已有方法 ...
 
   /**
-   * 可选：写入文件时保留精确 mtime。
-   * 如果实现此方法，同步引擎将使用它代替 writeFile，
-   * 传入源文件的 mtime 使目标端可以保留。
-   * 不支持精确 mtime 的后端不应实现此方法 —
-   * 同步引擎会回退到普通 writeFile。
+   * 可选：构建文件系统快照。
+   * 返回 root 下所有文件的快照映射（相对路径 → {size, mtimeMs}）。
+   * 如果文件系统不可达，返回 null。
+   *
+   * 能提供比通用 walkFiles+stat 更高效快照方法的后端应实现此方法。
    */
-  writeFileWithMtime?(path: string, data: string | Uint8Array, mtime: number): Promise<void>;
+  createSnapshot?(root: string, filter?: SyncFilter): Promise<Map<string, FileSnapshot> | null>;
 }
 ```
 
-### 5.3 同步引擎（zen-fs-sync）
+同步引擎的 `getSnapshot()` 助手在有 FS 提供的方法时优先使用，否则回退到通用的 `buildSnapshot()`（walkFiles + stat）：
 
-中心化的辅助函数处理回退逻辑：
-
-```javascript
-async function writeFileWithMtimeFallback(fs, path, data, mtimeMs) {
-  if (mtimeMs !== undefined && typeof fs.writeFileWithMtime === "function") {
-    await fs.writeFileWithMtime(path, data, mtimeMs);
-  } else {
-    await fs.writeFile(path, data);
+```typescript
+private async getSnapshot(fs: SyncableFS): Promise<Map<string, FileSnapshot> | null> {
+  if (fs.createSnapshot) {
+    return fs.createSnapshot(this.root, this.options.filter);
   }
+  return buildSnapshot(fs, this.root, this.options.filter);
 }
 ```
 
-此辅助函数在 `copyFile()`、`syncOneWay()` 和 `writeFileBoth()` 中使用。源文件的 mtime 通过 `stat()` 获取，然后传递给目标端。
+**优化示例**：
+- **Gitee/GitHub**：使用 Git tree API 一次性获取所有文件元信息，而非逐个遍历
+- **IndexedDB**：使用 `getAll()` 批量查询，而非逐个 `stat()`
+- **InMemory**：直接遍历内部 Map（无异步 I/O 开销）
 
-### 5.4 适配器（zen-fs-config）
+未实现 `createSnapshot()` 的后端完全兼容 — 通用回退产生相同结果。
 
-所有三个 `SyncableFS` 适配器都实现了 `writeFileWithMtime`：
+### 5.2 分离的 Source 和 Target 快照
 
-| 适配器 | 实现方式 |
-|---|---|
-| `backendToSyncableFS` | 将 `{ mtime }` 作为 options 传给 `backend.writeFile()` — 后端的 `writeFile` 调用 `touch()` 设置 mtime |
-| `zenfsPromisesToSyncableFS` | 先 `promises.writeFile()`，再用 `promises.utimes()` 作为回退（部分 VFS 后端不支持 writeFile 中传 mtime） |
-| `cachedFSToSyncableFS` | 将 `{ mtime }` 作为 options 传给 `cached.writeFile()` — mtime 透传到底层后端 |
+**旧设计**（合并快照）：
+- `buildInitialSnapshots()` 将 source 和 target 合并为一个 Map：`sourceSnapshots = new Map([...srcSnap, ...tgtSnap])`
+- `syncBidirectional()` 比较当前合并快照与缓存的合并快照
+- **问题**：合并后的 Map 丢失了文件属于哪个文件系统的信息。一个在 target 存在但 source 不存在的文件，可能是"target 新建的"也可能是"source 删除的" — 合并快照无法区分。
 
-### 5.5 RemoteStorage 后端（zen-fs-remotestoragejs）
+**新设计**（分离快照）：
+- `buildInitialSnapshots()` 缓存两个独立的 Map：`prevSrcSnap` 和 `prevTgtSnap`
+- `syncBidirectional()` 独立比较每端：
+  ```
+  srcChanged = !snapshotsEqual(prevSrcSnap, currentSrcSnap)
+  tgtChanged = !snapshotsEqual(prevTgtSnap, currentTgtSnap)
+  if (!srcChanged && !tgtChanged && prevSrcSnap && prevTgtSnap) → 跳过同步
+  ```
+- 每端的变更独立检测，保留了文件位置信息
 
-`writeFileWithMtime` 委托给 `writeFile(path, data, { mtime })`，后者写入 `.mtime` sidecar 文件以保留毫秒级精度的 mtime（详见 RemoteStorage DESIGN.md §2）。
+### 5.3 双向删除传播
 
-### 5.6 数据流
+当文件在一端存在、另一端不存在时，同步引擎使用上次快照来区分"新建"和"删除"：
 
 ```
-源文件: /app-a/db.json (mtime=1700000000123)
-  │
-  ├─ 同步引擎: stat("/app-a/db.json") → mtimeMs=1700000000123
-  ├─ 同步引擎: readFile("/app-a/db.json") → data
-  ├─ 同步引擎: writeFileWithMtimeFallback(target, "/app-a/db.json", data, 1700000000123)
-  │   ├─ target 有 writeFileWithMtime? → 是 → target.writeFileWithMtime(path, data, 1700000000123)
-  │   │                                    → backend.writeFile(path, data, { mtime: 1700000000123 })
-  │   │                                    → touch(path, { mtimeMs: 1700000000123 })
-  │   └─ target 有 writeFileWithMtime? → 否 → target.writeFile(path, data) [回退]
-  │
-  └─ 目标文件: /app-a/db.json (mtime=1700000000123) ← 已保留！
-     → 下次同步: source.mtimeMs === target.mtimeMs → 跳过（无多余复制）
+文件在 target 存在、source 不存在：
+  ├─ 上次 source 快照中有此文件吗？
+  │   ├─ 有 → 文件从 source 被删除 → 从 target 也删除（传播删除）
+  │   └─ 没有 → 文件在 target 新建 → 复制到 source
+
+文件在 source 存在、target 不存在：
+  ├─ 上次 target 快照中有此文件吗？
+  │   ├─ 有 → 文件从 target 被删除 → 从 source 也删除（传播删除）
+  │   └─ 没有 → 文件在 source 新建 → 复制到 target
 ```
+
+**没有此机制时**，在一端删除文件会导致同步引擎看到"另一端还有 → 复制回去"，实际上撤销了删除操作。
+
+**与墓碑机制的关系**：墓碑机制（§1.4）和双向删除传播在不同层级工作，互为补充：
+
+| 机制 | 所在层 | 触发方式 | 工作原理 |
+|------|-------|---------|---------|
+| 墓碑 | `zen-fs-config`（应用层） | 应用调用 `deleteFile()` | 写入 `.meta/.deleted/` 标记，在同步**之前**直接在所有副本上物理删除文件 |
+| 删除传播 | `zen-fs-sync`（引擎层） | 同步检测到一端独有文件 | 与上次快照比较，判断文件是新建还是被删除 |
+
+墓碑处理应用主动发起的删除（常见场景）。删除传播处理绕过墓碑流程的删除 — 例如远端后端上的外部修改，或其他同步机制移除的文件。
+
+### 5.4 `shouldSync()` 与快照比较的关系
+
+这两个机制互补而非可互换：
+
+| 机制 | 目的 | 开销 | 使用时机 |
+|------|------|------|---------|
+| `shouldSync()` | 快速判断"是否有变化" | 远端 O(1)（ETag/commit 检查） | `onRemotePoll()` — 决定是否触发同步 |
+| 快照比较 | "具体什么变了"的详情 | O(n) 文件系统遍历 | `syncBidirectional()` — 决定复制/删除哪些文件 |
+
+`shouldSync()` **不参与**快照比较，原因如下：
+1. `shouldSync()` 每次调用后更新内部基准 — 在同步中再次调用会返回过期结果
+2. `shouldSync()` 返回 false 不保证快照未变 — 它只表示 FS 自身的变更检测认为没变，可能遗漏边界情况
+3. `shouldSync()` 返回 true 不告诉我们**哪些**文件变了 — 仍需快照来确定
+
+两级优化工作流程：
+1. **第一级**：`shouldSync()` 在远端轮询中 → 如果返回 false，完全跳过同步触发（省去 O(n) 快照构建）
+2. **第二级**：分离快照比较在同步中 → 如果两端都没变，跳过文件操作（省去 I/O）
