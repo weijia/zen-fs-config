@@ -25,6 +25,7 @@ import type {
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
+  CacheOptions,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
@@ -127,6 +128,7 @@ export class ConfigRepo implements IConfigRepo {
   private disposed = false;
   private configCache = new Map<string, unknown>();
   private readonly primaryBackendId: string;
+  private readonly cacheOptions?: CacheOptions;
   private readonly pollIntervalMs?: number;
   /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
   private tombstoneCache: TombstoneMeta[] | null = null;
@@ -139,6 +141,7 @@ export class ConfigRepo implements IConfigRepo {
     serializer: PathAwareSerializer,
     onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>,
     pollIntervalMs?: number,
+    cacheOptions?: CacheOptions,
   ) {
     this.appId = appId;
     this.nodeId = nodeId;
@@ -149,6 +152,7 @@ export class ConfigRepo implements IConfigRepo {
     this.replicaBackends = new Map();
     this.onConflictCallback = onConflict;
     this.pollIntervalMs = pollIntervalMs;
+    this.cacheOptions = cacheOptions;
 
     this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
@@ -683,7 +687,19 @@ export class ConfigRepo implements IConfigRepo {
       console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
-        const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
+
+        // Wrap replica with CachedFileSystem when caching is enabled.
+        // This avoids redundant network reads on Gitee/RemoteStorage backends
+        // by caching content + revision tokens (ETag / Git blob SHA) in IndexedDB.
+        // The local IndexedDB primary is NOT cached (it's already local storage).
+        let fsInstance = instance;
+        if (this.cacheOptions) {
+          const { wrapWithCache } = await import('./cache-wrapper');
+          fsInstance = wrapWithCache(instance, desc.id, this.cacheOptions);
+          console.log(`[ConfigRepo] Replica ${desc.id} wrapped with CachedFileSystem (store=${this.cacheOptions.storeType ?? 'IdbCacheStore'})`);
+        }
+
+        const syncable = backendToSyncableFS(fsInstance, `${desc.type}(${desc.id})`);
 
         // Create sync pair
         const pair = this.syncEngine.addPair(
@@ -697,7 +713,7 @@ export class ConfigRepo implements IConfigRepo {
           '/',
         );
 
-        this.replicaBackends.set(desc.id, { instance, syncable, pairId: pair.pairId });
+        this.replicaBackends.set(desc.id, { instance: fsInstance, syncable, pairId: pair.pairId });
 
         // Register conflict handler
         const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
@@ -1655,7 +1671,7 @@ export async function createConfigRepo(
   // Step 3: Create temp repo for meta operations (nodeId not yet known)
   // -------------------------------------------------------------------
   const tempRepo = new ConfigRepo(
-    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs,
+    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs, options.cache,
   );
 
   // -------------------------------------------------------------------
@@ -1739,6 +1755,7 @@ export async function createConfigRepo(
     serializer,
     options.onConflict,
     options.syncPollIntervalMs,
+    options.cache,
   );
 
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);

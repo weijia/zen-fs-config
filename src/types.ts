@@ -126,11 +126,20 @@ export interface ConfigSerializer {
 
 /** Cache configuration. */
 export interface CacheOptions {
-  /** Type of cache store. */
+  /**
+   * Type of cache store for replica backends.
+   * Default: `'IdbCacheStore'` — persists across page reloads so cached
+   * content + revision tokens survive. Use `'MemoryCacheStore'` for
+   * session-only caching (lost on reload).
+   */
   storeType?: 'MemoryCacheStore' | 'IdbCacheStore';
-  /** Cache store prefix (for IdbCacheStore). */
+  /** Cache store prefix (for IdbCacheStore). Default: `'zen-fs-config:'`. */
   storePrefix?: string;
-  /** TTL in milliseconds for cache hits without revalidation. Default: 0 (always revalidate). */
+  /**
+   * TTL in milliseconds for cache hits without revalidation.
+   * Default: 0 (always revalidate via `getRevision` — exact, no stale data).
+   * Ignored when the backend implements `getRevision`.
+   */
   ttlMs?: number;
 }
 
