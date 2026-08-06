@@ -35,7 +35,8 @@ export function versionPathFor(configFilePath: string): string | null {
     return null;
   }
 
-  const versionFileName = `.${fileName}.version`;
+  // Avoid double dot: if fileName already starts with '.', don't add another
+  const versionFileName = fileName.startsWith('.') ? `${fileName}.version` : `.${fileName}.version`;
   return dir ? `${dir}/${versionFileName}` : versionFileName;
 }
 

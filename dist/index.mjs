@@ -403,7 +403,7 @@ function versionPathFor(configFilePath) {
   if (fileName.endsWith(".version")) {
     return null;
   }
-  const versionFileName = `.${fileName}.version`;
+  const versionFileName = fileName.startsWith(".") ? `${fileName}.version` : `.${fileName}.version`;
   return dir ? `${dir}/${versionFileName}` : versionFileName;
 }
 async function sha256(data) {
