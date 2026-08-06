@@ -21,11 +21,20 @@ import type { SyncableFS } from 'zen-fs-sync';
  * /app-a/db.json        → /app-a/.db.json.version
  * /shared/flags.json    → /shared/.flags.json.version
  * /nodes/s1/env.json    → /nodes/s1/.env.json.version
+ *
+ * Returns null for files that are already version sidecars (.version files),
+ * to prevent creating version-of-version files (e.g. ..db.json.version.version).
  */
-export function versionPathFor(configFilePath: string): string {
+export function versionPathFor(configFilePath: string): string | null {
   const lastSlash = configFilePath.lastIndexOf('/');
   const dir = lastSlash >= 0 ? configFilePath.slice(0, lastSlash) : '';
   const fileName = lastSlash >= 0 ? configFilePath.slice(lastSlash + 1) : configFilePath;
+
+  // Don't create version files for version files
+  if (fileName.endsWith('.version')) {
+    return null;
+  }
+
   const versionFileName = `.${fileName}.version`;
   return dir ? `${dir}/${versionFileName}` : versionFileName;
 }
@@ -103,7 +112,7 @@ export async function incrementVersion(
   author: string,
 ): Promise<VersionMeta> {
   const vPath = versionPathFor(configFilePath);
-  const prev = await readVersion(fs, vPath);
+  const prev = vPath ? await readVersion(fs, vPath) : null;
   const hash = await sha256(newContent);
 
   return {
@@ -129,6 +138,7 @@ export async function verifyOrRepairVersion(
   author: string,
 ): Promise<VersionMeta | null> {
   const vPath = versionPathFor(configFilePath);
+  if (!vPath) return null;
   const existing = await readVersion(fs, vPath);
   if (!existing) return null;
 

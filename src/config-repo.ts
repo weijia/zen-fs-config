@@ -32,6 +32,7 @@ import type { PathAwareSerializer } from './serializer';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, mergeAccountFields, getAccountFields, type BackendInstance } from './backend-registry';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
+import type { VersionMeta } from './types';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -376,9 +377,11 @@ export class ConfigRepo implements IConfigRepo {
 
     // 3. Also delete the version sidecar if it exists
     const versionPath = versionPathFor(normalizedPath);
-    try {
-      await this.cachedFS.unlink(versionPath);
-    } catch { /* no version file */ }
+    if (versionPath) {
+      try {
+        await this.cachedFS.unlink(versionPath);
+      } catch { /* no version file */ }
+    }
 
     console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
   }
@@ -415,18 +418,21 @@ export class ConfigRepo implements IConfigRepo {
     console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
 
     for (const tombstone of tombstones) {
+      const tVersionPath = versionPathFor(tombstone.path);
       // Delete on primary (in case it was re-created)
       try { await this.cachedFS.unlink(tombstone.path); } catch { /* already gone */ }
-      try { await this.cachedFS.unlink(versionPathFor(tombstone.path)); } catch { /* no version */ }
+      if (tVersionPath) { try { await this.cachedFS.unlink(tVersionPath); } catch { /* no version */ } }
 
       // Delete on all replicas
       for (const [replicaId, replica] of this.replicaBackends) {
         try {
           await replica.instance.unlink(tombstone.path);
         } catch { /* not on this replica */ }
-        try {
-          await replica.instance.unlink(versionPathFor(tombstone.path));
-        } catch { /* no version */ }
+        if (tVersionPath) {
+          try {
+            await replica.instance.unlink(tVersionPath);
+          } catch { /* no version */ }
+        }
         console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
       }
     }
@@ -557,7 +563,7 @@ export class ConfigRepo implements IConfigRepo {
         bytes,
         author,
       );
-      await writeVersion(this.fullFS, versionPathFor(configPath), version);
+      await this.writeVersionSidecar(configPath, version);
 
       // Save resolved content as a separate backup file
       const conflictDir = metaPath.substring(0, metaPath.lastIndexOf('/'));
@@ -698,14 +704,35 @@ export class ConfigRepo implements IConfigRepo {
   // Internal — Persistence
   // -----------------------------------------------------------------------
 
+  /** Write version sidecar for a config file (no-op for .version files). */
+  private async writeVersionSidecar(configPath: string, version: VersionMeta): Promise<void> {
+    const vPath = versionPathFor(configPath);
+    if (!vPath) return;
+    await this.ensureDir(vPath);
+    await writeVersion(this.fullFS, vPath, version);
+  }
+
+  /** Delete version sidecar on a backend (no-op for .version files). */
+  private async unlinkVersionSidecar(fs: any, configPath: string): Promise<void> {
+    const vPath = versionPathFor(configPath);
+    if (!vPath) return;
+    try { await fs.unlink(vPath); } catch { /* no version sidecar */ }
+  }
+
+  /** Read version sidecar (returns null for .version files). */
+  private async readVersionSidecar(configPath: string): Promise<VersionMeta | null> {
+    const vPath = versionPathFor(configPath);
+    if (!vPath) return null;
+    return readVersion(this.fullFS, vPath);
+  }
+
   private async persistConfig(fullPath: string, bytes: Uint8Array): Promise<void> {
     await this.ensureDir(fullPath);
     await this.cachedFS.writeFile(fullPath, bytes);
 
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, fullPath, bytes, author);
-    await this.ensureDir(versionPathFor(fullPath));
-    await writeVersion(this.fullFS, versionPathFor(fullPath), version);
+    await this.writeVersionSidecar(fullPath, version);
   }
 
   private async reloadConfigCache(): Promise<void> {
@@ -753,7 +780,7 @@ export class ConfigRepo implements IConfigRepo {
 
     let sourceVersion = 0;
     try {
-      const srcVer = await readVersion(this.fullFS, versionPathFor(conflict.path));
+      const srcVer = await this.readVersionSidecar(conflict.path);
       if (srcVer) sourceVersion = srcVer.version;
     } catch { /* ignore */ }
 
@@ -855,8 +882,7 @@ export class ConfigRepo implements IConfigRepo {
     // Generate version sidecar for meta files, same as config data files
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, path, bytes, author);
-    await this.ensureDir(versionPathFor(path));
-    await writeVersion(this.fullFS, versionPathFor(path), version);
+    await this.writeVersionSidecar(path, version);
   }
 
   async readMetaFile<T>(path: string): Promise<T | null> {
@@ -925,7 +951,7 @@ export class ConfigRepo implements IConfigRepo {
         // 1. Delete on all known replicas directly
         for (const [, replica] of this.replicaBackends) {
           try { await replica.instance.unlink(corruptPath); } catch { /* not on this replica */ }
-          try { await replica.instance.unlink(versionPathFor(corruptPath)); } catch { /* no version sidecar */ }
+          await this.unlinkVersionSidecar(replica.instance, corruptPath);
         }
         // 2. Create a tombstone + delete locally
         try {
@@ -933,7 +959,7 @@ export class ConfigRepo implements IConfigRepo {
         } catch {
           // deleteFile might fail if sync engine isn't set up yet — fall back to plain unlink
           try { await this.cachedFS.unlink(corruptPath); } catch { /* already gone */ }
-          try { await this.cachedFS.unlink(versionPathFor(corruptPath)); } catch { /* no sidecar */ }
+          await this.unlinkVersionSidecar(this.cachedFS, corruptPath);
         }
       }
 
@@ -975,9 +1001,7 @@ export class ConfigRepo implements IConfigRepo {
             try {
               await replica.instance.unlink(descPath);
             } catch { /* not on this replica */ }
-            try {
-              await replica.instance.unlink(versionPathFor(descPath));
-            } catch { /* no version sidecar */ }
+            await this.unlinkVersionSidecar(replica.instance, descPath);
           }
 
           // 2. Create a tombstone + delete the local file.
@@ -1007,15 +1031,14 @@ export class ConfigRepo implements IConfigRepo {
 
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, path, bytes, author);
-    await this.ensureDir(versionPathFor(path));
-    await writeVersion(this.fullFS, versionPathFor(path), version);
+    await this.writeVersionSidecar(path, version);
   }
 
   /** Remove a single backend descriptor file + its version sidecar */
   async removeBackendDescriptor(id: string): Promise<void> {
     const path = this.backendFilePath(id);
     try { await this.cachedFS.unlink(path); } catch { /* already gone */ }
-    try { await this.cachedFS.unlink(versionPathFor(path)); } catch { /* no version */ }
+    await this.unlinkVersionSidecar(this.cachedFS, path);
   }
 
   // -----------------------------------------------------------------------
@@ -1155,9 +1178,7 @@ export class ConfigRepo implements IConfigRepo {
     try {
       await replica.instance.unlink(descPath);
     } catch { /* not on remote */ }
-    try {
-      await replica.instance.unlink(versionPathFor(descPath));
-    } catch { /* no version sidecar */ }
+    await this.unlinkVersionSidecar(replica.instance, descPath);
 
     // 2. Create a tombstone + delete the local file.
     //    The tombstone ensures that if another backend syncs to the same
@@ -1287,8 +1308,7 @@ export class ConfigRepo implements IConfigRepo {
 
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, descPath, bytes, author);
-    await this.ensureDir(versionPathFor(descPath));
-    await writeVersion(this.fullFS, versionPathFor(descPath), version);
+    await this.writeVersionSidecar(descPath, version);
 
     this.appDataGroups.set(id, group);
     console.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
@@ -1355,7 +1375,7 @@ export class ConfigRepo implements IConfigRepo {
 
     const descPath = this.appDataGroupFilePath(id);
     try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
-    try { await this.cachedFS.unlink(versionPathFor(descPath)); } catch { /* no version */ }
+    await this.unlinkVersionSidecar(this.cachedFS, descPath);
     console.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
   }
 
@@ -1633,7 +1653,10 @@ export async function createConfigRepo(
     }
     // Delete legacy file + version sidecar
     try { await cachedFS.unlink(BACKENDS_FILE); } catch { /* ignore */ }
-    try { await cachedFS.unlink(versionPathFor(BACKENDS_FILE)); } catch { /* ignore */ }
+    {
+      const vPath = versionPathFor(BACKENDS_FILE);
+      if (vPath) { try { await cachedFS.unlink(vPath); } catch { /* ignore */ } }
+    }
     console.log(`[createConfigRepo] Migration complete`);
   }
 
