@@ -128,6 +128,8 @@ export class ConfigRepo implements IConfigRepo {
   private configCache = new Map<string, unknown>();
   private readonly primaryBackendId: string;
   private readonly pollIntervalMs?: number;
+  /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
+  private tombstoneCache: TombstoneMeta[] | null = null;
 
   constructor(
     appId: string,
@@ -330,6 +332,8 @@ export class ConfigRepo implements IConfigRepo {
     await this.processTombstones();
     // 2. Run normal sync (syncs data files + tombstone files)
     const resultsMap = await this.syncEngine.syncAll();
+    // Invalidate tombstone cache — sync may have pulled new tombstones from remote
+    this.invalidateTombstoneCache();
     // 3. Post-sync dedup: sync may have pulled duplicate backend descriptors
     //    from remote. Re-run readAllBackendDescriptors to detect and remove
     //    any duplicates that arrived via sync, then process their tombstones
@@ -339,6 +343,8 @@ export class ConfigRepo implements IConfigRepo {
     // 4. Update tombstone confirmations + GC
     await this.updateTombstoneConfirmations();
     await this.gcTombstones();
+    // Clear cache — flush is complete, next read should fetch fresh data
+    this.invalidateTombstoneCache();
     return Array.from(resultsMap.values());
   }
 
@@ -384,12 +390,19 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+    // Invalidate cache — a new tombstone was written
+    this.invalidateTombstoneCache();
   }
 
   /**
    * Read all tombstones from the primary backend.
+   * Results are cached within a flush() cycle to avoid redundant reads.
    */
   private async readTombstones(): Promise<TombstoneMeta[]> {
+    // Return cached result if available
+    if (this.tombstoneCache !== null) {
+      return this.tombstoneCache;
+    }
     try {
       const entries = await this.cachedFS.readdir(DELETIONS_DIR);
       const tombstones: TombstoneMeta[] = [];
@@ -401,10 +414,17 @@ export class ConfigRepo implements IConfigRepo {
           tombstones.push(data as TombstoneMeta);
         } catch { /* skip corrupt tombstone */ }
       }
+      this.tombstoneCache = tombstones;
       return tombstones;
     } catch {
+      this.tombstoneCache = [];
       return []; // DELETIONS_DIR doesn't exist yet
     }
+  }
+
+  /** Invalidate the tombstone cache — call after tombstones are modified. */
+  private invalidateTombstoneCache(): void {
+    this.tombstoneCache = null;
   }
 
   /**
@@ -485,6 +505,8 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     console.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+    // Invalidate cache — tombstones were modified (confirmedBy updated)
+    this.invalidateTombstoneCache();
   }
 
   /**

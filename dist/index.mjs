@@ -400,6 +400,9 @@ function versionPathFor(configFilePath) {
   const lastSlash = configFilePath.lastIndexOf("/");
   const dir = lastSlash >= 0 ? configFilePath.slice(0, lastSlash) : "";
   const fileName = lastSlash >= 0 ? configFilePath.slice(lastSlash + 1) : configFilePath;
+  if (fileName.endsWith(".version")) {
+    return null;
+  }
   const versionFileName = `.${fileName}.version`;
   return dir ? `${dir}/${versionFileName}` : versionFileName;
 }
@@ -436,7 +439,7 @@ async function writeVersion(fs, versionFilePath, meta) {
 }
 async function incrementVersion(fs, configFilePath, newContent, author) {
   const vPath = versionPathFor(configFilePath);
-  const prev = await readVersion(fs, vPath);
+  const prev = vPath ? await readVersion(fs, vPath) : null;
   const hash = await sha256(newContent);
   return {
     version: (prev?.version ?? 0) + 1,
@@ -447,6 +450,7 @@ async function incrementVersion(fs, configFilePath, newContent, author) {
 }
 async function verifyOrRepairVersion(fs, configFilePath, author) {
   const vPath = versionPathFor(configFilePath);
+  if (!vPath) return null;
   const existing = await readVersion(fs, vPath);
   if (!existing) return null;
   try {
@@ -525,6 +529,8 @@ var ConfigRepo = class {
   configCache = /* @__PURE__ */ new Map();
   primaryBackendId;
   pollIntervalMs;
+  /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
+  tombstoneCache = null;
   constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict, pollIntervalMs) {
     this.appId = appId;
     this.nodeId = nodeId;
@@ -685,10 +691,12 @@ var ConfigRepo = class {
     this.assertNotDisposed();
     await this.processTombstones();
     const resultsMap = await this.syncEngine.syncAll();
+    this.invalidateTombstoneCache();
     await this.readAllBackendDescriptors();
     await this.processTombstones();
     await this.updateTombstoneConfirmations();
     await this.gcTombstones();
+    this.invalidateTombstoneCache();
     return Array.from(resultsMap.values());
   }
   // -----------------------------------------------------------------------
@@ -718,16 +726,23 @@ var ConfigRepo = class {
     } catch {
     }
     const versionPath = versionPathFor(normalizedPath);
-    try {
-      await this.cachedFS.unlink(versionPath);
-    } catch {
+    if (versionPath) {
+      try {
+        await this.cachedFS.unlink(versionPath);
+      } catch {
+      }
     }
     console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+    this.invalidateTombstoneCache();
   }
   /**
    * Read all tombstones from the primary backend.
+   * Results are cached within a flush() cycle to avoid redundant reads.
    */
   async readTombstones() {
+    if (this.tombstoneCache !== null) {
+      return this.tombstoneCache;
+    }
     try {
       const entries = await this.cachedFS.readdir(DELETIONS_DIR);
       const tombstones = [];
@@ -740,10 +755,16 @@ var ConfigRepo = class {
         } catch {
         }
       }
+      this.tombstoneCache = tombstones;
       return tombstones;
     } catch {
+      this.tombstoneCache = [];
       return [];
     }
+  }
+  /** Invalidate the tombstone cache — call after tombstones are modified. */
+  invalidateTombstoneCache() {
+    this.tombstoneCache = null;
   }
   /**
    * Before sync: for each tombstone, delete the actual file on all replicas.
@@ -754,22 +775,27 @@ var ConfigRepo = class {
     if (tombstones.length === 0) return;
     console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
     for (const tombstone of tombstones) {
+      const tVersionPath = versionPathFor(tombstone.path);
       try {
         await this.cachedFS.unlink(tombstone.path);
       } catch {
       }
-      try {
-        await this.cachedFS.unlink(versionPathFor(tombstone.path));
-      } catch {
+      if (tVersionPath) {
+        try {
+          await this.cachedFS.unlink(tVersionPath);
+        } catch {
+        }
       }
       for (const [replicaId, replica] of this.replicaBackends) {
         try {
           await replica.instance.unlink(tombstone.path);
         } catch {
         }
-        try {
-          await replica.instance.unlink(versionPathFor(tombstone.path));
-        } catch {
+        if (tVersionPath) {
+          try {
+            await replica.instance.unlink(tVersionPath);
+          } catch {
+          }
         }
         console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
       }
@@ -815,6 +841,7 @@ var ConfigRepo = class {
       }
     }
     console.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+    this.invalidateTombstoneCache();
   }
   /**
    * GC: remove tombstones where all backends in backends.json have confirmed.
@@ -878,7 +905,7 @@ var ConfigRepo = class {
         bytes,
         author
       );
-      await writeVersion(this.fullFS, versionPathFor(configPath), version);
+      await this.writeVersionSidecar(configPath, version);
       const conflictDir = metaPath.substring(0, metaPath.lastIndexOf("/"));
       const resolvedBackupPath = `${conflictDir}/resolved`;
       const resolvedBytes = typeof mergedContent === "string" ? new TextEncoder().encode(mergedContent) : new TextEncoder().encode(JSON.stringify(mergedContent, null, 2));
@@ -979,13 +1006,34 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   // Internal — Persistence
   // -----------------------------------------------------------------------
+  /** Write version sidecar for a config file (no-op for .version files). */
+  async writeVersionSidecar(configPath, version) {
+    const vPath = versionPathFor(configPath);
+    if (!vPath) return;
+    await this.ensureDir(vPath);
+    await writeVersion(this.fullFS, vPath, version);
+  }
+  /** Delete version sidecar on a backend (no-op for .version files). */
+  async unlinkVersionSidecar(fs, configPath) {
+    const vPath = versionPathFor(configPath);
+    if (!vPath) return;
+    try {
+      await fs.unlink(vPath);
+    } catch {
+    }
+  }
+  /** Read version sidecar (returns null for .version files). */
+  async readVersionSidecar(configPath) {
+    const vPath = versionPathFor(configPath);
+    if (!vPath) return null;
+    return readVersion(this.fullFS, vPath);
+  }
   async persistConfig(fullPath, bytes) {
     await this.ensureDir(fullPath);
     await this.cachedFS.writeFile(fullPath, bytes);
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, fullPath, bytes, author);
-    await this.ensureDir(versionPathFor(fullPath));
-    await writeVersion(this.fullFS, versionPathFor(fullPath), version);
+    await this.writeVersionSidecar(fullPath, version);
   }
   async reloadConfigCache() {
     const appDir = `/${this.appId}`;
@@ -1023,7 +1071,7 @@ var ConfigRepo = class {
     );
     let sourceVersion = 0;
     try {
-      const srcVer = await readVersion(this.fullFS, versionPathFor(conflict.path));
+      const srcVer = await this.readVersionSidecar(conflict.path);
       if (srcVer) sourceVersion = srcVer.version;
     } catch {
     }
@@ -1108,8 +1156,7 @@ var ConfigRepo = class {
     await this.cachedFS.writeFile(path, bytes);
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, path, bytes, author);
-    await this.ensureDir(versionPathFor(path));
-    await writeVersion(this.fullFS, versionPathFor(path), version);
+    await this.writeVersionSidecar(path, version);
   }
   async readMetaFile(path) {
     try {
@@ -1167,10 +1214,7 @@ var ConfigRepo = class {
             await replica.instance.unlink(corruptPath);
           } catch {
           }
-          try {
-            await replica.instance.unlink(versionPathFor(corruptPath));
-          } catch {
-          }
+          await this.unlinkVersionSidecar(replica.instance, corruptPath);
         }
         try {
           await this.deleteFile(corruptPath);
@@ -1179,10 +1223,7 @@ var ConfigRepo = class {
             await this.cachedFS.unlink(corruptPath);
           } catch {
           }
-          try {
-            await this.cachedFS.unlink(versionPathFor(corruptPath));
-          } catch {
-          }
+          await this.unlinkVersionSidecar(this.cachedFS, corruptPath);
         }
       }
       const seen = /* @__PURE__ */ new Map();
@@ -1212,10 +1253,7 @@ var ConfigRepo = class {
               await replica.instance.unlink(descPath);
             } catch {
             }
-            try {
-              await replica.instance.unlink(versionPathFor(descPath));
-            } catch {
-            }
+            await this.unlinkVersionSidecar(replica.instance, descPath);
           }
           try {
             await this.deleteFile(descPath);
@@ -1237,8 +1275,7 @@ var ConfigRepo = class {
     await this.cachedFS.writeFile(path, bytes);
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, path, bytes, author);
-    await this.ensureDir(versionPathFor(path));
-    await writeVersion(this.fullFS, versionPathFor(path), version);
+    await this.writeVersionSidecar(path, version);
   }
   /** Remove a single backend descriptor file + its version sidecar */
   async removeBackendDescriptor(id) {
@@ -1247,10 +1284,7 @@ var ConfigRepo = class {
       await this.cachedFS.unlink(path);
     } catch {
     }
-    try {
-      await this.cachedFS.unlink(versionPathFor(path));
-    } catch {
-    }
+    await this.unlinkVersionSidecar(this.cachedFS, path);
   }
   // -----------------------------------------------------------------------
   // IConfigRepo — Meta file access (no chroot)
@@ -1349,10 +1383,7 @@ var ConfigRepo = class {
       await replica.instance.unlink(descPath);
     } catch {
     }
-    try {
-      await replica.instance.unlink(versionPathFor(descPath));
-    } catch {
-    }
+    await this.unlinkVersionSidecar(replica.instance, descPath);
     try {
       await this.deleteFile(descPath);
     } catch {
@@ -1448,8 +1479,7 @@ var ConfigRepo = class {
     await this.cachedFS.writeFile(descPath, bytes);
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, descPath, bytes, author);
-    await this.ensureDir(versionPathFor(descPath));
-    await writeVersion(this.fullFS, versionPathFor(descPath), version);
+    await this.writeVersionSidecar(descPath, version);
     this.appDataGroups.set(id, group);
     console.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
     return group;
@@ -1509,10 +1539,7 @@ var ConfigRepo = class {
       await this.cachedFS.unlink(descPath);
     } catch {
     }
-    try {
-      await this.cachedFS.unlink(versionPathFor(descPath));
-    } catch {
-    }
+    await this.unlinkVersionSidecar(this.cachedFS, descPath);
     console.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
   }
   async listAccountBackends() {
@@ -1710,9 +1737,14 @@ async function createConfigRepo(appId, options = {}) {
       await cachedFS.unlink(BACKENDS_FILE);
     } catch {
     }
-    try {
-      await cachedFS.unlink(versionPathFor(BACKENDS_FILE));
-    } catch {
+    {
+      const vPath = versionPathFor(BACKENDS_FILE);
+      if (vPath) {
+        try {
+          await cachedFS.unlink(vPath);
+        } catch {
+        }
+      }
     }
     console.log(`[createConfigRepo] Migration complete`);
   }

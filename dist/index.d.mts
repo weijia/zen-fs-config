@@ -462,6 +462,8 @@ declare class ConfigRepo implements IConfigRepo {
     private configCache;
     private readonly primaryBackendId;
     private readonly pollIntervalMs?;
+    /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
+    private tombstoneCache;
     constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>, pollIntervalMs?: number);
     /** Full path to this node's directory on the primary backend. */
     get nodePath(): string;
@@ -484,8 +486,11 @@ declare class ConfigRepo implements IConfigRepo {
     deleteFile(path: string): Promise<void>;
     /**
      * Read all tombstones from the primary backend.
+     * Results are cached within a flush() cycle to avoid redundant reads.
      */
     private readTombstones;
+    /** Invalidate the tombstone cache — call after tombstones are modified. */
+    private invalidateTombstoneCache;
     /**
      * Before sync: for each tombstone, delete the actual file on all replicas.
      * This prevents bi-directional sync from copying the file back.
@@ -522,6 +527,12 @@ declare class ConfigRepo implements IConfigRepo {
     readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
     dispose(): Promise<void>;
     setupSync(backends: BackendDescriptor[], primaryBackendId: string, pollIntervalMs?: number): Promise<void>;
+    /** Write version sidecar for a config file (no-op for .version files). */
+    private writeVersionSidecar;
+    /** Delete version sidecar on a backend (no-op for .version files). */
+    private unlinkVersionSidecar;
+    /** Read version sidecar (returns null for .version files). */
+    private readVersionSidecar;
     private persistConfig;
     private reloadConfigCache;
     private handleConflict;
@@ -683,8 +694,11 @@ declare function connect(appId: string, options?: ConnectOptions): Promise<Conne
  * /app-a/db.json        → /app-a/.db.json.version
  * /shared/flags.json    → /shared/.flags.json.version
  * /nodes/s1/env.json    → /nodes/s1/.env.json.version
+ *
+ * Returns null for files that are already version sidecars (.version files),
+ * to prevent creating version-of-version files (e.g. ..db.json.version.version).
  */
-declare function versionPathFor(configFilePath: string): string;
+declare function versionPathFor(configFilePath: string): string | null;
 /**
  * Compute SHA-256 hash of a Uint8Array.
  * Returns "sha256:" prefix + hex digest.
