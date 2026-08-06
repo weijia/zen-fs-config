@@ -170,8 +170,19 @@ export interface ConfigRepoOptions {
   /** Node identifier. Auto-detected if not provided (see DESIGN.md §8.2). */
   nodeId?: string;
 
-  /** Cache configuration. */
-  cache?: CacheOptions;
+  /**
+   * Cache configuration for replica backends.
+   *
+   * - **Default** (omitted): Caching is enabled with `IdbCacheStore`
+   *   (persists across page reloads). Replica backends (Gitee,
+   *   RemoteStorage, etc.) are wrapped with `CachedFileSystem` to avoid
+   *   redundant network reads via `getRevision` revalidation.
+   * - Pass a `CacheOptions` object to customize the store type, prefix,
+   *   or TTL.
+   * - Pass `false` to disable caching entirely (all reads go directly
+   *   to the backend).
+   */
+  cache?: CacheOptions | false;
 
   /** Custom serializer. */
   serializer?: ConfigSerializer;

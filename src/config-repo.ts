@@ -1641,6 +1641,13 @@ export async function createConfigRepo(
 
   const cachedFS = primaryInstance;
 
+  // Cache is enabled by default for replica backends (Gitee, RemoteStorage,
+  // etc.) using IdbCacheStore. The local IndexedDB primary is not cached.
+  // Pass { cache: false } to disable, or { cache: { storeType: 'MemoryCacheStore' } }
+  // for session-only caching.
+  const cacheOptions: CacheOptions | undefined =
+    options.cache === false ? undefined : (options.cache ?? {});
+
   // -------------------------------------------------------------------
   // Step 2: Ensure /.meta/ directory exists
   // -------------------------------------------------------------------
@@ -1671,7 +1678,7 @@ export async function createConfigRepo(
   // Step 3: Create temp repo for meta operations (nodeId not yet known)
   // -------------------------------------------------------------------
   const tempRepo = new ConfigRepo(
-    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs, options.cache,
+    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs, cacheOptions,
   );
 
   // -------------------------------------------------------------------
@@ -1755,7 +1762,7 @@ export async function createConfigRepo(
     serializer,
     options.onConflict,
     options.syncPollIntervalMs,
-    options.cache,
+    cacheOptions,
   );
 
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
