@@ -445,14 +445,16 @@ export class ConfigRepo implements IConfigRepo {
     const tombstones = await this.readTombstones();
     if (tombstones.length === 0) return;
 
-    console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
+    let processed = 0;
+    let alreadyDeleted = 0;
 
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
 
       // Delete on primary (in case it was re-created)
-      if (await this.safeExists(this.cachedFS, tombstone.path)) {
-        try { await this.cachedFS.unlink(tombstone.path); } catch { /* race */ }
+      const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
+      if (existedOnPrimary) {
+        try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* race */ }
       }
       if (tVersionPath && await this.safeExists(this.cachedFS, tVersionPath)) {
         try { await this.cachedFS.unlink(tVersionPath); } catch { /* race */ }
@@ -463,11 +465,18 @@ export class ConfigRepo implements IConfigRepo {
         // Check existence before unlink — avoids wasteful DELETE requests
         // on remote backends (RemoteStorage, Gitee, WebDAV) when the file
         // was already deleted on a previous sync cycle.
-        if (await this.safeExists(replica.instance, tombstone.path)) {
+        const existed = await this.safeExists(replica.instance, tombstone.path);
+        if (existed) {
           try {
             await replica.instance.unlink(tombstone.path);
             console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
-          } catch { /* race — file removed between exists and unlink */ }
+            processed++;
+          } catch {
+            // race — file removed between exists and unlink
+            alreadyDeleted++;
+          }
+        } else {
+          alreadyDeleted++;
         }
         if (tVersionPath && await this.safeExists(replica.instance, tVersionPath)) {
           try {
@@ -475,6 +484,11 @@ export class ConfigRepo implements IConfigRepo {
           } catch { /* race */ }
         }
       }
+    }
+
+    // Only log summary — per-file logs only appear for actual deletions
+    if (processed > 0 || alreadyDeleted > 0) {
+      console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
     }
   }
 
