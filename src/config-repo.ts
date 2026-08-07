@@ -566,6 +566,11 @@ export class ConfigRepo implements IConfigRepo {
 
   /**
    * GC: remove tombstones where all backends in backends.json have confirmed.
+   *
+   * Tombstones are deleted from ALL backends (local + replicas), not just
+   * the local IndexedDB. If we only deleted locally, the sync engine would
+   * see them as "created on target" and copy them back every cycle — causing
+   * an infinite loop of copy → GC → copy → GC.
    */
   private async gcTombstones(): Promise<void> {
     const tombstones = await this.readTombstones();
@@ -578,10 +583,23 @@ export class ConfigRepo implements IConfigRepo {
       const allConfirmed = allBackendIds.every(id => tombstone.confirmedBy.includes(id));
       if (allConfirmed) {
         const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
+
+        // Delete tombstone on local primary
         try {
           await this.cachedFS.unlink(tombstonePath);
-          console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
         } catch { /* already gone */ }
+
+        // Delete tombstone on all replicas — prevents the sync engine
+        // from re-copying them back on the next cycle.
+        for (const [replicaId, replica] of this.replicaBackends) {
+          if (await this.safeExists(replica.instance, tombstonePath)) {
+            try {
+              await replica.instance.unlink(tombstonePath);
+            } catch { /* race */ }
+          }
+        }
+
+        console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
       }
     }
   }
