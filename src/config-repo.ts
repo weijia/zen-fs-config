@@ -1724,7 +1724,14 @@ export async function createConfigRepo(
     await primaryInstance.mkdir(META_DIR);
     console.log(`[createConfigRepo] /.meta/ ready`);
   } catch (err: any) {
-    console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+    // EEXIST / File exists is expected on every launch after the first —
+    // the directory was already created. Suppress to avoid log noise.
+    const msg = err.message || '';
+    if (msg.includes('File exists') || msg.includes('EEXIST') || (err as { code?: string }).code === 'EEXIST') {
+      // /.meta/ already exists — this is the normal case after first run
+    } else {
+      console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+    }
   }
 
   // -------------------------------------------------------------------

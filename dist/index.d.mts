@@ -542,6 +542,11 @@ declare class ConfigRepo implements IConfigRepo {
     private updateTombstoneConfirmations;
     /**
      * GC: remove tombstones where all backends in backends.json have confirmed.
+     *
+     * Tombstones are deleted from ALL backends (local + replicas), not just
+     * the local IndexedDB. If we only deleted locally, the sync engine would
+     * see them as "created on target" and copy them back every cycle — causing
+     * an infinite loop of copy → GC → copy → GC.
      */
     private gcTombstones;
     /**

@@ -871,12 +871,16 @@ var ConfigRepo = class {
   async processTombstones() {
     const tombstones = await this.readTombstones();
     if (tombstones.length === 0) return;
-    console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
+    let processed = 0;
+    let alreadyDeleted = 0;
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
-      if (await this.safeExists(this.cachedFS, tombstone.path)) {
+      const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
+      console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on primary \u2192 ${existedOnPrimary ? "EXISTS" : "not found"}`);
+      if (existedOnPrimary) {
         try {
           await this.cachedFS.unlink(tombstone.path);
+          processed++;
         } catch {
         }
       }
@@ -887,12 +891,18 @@ var ConfigRepo = class {
         }
       }
       for (const [replicaId, replica] of this.replicaBackends) {
-        if (await this.safeExists(replica.instance, tombstone.path)) {
+        const existed = await this.safeExists(replica.instance, tombstone.path);
+        console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on ${replicaId} \u2192 ${existed ? "EXISTS" : "not found"}`);
+        if (existed) {
           try {
             await replica.instance.unlink(tombstone.path);
             console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+            processed++;
           } catch {
+            alreadyDeleted++;
           }
+        } else {
+          alreadyDeleted++;
         }
         if (tVersionPath && await this.safeExists(replica.instance, tVersionPath)) {
           try {
@@ -902,6 +912,9 @@ var ConfigRepo = class {
         }
       }
     }
+    if (processed > 0 || alreadyDeleted > 0) {
+      console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
+    }
   }
   /**
    * Safe existence check — returns false on any error instead of throwing.
@@ -910,11 +923,13 @@ var ConfigRepo = class {
   async safeExists(fs, path) {
     try {
       if (typeof fs.exists === "function") {
-        return await fs.exists(path);
+        const result = await fs.exists(path);
+        return result;
       }
       await fs.stat(path);
       return true;
-    } catch {
+    } catch (err) {
+      console.log(`[ConfigRepo] safeExists(${path}): threw ${err?.code ?? err?.status ?? ""} ${err?.message ?? err}`);
       return false;
     }
   }
@@ -962,6 +977,11 @@ var ConfigRepo = class {
   }
   /**
    * GC: remove tombstones where all backends in backends.json have confirmed.
+   *
+   * Tombstones are deleted from ALL backends (local + replicas), not just
+   * the local IndexedDB. If we only deleted locally, the sync engine would
+   * see them as "created on target" and copy them back every cycle — causing
+   * an infinite loop of copy → GC → copy → GC.
    */
   async gcTombstones() {
     const tombstones = await this.readTombstones();
@@ -974,9 +994,17 @@ var ConfigRepo = class {
         const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
         try {
           await this.cachedFS.unlink(tombstonePath);
-          console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
         } catch {
         }
+        for (const [replicaId, replica] of this.replicaBackends) {
+          if (await this.safeExists(replica.instance, tombstonePath)) {
+            try {
+              await replica.instance.unlink(tombstonePath);
+            } catch {
+            }
+          }
+        }
+        console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
       }
     }
   }
@@ -1824,7 +1852,11 @@ async function createConfigRepo(appId, options = {}) {
     await primaryInstance.mkdir(META_DIR);
     console.log(`[createConfigRepo] /.meta/ ready`);
   } catch (err) {
-    console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+    const msg = err.message || "";
+    if (msg.includes("File exists") || msg.includes("EEXIST") || err.code === "EEXIST") {
+    } else {
+      console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+    }
   }
   try {
     const groupTypeBytes = new TextEncoder().encode("config-sync");
