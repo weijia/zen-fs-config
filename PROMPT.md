@@ -12,6 +12,58 @@
 - **远程后端为副本**：GitHub、Gitee、WebDAV、RemoteStorage 等通过双向同步保持一致
 - **自描述拓扑**：后端配置存储在 `.meta/backends/` 中，重新打开时自动恢复
 - **两种同步组类型**：config-sync（配置管理）和 data-sync（纯数据同步）
+- **缓存层默认开启**：远程副本后端自动被 `CachedFileSystem` 包装，通过 `getRevision` 钩子实现零下载重校验，缓存数据持久化到 IndexedDB
+- **后端内部缓存持久化**：Gitee/RemoteStorage 后端的内存缓存（文件内容、SHA、ETag 快照等）持久化到 IndexedDB，实现跨会话热启动
+
+## 缓存层架构（zen-fs-cache）
+
+zen-fs-cache 是一个通用缓存层，为所有远程后端提供透明的缓存包装。
+
+### 核心概念
+
+| 概念 | 说明 |
+|---|---|
+| `CachedFileSystem` | 包装器类，拦截读写操作，缓存文件内容、目录列表和 stat 元数据 |
+| `CacheableFileSystem` | 接口契约，后端实现 `getRevision()` 和 `readFileMeta()` 钩子后即可被缓存层精确重校验 |
+| `getRevision(path)` | **首选重校验钩子**：返回修订令牌（Git blob SHA / HTTP ETag），缓存层比较令牌决定是否需要重新下载 |
+| `IdbCacheStore` | IndexedDB 持久化缓存存储，跨页面刷新存活，不受 localStorage 5MB 限制 |
+| `IdbKVStore` | 通用 IndexedDB 键值存储，后端内部用于持久化自己的缓存（SHA 映射、ETag 快照等） |
+| `MemoryCacheStore` | 内存缓存存储，仅当前会话有效 |
+
+### 重校验流程
+
+```
+读取文件 → TTL 命中？→ 直接返回缓存（零网络）
+         → getRevision 可用？→ 调用 getRevision(path)
+           → 令牌匹配？→ 返回缓存（零下载）
+           → 令牌不匹配？→ 全量读取并更新缓存
+         → readFileMeta 可用？→ HTTP 条件 GET (If-None-Match)
+           → 304？→ 返回缓存
+           → 200？→ 返回新内容并更新缓存
+         → 全量读取并缓存
+```
+
+### 缓存配置
+
+`createConfigRepo` 的 `cache` 选项：
+
+| 值 | 行为 |
+|---|---|
+| 省略（默认） | 启用缓存，使用 `IdbCacheStore`（IndexedDB 持久化） |
+| `{ storeType: 'MemoryCacheStore' }` | 启用缓存，仅内存（页面刷新丢失） |
+| `{ ttlMs: 5000 }` | 启用缓存，5 秒 TTL 内直接返回缓存（跳过重校验） |
+| `false` | 完全禁用缓存 |
+
+> **注意**：当后端实现了 `getRevision` 时，`ttlMs` 被忽略，始终通过 `getRevision` 精确重校验。
+
+### 后端内部缓存 IndexedDB 持久化
+
+除了外部 `CachedFileSystem` 包装层，各后端自身的内部缓存也持久化到 IndexedDB：
+
+| 后端 | 持久化的缓存 | 效果 |
+|---|---|---|
+| GiteeFS | `shaCache`（路径→blob SHA）、`contentCache`（路径→文件内容）、`mtimeCache`（路径→修改时间） | 页面刷新后从 IndexedDB 恢复，API tree SHA 不变的文件跳过重新拉取 |
+| RemoteStorage | `dirListingCache`（目录列表，从 localStorage 迁移到 IndexedDB）、`snapshot`（ETag 快照）、`rootEtag`、`mtimeCache` | 页面刷新后 `shouldSync()` 从 IndexedDB 恢复快照，root ETag 未变则跳过全量扫描 |
 
 ## 关键 API
 
@@ -20,22 +72,80 @@
 - `createConfigRepo(appId, options?)` — 直接创建配置同步组
 - `createDataSyncGroup(appId, options?)` — 直接创建数据同步组
 
+### ConfigRepoOptions
+| 选项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `backendInfo` | `{ type, options }` | — | 副本后端连接信息 |
+| `cache` | `CacheOptions \| false` | `{}`（启用 IdbCacheStore） | 缓存配置，`false` 禁用 |
+| `idbStoreName` | `string` | `zen-fs-config-{appId}` | IndexedDB 存储名 |
+| `nodeId` | `string` | 自动检测 | 节点标识符 |
+| `syncPollIntervalMs` | `number` | `1800000`（30 分钟） | 同步轮询间隔 |
+
+### ConfigRepo 核心属性
+- `appId` — 应用 ID（只读）
+- `nodeId` — 节点 ID（只读）
+- `fs` — ZenFS 兼容的 fs 对象，已隔离到当前应用目录（chroot）
+- `rootFS` — 未 chroot 的底层 fs，可访问 `/.meta/` 及所有应用目录（低层操作用）
+
 ### ConfigRepo 核心方法
+- `load(rawConfig)` — 从原始字符串加载/重载配置
 - `getConfig<T>(path)` — 同步读取配置（从 IndexedDB）
 - `setConfig(path, data)` — 同步写入配置（自动异步同步到副本）
 - `getNodeConfig<T>(nodeId, path)` — 异步读取节点本地配置
 - `setNodeConfig(nodeId, path, data)` — 异步写入节点本地配置（不同步）
+- `publishNodeConfig(nodeId, options?)` — 发布节点配置到其他节点（可选 `paths` 过滤）
+- `peekNodeConfig<T>(nodeId, path)` — 查看其他节点配置
 - `addBackend(id, type, options, desc?)` — 动态添加副本后端
 - `removeBackend(id)` — 移除副本后端
 - `getBackends()` — 读取后端拓扑
-- `flush()` — 手动触发同步
+- `updateBackends(meta)` — 批量更新后端列表
+- `syncMetaToReplicas()` — 同步元数据到所有副本
+- `flush()` — 手动触发同步（含墓碑处理、去重、GC）
 - `deleteFile(path)` — 删除文件（带墓碑，跨后端传播）
+- `listConflicts()` — 列出冲突
+- `resolveConflict(conflictId, mergedContent)` — 解决冲突
+- `readConflictBackup(conflictId, fileType)` — 读取冲突备份文件内容（`source`/`target`/`resolved`）
+- `getSyncStatuses()` — 获取同步状态
+- `getGroupType()` — 获取当前同步组类型（`config-sync` / `data-sync`）
 - `createAppDataGroup(id, backends)` — 创建数据同步组
+- `getAppDataGroup(id)` — 获取数据同步组
+- `listAppDataGroups()` — 列出数据同步组
+- `removeAppDataGroup(id)` — 移除数据同步组
+- `listAccountBackends()` — 列出账户后端
 - `dispose()` — 停止同步、释放资源
 
 ### 后端注册
 - `registerBackend(type, factory, metadata?)` — 注册自定义后端类型，metadata 用于 UI 表单自动生成
 - 内置后端：`IndexedDB`（本地主后端）、`InMemory`（测试用）
+
+## 版本 Sidecar 机制
+
+每个配置文件都有一个伴随的 `.version` 文件，用于版本追踪和冲突检测：
+
+```
+配置文件：/app-a/db.json
+版本文件：/app-a/.db.json.version
+```
+
+`.version` 文件内容（`VersionMeta`）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `version` | `number` | 单调递增版本号 |
+| `hash` | `string` | 文件内容的 SHA-256 哈希 |
+| `author` | `string` | 如 `app-a/server-1` |
+| `timestamp` | `number` | 修改时间戳 |
+
+每次写入配置文件、元数据文件或后端描述符时，都会自动递增版本并写入 sidecar。冲突解决时也使用版本号判断哪边更新。
+
+## 墓碑（Tombstone）机制
+
+`deleteFile()` 删除文件时会创建墓碑记录，确保删除操作跨后端传播：
+
+- 墓碑存储在 `.meta/.deleted/` 目录下，文件名编码了被删除的路径
+- 墓碑记录包含 `path`、`deletedAt`、`deletedBy`、`confirmedBy[]`（已确认删除的后端列表）
+- `flush()` 时会：处理墓碑（在各副本上删除实际文件）→ 同步 → 更新确认 → GC 回收
+- GC 条件：所有后端都确认删除后，墓碑文件本身也会从所有后端删除
 
 ## 支持的后端类型
 
@@ -115,6 +225,8 @@ registerBackend('GitHub', async (options) => {
 ### Gitee 后端
 
 **安装**：`npm install zen-fs-gitee`
+
+GiteeFS 已实现 `getRevision()` 钩子（返回 Git blob SHA，零网络往返），并自动将 `shaCache`、`contentCache`、`mtimeCache` 持久化到 IndexedDB，实现跨会话热启动。
 
 **注册**：
 ```typescript
@@ -235,6 +347,8 @@ registerBackend('WebDAV', async (options) => {
 
 **安装**：`npm install zen-fs-remotestoragejs`
 
+RemoteStorageFileSystem 已实现 `getRevision()` 钩子（返回 HTTP ETag），并自动将目录列表缓存、ETag 快照、mtime 缓存持久化到 IndexedDB。`shouldSync()` 在首次调用时从 IndexedDB 恢复快照，若 root ETag 未变则跳过全量扫描。
+
 **注册**：
 ```typescript
 import { registerBackend } from 'zen-fs-config';
@@ -246,6 +360,7 @@ registerBackend('RemoteStorage', async (options) => {
     token: options.token,
     basePath: options.basePath || undefined,
     preciseMtime: true, // 启用 .mtime sidecar 精确 mtime
+    persistCache: true,  // 持久化目录缓存到 IndexedDB（默认 true）
   });
   // RemoteStorageFileSystem 已实现 BackendInstance 接口，直接返回
   return fs;
@@ -268,6 +383,7 @@ registerBackend('RemoteStorage', async (options) => {
 | `token` | 是 | Bearer 认证令牌 |
 | `basePath` | 否 | 文件基础路径 |
 | `preciseMtime` | 否 | 通过 `.mtime` sidecar 保留毫秒精度 mtime，默认 `true` |
+| `persistCache` | 否 | 持久化目录缓存到 IndexedDB，默认 `true` |
 
 ### WebStorage 后端
 
@@ -302,26 +418,28 @@ registerBackend('WebStorage', async (options) => {
 
 ## 后端对比总览
 
-| 后端 | 类型名 | npm 包 | 账户字段 | 存储位置字段 | shouldSync |
-|---|---|---|---|---|---|
-| IndexedDB | `IndexedDB` | `@zenfs/dom`（内置） | — | `storeName` | — |
-| InMemory | `InMemory` | `@zenfs/core`（内置） | — | `maxSize`, `label` | — |
-| WebStorage | `WebStorage` | `@zenfs/dom`（内置） | — | `storageType` | — |
-| GitHub | `GitHub` | `zen-fs-github` | `token`, `owner` | `repo`, `branch` | ✅ tree SHA |
-| Gitee | `Gitee` | `zen-fs-gitee` | `token`, `owner` | `repo`, `branch` | ✅ tree SHA |
-| WebDAV | `WebDAV` | 内置（fetch） | `url`, `username`, `password` | `rootPath` | — |
-| RemoteStorage | `RemoteStorage` | `zen-fs-remotestoragejs` | `href`, `token` | `basePath` | ✅ ETag |
+| 后端 | 类型名 | npm 包 | 账户字段 | 存储位置字段 | shouldSync | getRevision | IndexedDB 持久化 |
+|---|---|---|---|---|---|---|---|
+| IndexedDB | `IndexedDB` | `@zenfs/dom`（内置） | — | `storeName` | — | — | — |
+| InMemory | `InMemory` | `@zenfs/core`（内置） | — | `maxSize`, `label` | — | — | — |
+| WebStorage | `WebStorage` | `@zenfs/dom`（内置） | — | `storageType` | — | — | — |
+| GitHub | `GitHub` | `zen-fs-github` | `token`, `owner` | `repo`, `branch` | ✅ tree SHA | — | — |
+| Gitee | `Gitee` | `zen-fs-gitee` | `token`, `owner` | `repo`, `branch` | ✅ tree SHA | ✅ blob SHA | ✅ content/SHA/mtime |
+| WebDAV | `WebDAV` | 内置（fetch） | `url`, `username`, `password` | `rootPath` | — | — | — |
+| RemoteStorage | `RemoteStorage` | `zen-fs-remotestoragejs` | `href`, `token` | `basePath` | ✅ ETag | ✅ ETag | ✅ dirListing/snapshot/mtime |
 
 ## 目录结构
 
 ```
 /
 ├── {appId}/              # 应用私有配置（双向同步）
+│   └── .{file}.version   # 每个配置文件的版本 sidecar
 ├── shared/               # 跨应用共享配置（双向同步）
 ├── nodes/{nodeId}/       # 节点本地配置（不同步）
 └── .meta/
     ├── group-type        # 组类型标记
     ├── backends/         # 后端拓扑（每个后端一个 JSON 文件）
+    │   └── .{id}.json.version  # 后端描述符的版本 sidecar
     ├── .deleted/         # 删除墓碑
     └── .conflicts/       # 冲突归档
 ```
@@ -460,6 +578,9 @@ registerBackend('MyBackend', async (options) => {
 5. **节点配置默认不同步**，用 `publishNodeConfig()` 手动发布
 6. **冲突自动归档**到 `.meta/.conflicts/`，不会丢失数据
 7. **accountFields** 用于 data-sync 后端复用 config-sync 后端的账户凭证（如 token、owner），只需指定存储位置字段
+8. **缓存默认开启**（IdbCacheStore），远程后端读取时通过 `getRevision` 零下载重校验，缓存持久化到 IndexedDB
+9. **版本 sidecar**：每个配置文件和后端描述符都有伴随 `.version` 文件，用于变更检测和冲突解决
+10. **墓碑跨后端传播**：`deleteFile()` 创建墓碑后，`flush()` 会确保所有副本删除对应文件，全部确认后 GC 回收墓碑
 
 ## 帮助我时的注意事项
 
@@ -470,3 +591,5 @@ registerBackend('MyBackend', async (options) => {
 - 如果我需要存储大量应用数据（非配置），建议使用 data-sync group 而非 config-sync group
 - 如果我提到某个后端类型（如 GitHub、Gitee、WebDAV、RemoteStorage），提醒我先安装对应 npm 包并注册
 - 注册后端时，建议提供 `metadata`（第三个参数）以便 UI 表单自动生成
+- 如果我关心性能，提醒我缓存默认开启（IdbCacheStore），Gitee 和 RemoteStorage 后端的内部缓存也持久化到 IndexedDB，页面刷新后可热启动
+- 如果我需要自定义缓存策略，可通过 `createConfigRepo` 的 `cache` 选项配置（`MemoryCacheStore` / `IdbCacheStore` / `false`）
