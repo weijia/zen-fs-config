@@ -622,6 +622,12 @@ var ConfigRepo = class {
   pollIntervalMs;
   /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
   tombstoneCache = null;
+  /**
+   * Tracks the background initial sync started by createConfigRepo().
+   * `flush()` and `dispose()` will await this if it hasn't completed yet,
+   * preventing concurrent syncEngine.syncAll() calls.
+   */
+  initialSyncPromise = null;
   constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict, pollIntervalMs, cacheOptions) {
     this.appId = appId;
     this.nodeId = nodeId;
@@ -781,6 +787,10 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   async flush() {
     this.assertNotDisposed();
+    if (this.initialSyncPromise) {
+      await this.initialSyncPromise;
+      this.initialSyncPromise = null;
+    }
     await this.processTombstones();
     const resultsMap = await this.syncEngine.syncAll();
     this.invalidateTombstoneCache();
@@ -826,6 +836,25 @@ var ConfigRepo = class {
     }
     console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
     this.invalidateTombstoneCache();
+    this.schedulePostDeleteSync();
+  }
+  /**
+   * Background sync scheduled after a deleteFile() call.
+   * Uses a short debounce to coalesce multiple rapid deletions.
+   * If a sync is already in progress, the next poll will pick up the tombstone.
+   */
+  postDeleteSyncTimer;
+  schedulePostDeleteSync() {
+    if (this.postDeleteSyncTimer) {
+      clearTimeout(this.postDeleteSyncTimer);
+    }
+    this.postDeleteSyncTimer = setTimeout(() => {
+      this.postDeleteSyncTimer = void 0;
+      if (this.disposed) return;
+      this.syncEngine.syncAll().catch((err) => {
+        console.warn("[ConfigRepo] post-delete sync failed:", err);
+      });
+    }, 500);
   }
   /**
    * Read all tombstones from the primary backend.
@@ -950,6 +979,20 @@ var ConfigRepo = class {
     await this.readAllBackendDescriptors();
     await this.processTombstones();
     this.syncEngine.watchAll();
+  }
+  /**
+   * Start the initial sync + dedup cycle in the background.
+   * `flush()` and `dispose()` will await this promise if it hasn't
+   * completed yet, preventing concurrent syncEngine operations.
+   */
+  startBackgroundSync() {
+    this.initialSyncPromise = this.initialSyncAndDedup().then(() => {
+      console.log("[ConfigRepo] Background initial sync complete");
+    }).catch((err) => {
+      console.error("[ConfigRepo] Background initial sync failed:", err);
+    }).finally(() => {
+      this.initialSyncPromise = null;
+    });
   }
   /**
    * After sync: mark each tombstone as confirmed by all replica backends.
@@ -1098,7 +1141,15 @@ var ConfigRepo = class {
   // -----------------------------------------------------------------------
   async dispose() {
     if (this.disposed) return;
+    if (this.initialSyncPromise) {
+      await this.initialSyncPromise;
+      this.initialSyncPromise = null;
+    }
     this.disposed = true;
+    if (this.postDeleteSyncTimer) {
+      clearTimeout(this.postDeleteSyncTimer);
+      this.postDeleteSyncTimer = void 0;
+    }
     this.syncEngine.dispose();
     for (const [_id, replica] of this.replicaBackends) {
       if (replica.instance?.dispose) {
@@ -1139,7 +1190,24 @@ var ConfigRepo = class {
           {
             direction: import_zen_fs_sync.SyncDirection.BiDirectional,
             conflictStrategy: "source-wins",
-            pollIntervalMs
+            pollIntervalMs,
+            preSyncHook: async () => {
+              try {
+                this.invalidateTombstoneCache();
+                await this.processTombstones();
+              } catch (err) {
+                console.warn("[ConfigRepo] preSyncHook processTombstones failed:", err);
+              }
+            },
+            postSyncHook: async () => {
+              try {
+                this.invalidateTombstoneCache();
+                await this.processTombstones();
+                await this.updateTombstoneConfirmations();
+              } catch (err) {
+                console.warn("[ConfigRepo] postSyncHook tombstone processing failed:", err);
+              }
+            }
           },
           "/"
         );
@@ -1192,13 +1260,19 @@ var ConfigRepo = class {
     const appDir = `/${this.appId}`;
     try {
       const files = await this.walkDir(appDir);
-      for (const filePath of files) {
-        try {
-          const raw = await this.cachedFS.readFile(filePath);
-          const data = this.serializer.deserialize(toUint8Array(raw), filePath);
-          this.configCache.set(filePath, data);
-        } catch {
-        }
+      const readResults = await Promise.all(
+        files.map(async (filePath) => {
+          try {
+            const raw = await this.cachedFS.readFile(filePath);
+            const data = this.serializer.deserialize(toUint8Array(raw), filePath);
+            return { filePath, data };
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const item of readResults) {
+        if (item) this.configCache.set(item.filePath, item.data);
       }
     } catch {
     }
@@ -1285,17 +1359,23 @@ var ConfigRepo = class {
       const current = stack.pop();
       try {
         const entries = await this.cachedFS.readdir(current);
-        for (const entry of entries) {
-          if (entry.startsWith(".")) continue;
-          const fullPath = current === "/" ? `/${entry}` : `${current}/${entry}`;
-          try {
-            const stat = await this.cachedFS.stat(fullPath);
-            if (stat.mode !== void 0 && (stat.mode & 16384) === 16384) {
-              stack.push(fullPath);
-            } else {
-              results.push(fullPath);
+        const statResults = await Promise.all(
+          entries.filter((entry) => !entry.startsWith(".")).map(async (entry) => {
+            const fullPath = current === "/" ? `/${entry}` : `${current}/${entry}`;
+            try {
+              const stat = await this.cachedFS.stat(fullPath);
+              return { fullPath, stat };
+            } catch {
+              return null;
             }
-          } catch {
+          })
+        );
+        for (const item of statResults) {
+          if (!item) continue;
+          if (item.stat.mode !== void 0 && (item.stat.mode & 16384) === 16384) {
+            stack.push(item.fullPath);
+          } else {
+            results.push(item.fullPath);
           }
         }
       } catch {
@@ -1336,29 +1416,38 @@ var ConfigRepo = class {
   async readAllBackendDescriptors() {
     try {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
+      const jsonEntries = entries.filter((e) => e.endsWith(".json"));
+      const readResults = await Promise.all(
+        jsonEntries.map(async (entry) => {
+          const filePath = `${BACKENDS_DIR}/${entry}`;
+          try {
+            const raw = await this.cachedFS.readFile(filePath);
+            const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+            if (desc.id && desc.type) {
+              let mtime = 0;
+              try {
+                const stat = await this.cachedFS.stat(filePath);
+                mtime = stat.mtimeMs ?? 0;
+              } catch {
+              }
+              return { kind: "ok", desc, mtime };
+            } else {
+              console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+              return { kind: "corrupt", filePath };
+            }
+          } catch (parseErr) {
+            console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+            return { kind: "corrupt", filePath };
+          }
+        })
+      );
       const items = [];
       const corruptFiles = [];
-      for (const entry of entries) {
-        if (!entry.endsWith(".json")) continue;
-        const filePath = `${BACKENDS_DIR}/${entry}`;
-        try {
-          const raw = await this.cachedFS.readFile(filePath);
-          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-          if (desc.id && desc.type) {
-            let mtime = 0;
-            try {
-              const stat = await this.cachedFS.stat(filePath);
-              mtime = stat.mtimeMs ?? 0;
-            } catch {
-            }
-            items.push({ desc, mtime });
-          } else {
-            console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
-            corruptFiles.push(filePath);
-          }
-        } catch (parseErr) {
-          console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
-          corruptFiles.push(filePath);
+      for (const result of readResults) {
+        if (result.kind === "ok") {
+          items.push({ desc: result.desc, mtime: result.mtime });
+        } else {
+          corruptFiles.push(result.filePath);
         }
       }
       for (const corruptPath of corruptFiles) {
@@ -1509,7 +1598,24 @@ var ConfigRepo = class {
       syncable,
       {
         direction: import_zen_fs_sync.SyncDirection.BiDirectional,
-        conflictStrategy: "source-wins"
+        conflictStrategy: "source-wins",
+        preSyncHook: async () => {
+          try {
+            this.invalidateTombstoneCache();
+            await this.processTombstones();
+          } catch (err) {
+            console.warn("[ConfigRepo] preSyncHook processTombstones failed:", err);
+          }
+        },
+        postSyncHook: async () => {
+          try {
+            this.invalidateTombstoneCache();
+            await this.processTombstones();
+            await this.updateTombstoneConfirmations();
+          } catch (err) {
+            console.warn("[ConfigRepo] postSyncHook tombstone processing failed:", err);
+          }
+        }
       },
       "/"
     );
@@ -1528,26 +1634,33 @@ var ConfigRepo = class {
       throw new Error("Cannot remove the local IndexedDB primary backend");
     }
     const replica = this.replicaBackends.get(id);
-    if (!replica) {
-      throw new Error(`Backend "${id}" is not a registered replica`);
-    }
     const descPath = this.backendFilePath(id);
-    try {
-      await replica.instance.unlink(descPath);
-    } catch {
+    if (replica) {
+      try {
+        await replica.instance.unlink(descPath);
+      } catch {
+      }
+      await this.unlinkVersionSidecar(replica.instance, descPath);
+      try {
+        await this.deleteFile(descPath);
+      } catch {
+        await this.removeBackendDescriptor(id);
+      }
+      this.syncEngine.removePair(replica.pairId);
+      console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
+      this.replicaBackends.delete(id);
+      if (replica.instance?.dispose) {
+        await replica.instance.dispose();
+      }
+    } else {
+      console.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
+      try {
+        await this.deleteFile(descPath);
+      } catch {
+        await this.removeBackendDescriptor(id);
+      }
     }
-    await this.unlinkVersionSidecar(replica.instance, descPath);
-    try {
-      await this.deleteFile(descPath);
-    } catch {
-      await this.removeBackendDescriptor(id);
-    }
-    this.syncEngine.removePair(replica.pairId);
-    console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
-    this.replicaBackends.delete(id);
-    if (replica.instance?.dispose) {
-      await replica.instance.dispose();
-    }
+    this.schedulePostDeleteSync();
     console.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
   }
   // -----------------------------------------------------------------------
@@ -1907,16 +2020,16 @@ async function createConfigRepo(appId, options = {}) {
     }
     console.log(`[createConfigRepo] Migration complete`);
   }
+  let allBackends = await tempRepo.readAllBackendDescriptors();
   if (options.backendInfo) {
     const replicaId = options.primaryBackendId || `${options.backendInfo.type}-replica`;
-    const allBackends2 = await tempRepo.readAllBackendDescriptors();
-    const hasReplica = allBackends2.some((b) => b.id === replicaId);
+    const hasReplica = allBackends.some((b) => b.id === replicaId);
     const newKey = backendDedupKey({
       id: replicaId,
       type: options.backendInfo.type,
       options: options.backendInfo.options
     });
-    const dupConfig = allBackends2.find((b) => backendDedupKey(b) === newKey);
+    const dupConfig = allBackends.find((b) => backendDedupKey(b) === newKey);
     if (!hasReplica && !dupConfig) {
       await tempRepo.writeBackendDescriptor({
         id: replicaId,
@@ -1924,13 +2037,13 @@ async function createConfigRepo(appId, options = {}) {
         options: options.backendInfo.options
       });
       console.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
+      allBackends = [...allBackends, { id: replicaId, type: options.backendInfo.type, options: options.backendInfo.options }];
     } else if (dupConfig) {
       console.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
     } else {
       console.log(`[createConfigRepo] Replica ${replicaId} already registered`);
     }
   }
-  const allBackends = await tempRepo.readAllBackendDescriptors();
   console.log(`[createConfigRepo] Replica backends: ${allBackends.map((b) => b.id).join(", ") || "(none)"}`);
   let nodeId = options.nodeId;
   if (!nodeId) {
@@ -1951,8 +2064,8 @@ async function createConfigRepo(appId, options = {}) {
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
   await repo.load();
   if (repo.replicaCount > 0) {
-    console.log("[createConfigRepo] Initial sync + dedup cycle...");
-    await repo.initialSyncAndDedup();
+    console.log("[createConfigRepo] Starting background initial sync + dedup...");
+    repo.startBackgroundSync();
   }
   repo.syncMetaToReplicas().catch((err) => {
     console.error("[createConfigRepo] background syncMetaToReplicas failed:", err);

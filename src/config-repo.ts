@@ -408,6 +408,35 @@ export class ConfigRepo implements IConfigRepo {
     console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
     // Invalidate cache — a new tombstone was written
     this.invalidateTombstoneCache();
+
+    // 4. Trigger a background sync to propagate the tombstone immediately.
+    // Without this, the tombstone sits locally until the next poll interval
+    // (default 30 min) or manual flush. During that window, zen-fs-sync's
+    // onChange could fire and resurrect the file from a remote replica.
+    // The preSyncHook on each sync pair will processTombstones() before
+    // the snapshot comparison runs, preventing resurrection.
+    this.schedulePostDeleteSync();
+  }
+
+  /**
+   * Background sync scheduled after a deleteFile() call.
+   * Uses a short debounce to coalesce multiple rapid deletions.
+   * If a sync is already in progress, the next poll will pick up the tombstone.
+   */
+  private postDeleteSyncTimer?: ReturnType<typeof setTimeout>;
+  private schedulePostDeleteSync(): void {
+    if (this.postDeleteSyncTimer) {
+      clearTimeout(this.postDeleteSyncTimer);
+    }
+    this.postDeleteSyncTimer = setTimeout(() => {
+      this.postDeleteSyncTimer = undefined;
+      if (this.disposed) return;
+      // syncAll() on each pair triggers preSyncHook → processTombstones
+      // before the snapshot comparison, then postSyncHook for confirmation/GC.
+      this.syncEngine.syncAll().catch((err) => {
+        console.warn('[ConfigRepo] post-delete sync failed:', err);
+      });
+    }, 500); // 500ms debounce — coalesce rapid deletions
   }
 
   /**
@@ -757,6 +786,11 @@ export class ConfigRepo implements IConfigRepo {
       this.initialSyncPromise = null;
     }
     this.disposed = true;
+    // Clear post-delete sync timer
+    if (this.postDeleteSyncTimer) {
+      clearTimeout(this.postDeleteSyncTimer);
+      this.postDeleteSyncTimer = undefined;
+    }
     this.syncEngine.dispose();
 
     for (const [_id, replica] of this.replicaBackends) {
@@ -807,7 +841,18 @@ export class ConfigRepo implements IConfigRepo {
 
         const syncable = backendToSyncableFS(fsInstance, `${desc.type}(${desc.id})`);
 
-        // Create sync pair
+        // Create sync pair with tombstone hooks.
+        // preSyncHook: processTombstones() deletes real files on replicas
+        //   BEFORE sync runs, so zen-fs-sync doesn't resurrect them via
+        //   snapshot comparison (especially after restart when in-memory
+        //   snapshots are lost).
+        // postSyncHook: sync may have pulled new tombstones from remote.
+        //   Re-process tombstones and update confirmations.
+        //   NOTE: gcTombstones() is intentionally NOT called here — GC
+        //   only happens in flush() to give tombstones time to propagate
+        //   to all replicas across multiple sync cycles. Running GC in
+        //   every postSyncHook would delete tombstones before offline
+        //   replicas have a chance to see them.
         const pair = this.syncEngine.addPair(
           this.fullFS,
           syncable,
@@ -815,6 +860,23 @@ export class ConfigRepo implements IConfigRepo {
             direction: SyncDirection.BiDirectional,
             conflictStrategy: 'source-wins' as any,
             pollIntervalMs,
+            preSyncHook: async () => {
+              try {
+                this.invalidateTombstoneCache();
+                await this.processTombstones();
+              } catch (err) {
+                console.warn('[ConfigRepo] preSyncHook processTombstones failed:', err);
+              }
+            },
+            postSyncHook: async () => {
+              try {
+                this.invalidateTombstoneCache();
+                await this.processTombstones();
+                await this.updateTombstoneConfirmations();
+              } catch (err) {
+                console.warn('[ConfigRepo] postSyncHook tombstone processing failed:', err);
+              }
+            },
           },
           '/',
         );
@@ -1292,13 +1354,30 @@ export class ConfigRepo implements IConfigRepo {
     const desc: BackendDescriptor = { id, type, options, description };
     await this.writeBackendDescriptor(desc);
 
-    // Register as replica
+    // Register as replica with tombstone hooks
     const pair = this.syncEngine.addPair(
       this.fullFS,
       syncable,
       {
         direction: SyncDirection.BiDirectional,
         conflictStrategy: 'source-wins' as any,
+        preSyncHook: async () => {
+          try {
+            this.invalidateTombstoneCache();
+            await this.processTombstones();
+          } catch (err) {
+            console.warn('[ConfigRepo] preSyncHook processTombstones failed:', err);
+          }
+        },
+        postSyncHook: async () => {
+          try {
+            this.invalidateTombstoneCache();
+            await this.processTombstones();
+            await this.updateTombstoneConfirmations();
+          } catch (err) {
+            console.warn('[ConfigRepo] postSyncHook tombstone processing failed:', err);
+          }
+        },
       },
       '/',
     );
@@ -1328,42 +1407,63 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     const replica = this.replicaBackends.get(id);
-    if (!replica) {
-      throw new Error(`Backend "${id}" is not a registered replica`);
-    }
-
-    // 1. Delete the descriptor file on the remote backend DIRECTLY.
-    //    This must happen BEFORE removing the sync pair, because once the
-    //    sync pair is gone, we can no longer reach the remote through the
-    //    normal sync flow. Without this, the remote keeps the file and
-    //    another backend's sync pair would pull it back.
     const descPath = this.backendFilePath(id);
-    try {
-      await replica.instance.unlink(descPath);
-    } catch { /* not on remote */ }
-    await this.unlinkVersionSidecar(replica.instance, descPath);
 
-    // 2. Create a tombstone + delete the local file.
-    //    The tombstone ensures that if another backend syncs to the same
-    //    remote, the deleted file won't be re-introduced.
-    try {
-      await this.deleteFile(descPath);
-    } catch {
-      // deleteFile might fail in edge cases — fall back to plain unlink
-      await this.removeBackendDescriptor(id);
+    if (replica) {
+      // Backend is actively registered — full cleanup path.
+      // 1. Delete the descriptor file on the remote backend DIRECTLY.
+      //    This must happen BEFORE removing the sync pair, because once the
+      //    sync pair is gone, we can no longer reach the remote through the
+      //    normal sync flow. Without this, the remote keeps the file and
+      //    another backend's sync pair would pull it back.
+      try {
+        await replica.instance.unlink(descPath);
+      } catch { /* not on remote */ }
+      await this.unlinkVersionSidecar(replica.instance, descPath);
+
+      // 2. Create a tombstone + delete the local file.
+      //    The tombstone ensures that if another backend syncs to the same
+      //    remote, the deleted file won't be re-introduced.
+      try {
+        await this.deleteFile(descPath);
+      } catch {
+        // deleteFile might fail in edge cases — fall back to plain unlink
+        await this.removeBackendDescriptor(id);
+      }
+
+      // 3. Stop watching and remove sync pair
+      this.syncEngine.removePair(replica.pairId);
+      console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
+
+      // 4. Remove from replica map
+      this.replicaBackends.delete(id);
+
+      // 5. Dispose backend instance
+      if (replica.instance?.dispose) {
+        await replica.instance.dispose();
+      }
+    } else {
+      // Backend is NOT in replicaBackends — this happens when:
+      //   - The backend failed to initialize (e.g. auth error during setupSync)
+      //   - A reconnect created a new ConfigRepo that didn't register this backend
+      //   - The backend was disabled (enabled === false) and skipped during setupSync
+      // We still need to write a tombstone and clean up the descriptor so the
+      // deletion propagates to other replicas via sync.
+      console.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
+      try {
+        await this.deleteFile(descPath);
+      } catch {
+        await this.removeBackendDescriptor(id);
+      }
     }
 
-    // 3. Stop watching and remove sync pair
-    this.syncEngine.removePair(replica.pairId);
-    console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
-
-    // 4. Remove from replica map
-    this.replicaBackends.delete(id);
-
-    // 5. Dispose backend instance
-    if (replica.instance?.dispose) {
-      await replica.instance.dispose();
-    }
+    // 6. Trigger sync on remaining pairs to propagate the tombstone.
+    //    The tombstone must reach all remaining backends so they don't
+    //    re-introduce the deleted descriptor from their snapshots.
+    //    schedulePostDeleteSync() (called by deleteFile above) handles this,
+    //    but we also trigger it here to ensure it runs even if deleteFile's
+    //    timer hasn't fired yet.
+    this.schedulePostDeleteSync();
 
     console.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
   }

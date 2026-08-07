@@ -485,6 +485,12 @@ declare class ConfigRepo implements IConfigRepo {
     private readonly pollIntervalMs?;
     /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
     private tombstoneCache;
+    /**
+     * Tracks the background initial sync started by createConfigRepo().
+     * `flush()` and `dispose()` will await this if it hasn't completed yet,
+     * preventing concurrent syncEngine.syncAll() calls.
+     */
+    private initialSyncPromise;
     constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>, pollIntervalMs?: number, cacheOptions?: CacheOptions);
     /** Full path to this node's directory on the primary backend. */
     get nodePath(): string;
@@ -505,6 +511,13 @@ declare class ConfigRepo implements IConfigRepo {
      * to all backends instead of being treated as "missing file → re-create".
      */
     deleteFile(path: string): Promise<void>;
+    /**
+     * Background sync scheduled after a deleteFile() call.
+     * Uses a short debounce to coalesce multiple rapid deletions.
+     * If a sync is already in progress, the next poll will pick up the tombstone.
+     */
+    private postDeleteSyncTimer?;
+    private schedulePostDeleteSync;
     /**
      * Read all tombstones from the primary backend.
      * Results are cached within a flush() cycle to avoid redundant reads.
@@ -536,6 +549,12 @@ declare class ConfigRepo implements IConfigRepo {
      * backend descriptors) that watch()'s initial snapshot would skip.
      */
     initialSyncAndDedup(): Promise<void>;
+    /**
+     * Start the initial sync + dedup cycle in the background.
+     * `flush()` and `dispose()` will await this promise if it hasn't
+     * completed yet, preventing concurrent syncEngine operations.
+     */
+    startBackgroundSync(): void;
     /**
      * After sync: mark each tombstone as confirmed by all replica backends.
      */

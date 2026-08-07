@@ -46,7 +46,7 @@ function createMockBackend(storeKey: string): BackendInstance {
   return {
     async readFile(path: string, ...args: any[]) {
       const data = store!.get(path);
-      if (!data) throw new Error(`ENOENT: ${path}`);
+      if (!data) throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
       if (args[0] === 'utf-8') return new TextDecoder().decode(data);
       return data;
     },
@@ -94,7 +94,7 @@ function createMockBackend(storeKey: string): BackendInstance {
           return { mode: 0o040000, size: 0, mtimeMs: Date.now() };
         }
       }
-      throw new Error(`ENOENT: ${path}`);
+      throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
     },
     async exists(path: string) {
       if (store!.has(path)) return true;
