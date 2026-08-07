@@ -453,6 +453,7 @@ export class ConfigRepo implements IConfigRepo {
 
       // Delete on primary (in case it was re-created)
       const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
+      console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on primary → ${existedOnPrimary ? 'EXISTS' : 'not found'}`);
       if (existedOnPrimary) {
         try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* race */ }
       }
@@ -466,6 +467,7 @@ export class ConfigRepo implements IConfigRepo {
         // on remote backends (RemoteStorage, Gitee, WebDAV) when the file
         // was already deleted on a previous sync cycle.
         const existed = await this.safeExists(replica.instance, tombstone.path);
+        console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on ${replicaId} → ${existed ? 'EXISTS' : 'not found'}`);
         if (existed) {
           try {
             await replica.instance.unlink(tombstone.path);
@@ -499,12 +501,14 @@ export class ConfigRepo implements IConfigRepo {
   private async safeExists(fs: any, path: string): Promise<boolean> {
     try {
       if (typeof fs.exists === 'function') {
-        return await fs.exists(path);
+        const result = await fs.exists(path);
+        return result;
       }
       // Fallback: try stat() — if it throws, the file doesn't exist
       await fs.stat(path);
       return true;
-    } catch {
+    } catch (err: any) {
+      console.log(`[ConfigRepo] safeExists(${path}): threw ${err?.code ?? err?.status ?? ''} ${err?.message ?? err}`);
       return false;
     }
   }
