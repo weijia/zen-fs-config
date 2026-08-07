@@ -528,10 +528,11 @@ var ConfigRepo = class {
   disposed = false;
   configCache = /* @__PURE__ */ new Map();
   primaryBackendId;
+  cacheOptions;
   pollIntervalMs;
   /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
   tombstoneCache = null;
-  constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict, pollIntervalMs) {
+  constructor(appId, nodeId, primaryBackendId, cachedFS, serializer, onConflict, pollIntervalMs, cacheOptions) {
     this.appId = appId;
     this.nodeId = nodeId;
     this.primaryBackendId = primaryBackendId;
@@ -541,6 +542,7 @@ var ConfigRepo = class {
     this.replicaBackends = /* @__PURE__ */ new Map();
     this.onConflictCallback = onConflict;
     this.pollIntervalMs = pollIntervalMs;
+    this.cacheOptions = cacheOptions;
     this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
     this.fs = createChrootFS(cachedFS, `/${appId}`);
     this.rootFS = createChrootFS(cachedFS, "/");
@@ -979,7 +981,13 @@ var ConfigRepo = class {
       console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
-        const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
+        let fsInstance = instance;
+        if (this.cacheOptions) {
+          const { wrapWithCache } = await import("./cache-wrapper-XQCPZJCD.mjs");
+          fsInstance = wrapWithCache(instance, desc.id, this.cacheOptions);
+          console.log(`[ConfigRepo] Replica ${desc.id} wrapped with CachedFileSystem (store=${this.cacheOptions.storeType ?? "IdbCacheStore"})`);
+        }
+        const syncable = backendToSyncableFS(fsInstance, `${desc.type}(${desc.id})`);
         const pair = this.syncEngine.addPair(
           this.fullFS,
           syncable,
@@ -990,7 +998,7 @@ var ConfigRepo = class {
           },
           "/"
         );
-        this.replicaBackends.set(desc.id, { instance, syncable, pairId: pair.pairId });
+        this.replicaBackends.set(desc.id, { instance: fsInstance, syncable, pairId: pair.pairId });
         const conflictHandler = (event) => {
           this.handleConflict(event);
         };
@@ -1696,6 +1704,7 @@ async function createConfigRepo(appId, options = {}) {
     options: { storeName: idbStoreName }
   });
   const cachedFS = primaryInstance;
+  const cacheOptions = options.cache === false ? void 0 : options.cache ?? {};
   try {
     await primaryInstance.mkdir(META_DIR);
     console.log(`[createConfigRepo] /.meta/ ready`);
@@ -1720,7 +1729,8 @@ async function createConfigRepo(appId, options = {}) {
     cachedFS,
     createSerializerChain(),
     void 0,
-    options.syncPollIntervalMs
+    options.syncPollIntervalMs,
+    cacheOptions
   );
   const oldBackendsMeta = await tempRepo.readMetaFile(BACKENDS_FILE);
   if (oldBackendsMeta && oldBackendsMeta.backends?.length > 0) {
@@ -1786,7 +1796,8 @@ async function createConfigRepo(appId, options = {}) {
     cachedFS,
     serializer,
     options.onConflict,
-    options.syncPollIntervalMs
+    options.syncPollIntervalMs,
+    cacheOptions
   );
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
   await repo.load();

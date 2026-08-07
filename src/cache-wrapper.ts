@@ -39,7 +39,16 @@ export function wrapWithCache(
     store = new MemoryCacheStore();
   }
 
-  return new CachedFileSystem(backend, store, {
+  const wrapped = new CachedFileSystem(backend, store, {
     ttlMs: options.ttlMs ?? 0,
   });
+
+  // Pass through shouldSync from the underlying backend.
+  // CachedFileSystem does not implement this itself, but the sync engine
+  // relies on it to skip unnecessary full syncs (see zen-fs-sync onPoll).
+  if (typeof backend.shouldSync === 'function') {
+    (wrapped as any).shouldSync = (...args: any[]) => backend.shouldSync(...args);
+  }
+
+  return wrapped;
 }

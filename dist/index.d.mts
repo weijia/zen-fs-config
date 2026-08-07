@@ -89,11 +89,20 @@ interface ConfigSerializer {
 }
 /** Cache configuration. */
 interface CacheOptions {
-    /** Type of cache store. */
+    /**
+     * Type of cache store for replica backends.
+     * Default: `'IdbCacheStore'` — persists across page reloads so cached
+     * content + revision tokens survive. Use `'MemoryCacheStore'` for
+     * session-only caching (lost on reload).
+     */
     storeType?: 'MemoryCacheStore' | 'IdbCacheStore';
-    /** Cache store prefix (for IdbCacheStore). */
+    /** Cache store prefix (for IdbCacheStore). Default: `'zen-fs-config:'`. */
     storePrefix?: string;
-    /** TTL in milliseconds for cache hits without revalidation. Default: 0 (always revalidate). */
+    /**
+     * TTL in milliseconds for cache hits without revalidation.
+     * Default: 0 (always revalidate via `getRevision` — exact, no stale data).
+     * Ignored when the backend implements `getRevision`.
+     */
     ttlMs?: number;
 }
 /** Options for creating a ConfigRepo. */
@@ -119,8 +128,19 @@ interface ConfigRepoOptions {
     idbStoreName?: string;
     /** Node identifier. Auto-detected if not provided (see DESIGN.md §8.2). */
     nodeId?: string;
-    /** Cache configuration. */
-    cache?: CacheOptions;
+    /**
+     * Cache configuration for replica backends.
+     *
+     * - **Default** (omitted): Caching is enabled with `IdbCacheStore`
+     *   (persists across page reloads). Replica backends (Gitee,
+     *   RemoteStorage, etc.) are wrapped with `CachedFileSystem` to avoid
+     *   redundant network reads via `getRevision` revalidation.
+     * - Pass a `CacheOptions` object to customize the store type, prefix,
+     *   or TTL.
+     * - Pass `false` to disable caching entirely (all reads go directly
+     *   to the backend).
+     */
+    cache?: CacheOptions | false;
     /** Custom serializer. */
     serializer?: ConfigSerializer;
     /** Custom conflict handler. Called before auto-resolution. */
@@ -461,10 +481,11 @@ declare class ConfigRepo implements IConfigRepo {
     private disposed;
     private configCache;
     private readonly primaryBackendId;
+    private readonly cacheOptions?;
     private readonly pollIntervalMs?;
     /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
     private tombstoneCache;
-    constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>, pollIntervalMs?: number);
+    constructor(appId: string, nodeId: string, primaryBackendId: string, cachedFS: MinimalAsyncFS, serializer: PathAwareSerializer, onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>, pollIntervalMs?: number, cacheOptions?: CacheOptions);
     /** Full path to this node's directory on the primary backend. */
     get nodePath(): string;
     /** Number of replica backends registered (excludes the local primary). */

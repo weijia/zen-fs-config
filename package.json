@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-config",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Distributed config management library built on ZenFS, zen-fs-cache, and zen-fs-sync",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -61,6 +61,6 @@
     "typescript": "^5.9.3",
     "vitest": "^1.6.1",
     "zen-fs-cache": "^1.0.1",
-    "zen-fs-sync": "^0.4.3"
+    "zen-fs-sync": "^0.4.5"
   }
 }
