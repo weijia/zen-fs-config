@@ -44,7 +44,7 @@
     "@zenfs/core": ">=2.3.0",
     "@zenfs/dom": ">=1.0.0",
     "zen-fs-cache": ">=1.0.0",
-    "zen-fs-sync": "file:../zen-fs-sync"
+    "zen-fs-sync": ">=0.4.6"
   },
   "peerDependenciesMeta": {
     "@zenfs/dom": {
@@ -61,6 +61,6 @@
     "typescript": "^5.9.3",
     "vitest": "^1.6.1",
     "zen-fs-cache": "^1.0.1",
-    "zen-fs-sync": "file:../zen-fs-sync"
+    "zen-fs-sync": "^0.4.6"
   }
 }
