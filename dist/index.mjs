@@ -786,7 +786,9 @@ var ConfigRepo = class {
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
       const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
-      console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on primary \u2192 ${existedOnPrimary ? "EXISTS" : "not found"}`);
+      if (existedOnPrimary) {
+        console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on primary \u2192 EXISTS`);
+      }
       if (existedOnPrimary) {
         try {
           await this.cachedFS.unlink(tombstone.path);
@@ -802,8 +804,8 @@ var ConfigRepo = class {
       }
       for (const [replicaId, replica] of this.replicaBackends) {
         const existed = await this.safeExists(replica.instance, tombstone.path);
-        console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on ${replicaId} \u2192 ${existed ? "EXISTS" : "not found"}`);
         if (existed) {
+          console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on ${replicaId} \u2192 EXISTS`);
           try {
             await replica.instance.unlink(tombstone.path);
             console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
