@@ -771,6 +771,12 @@ var ConfigRepo = class {
   /**
    * Before sync: for each tombstone, delete the actual file on all replicas.
    * This prevents bi-directional sync from copying the file back.
+   *
+   * Before calling unlink() on each backend, we check exists() first.
+   * This avoids sending wasteful DELETE requests (or GET-then-404) to
+   * remote backends when the file was already removed on a previous cycle.
+   * Local backends (IndexedDB) are cheap to check, so the guard is
+   * effectively free for them.
    */
   async processTombstones() {
     const tombstones = await this.readTombstones();
@@ -778,29 +784,48 @@ var ConfigRepo = class {
     console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s)`);
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
-      try {
-        await this.cachedFS.unlink(tombstone.path);
-      } catch {
+      if (await this.safeExists(this.cachedFS, tombstone.path)) {
+        try {
+          await this.cachedFS.unlink(tombstone.path);
+        } catch {
+        }
       }
-      if (tVersionPath) {
+      if (tVersionPath && await this.safeExists(this.cachedFS, tVersionPath)) {
         try {
           await this.cachedFS.unlink(tVersionPath);
         } catch {
         }
       }
       for (const [replicaId, replica] of this.replicaBackends) {
-        try {
-          await replica.instance.unlink(tombstone.path);
-        } catch {
+        if (await this.safeExists(replica.instance, tombstone.path)) {
+          try {
+            await replica.instance.unlink(tombstone.path);
+            console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+          } catch {
+          }
         }
-        if (tVersionPath) {
+        if (tVersionPath && await this.safeExists(replica.instance, tVersionPath)) {
           try {
             await replica.instance.unlink(tVersionPath);
           } catch {
           }
         }
-        console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
       }
+    }
+  }
+  /**
+   * Safe existence check — returns false on any error instead of throwing.
+   * Used by processTombstones to avoid unnecessary unlink() calls.
+   */
+  async safeExists(fs, path) {
+    try {
+      if (typeof fs.exists === "function") {
+        return await fs.exists(path);
+      }
+      await fs.stat(path);
+      return true;
+    } catch {
+      return false;
     }
   }
   /** Public wrapper for processTombstones — used by createConfigRepo. */

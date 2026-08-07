@@ -515,8 +515,19 @@ declare class ConfigRepo implements IConfigRepo {
     /**
      * Before sync: for each tombstone, delete the actual file on all replicas.
      * This prevents bi-directional sync from copying the file back.
+     *
+     * Before calling unlink() on each backend, we check exists() first.
+     * This avoids sending wasteful DELETE requests (or GET-then-404) to
+     * remote backends when the file was already removed on a previous cycle.
+     * Local backends (IndexedDB) are cheap to check, so the guard is
+     * effectively free for them.
      */
     private processTombstones;
+    /**
+     * Safe existence check — returns false on any error instead of throwing.
+     * Used by processTombstones to avoid unnecessary unlink() calls.
+     */
+    private safeExists;
     /** Public wrapper for processTombstones — used by createConfigRepo. */
     processTombstonesPublic(): Promise<void>;
     /**
