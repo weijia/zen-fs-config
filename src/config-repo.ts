@@ -132,6 +132,12 @@ export class ConfigRepo implements IConfigRepo {
   private readonly pollIntervalMs?: number;
   /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
   private tombstoneCache: TombstoneMeta[] | null = null;
+  /**
+   * Tracks the background initial sync started by createConfigRepo().
+   * `flush()` and `dispose()` will await this if it hasn't completed yet,
+   * preventing concurrent syncEngine.syncAll() calls.
+   */
+  private initialSyncPromise: Promise<void> | null = null;
 
   constructor(
     appId: string,
@@ -332,6 +338,12 @@ export class ConfigRepo implements IConfigRepo {
 
   async flush(): Promise<SyncResult[]> {
     this.assertNotDisposed();
+    // Wait for background initial sync if still running — prevents
+    // concurrent syncEngine.syncAll() calls which could cause race conditions.
+    if (this.initialSyncPromise) {
+      await this.initialSyncPromise;
+      this.initialSyncPromise = null;
+    }
     // 1. Process tombstones: delete actual files on all replicas
     await this.processTombstones();
     // 2. Run normal sync (syncs data files + tombstone files)
@@ -534,6 +546,24 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * Start the initial sync + dedup cycle in the background.
+   * `flush()` and `dispose()` will await this promise if it hasn't
+   * completed yet, preventing concurrent syncEngine operations.
+   */
+  startBackgroundSync(): void {
+    this.initialSyncPromise = this.initialSyncAndDedup()
+      .then(() => {
+        console.log('[ConfigRepo] Background initial sync complete');
+      })
+      .catch((err) => {
+        console.error('[ConfigRepo] Background initial sync failed:', err);
+      })
+      .finally(() => {
+        this.initialSyncPromise = null;
+      });
+  }
+
+  /**
    * After sync: mark each tombstone as confirmed by all replica backends.
    */
   private async updateTombstoneConfirmations(): Promise<void> {
@@ -721,6 +751,11 @@ export class ConfigRepo implements IConfigRepo {
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
+    // Wait for background initial sync if still running
+    if (this.initialSyncPromise) {
+      await this.initialSyncPromise;
+      this.initialSyncPromise = null;
+    }
     this.disposed = true;
     this.syncEngine.dispose();
 
@@ -848,14 +883,20 @@ export class ConfigRepo implements IConfigRepo {
     const appDir = `/${this.appId}`;
     try {
       const files = await this.walkDir(appDir);
-      for (const filePath of files) {
-        try {
-          const raw = await this.cachedFS.readFile(filePath);
-          const data = this.serializer.deserialize(toUint8Array(raw), filePath);
-          this.configCache.set(filePath, data);
-        } catch {
-          // Skip unreadable files
-        }
+      // Parallelize file reads — avoids serial await for each file
+      const readResults = await Promise.all(
+        files.map(async (filePath) => {
+          try {
+            const raw = await this.cachedFS.readFile(filePath);
+            const data = this.serializer.deserialize(toUint8Array(raw), filePath);
+            return { filePath, data };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      for (const item of readResults) {
+        if (item) this.configCache.set(item.filePath, item.data);
       }
     } catch {
       // App directory might not exist yet
@@ -960,18 +1001,26 @@ export class ConfigRepo implements IConfigRepo {
       const current = stack.pop()!;
       try {
         const entries = await this.cachedFS.readdir(current);
-        for (const entry of entries) {
-          if (entry.startsWith('.')) continue;
-          const fullPath = current === '/' ? `/${entry}` : `${current}/${entry}`;
-          try {
-            const stat = await this.cachedFS.stat(fullPath);
-            if (stat.mode !== undefined && (stat.mode & 0o40000) === 0o40000) {
-              stack.push(fullPath);
-            } else {
-              results.push(fullPath);
-            }
-          } catch {
-            // Skip entries that can't be stated
+        // Parallelize stat calls — avoids serial await for each entry
+        const statResults = await Promise.all(
+          entries
+            .filter((entry: string) => !entry.startsWith('.'))
+            .map(async (entry: string) => {
+              const fullPath = current === '/' ? `/${entry}` : `${current}/${entry}`;
+              try {
+                const stat = await this.cachedFS.stat(fullPath);
+                return { fullPath, stat };
+              } catch {
+                return null;
+              }
+            }),
+        );
+        for (const item of statResults) {
+          if (!item) continue;
+          if (item.stat.mode !== undefined && (item.stat.mode & 0o40000) === 0o40000) {
+            stack.push(item.fullPath);
+          } else {
+            results.push(item.fullPath);
           }
         }
       } catch {
@@ -1022,35 +1071,40 @@ export class ConfigRepo implements IConfigRepo {
   async readAllBackendDescriptors(): Promise<BackendDescriptor[]> {
     try {
       const entries = await this.cachedFS.readdir(BACKENDS_DIR);
-      // Collect descriptor + file mtime for dedup
+      const jsonEntries = entries.filter((e: string) => e.endsWith('.json'));
+
+      // Parallelize readFile + stat for all descriptor files
+      const readResults = await Promise.all(
+        jsonEntries.map(async (entry: string) => {
+          const filePath = `${BACKENDS_DIR}/${entry}`;
+          try {
+            const raw = await this.cachedFS.readFile(filePath);
+            const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+            if (desc.id && desc.type) {
+              let mtime = 0;
+              try {
+                const stat = await this.cachedFS.stat(filePath);
+                mtime = stat.mtimeMs ?? 0;
+              } catch { /* mtime unknown */ }
+              return { kind: 'ok' as const, desc, mtime };
+            } else {
+              console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+              return { kind: 'corrupt' as const, filePath };
+            }
+          } catch (parseErr) {
+            console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+            return { kind: 'corrupt' as const, filePath };
+          }
+        }),
+      );
+
       const items: { desc: BackendDescriptor; mtime: number }[] = [];
       const corruptFiles: string[] = [];
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        const filePath = `${BACKENDS_DIR}/${entry}`;
-        try {
-          const raw = await this.cachedFS.readFile(filePath);
-          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-          if (desc.id && desc.type) {
-            let mtime = 0;
-            try {
-              const stat = await this.cachedFS.stat(filePath);
-              mtime = stat.mtimeMs ?? 0;
-            } catch { /* mtime unknown */ }
-            items.push({ desc, mtime });
-          } else {
-            // Valid JSON but missing required fields — treat as corrupt
-            console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
-            corruptFiles.push(filePath);
-          }
-        } catch (parseErr) {
-          // JSON.parse failed — the file is corrupted.
-          // This was the root cause of the "duplicate RemoteStorage backend" issue:
-          // a corrupted .json file could never be parsed, so it was never recognized
-          // as a duplicate, never got tombstoned, and kept being re-synced from remote.
-          // Now we proactively delete corrupted files on all replicas + create a tombstone.
-          console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
-          corruptFiles.push(filePath);
+      for (const result of readResults) {
+        if (result.kind === 'ok') {
+          items.push({ desc: result.desc, mtime: result.mtime });
+        } else {
+          corruptFiles.push(result.filePath);
         }
       }
 
@@ -1784,11 +1838,15 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 5: If backendInfo is provided, add as replica (if not present)
+  // Step 5: Read all backends ONCE (used for both duplicate check and setupSync)
+  // -------------------------------------------------------------------
+  let allBackends = await tempRepo.readAllBackendDescriptors();
+
+  // -------------------------------------------------------------------
+  // Step 5b: If backendInfo is provided, add as replica (if not present)
   // -------------------------------------------------------------------
   if (options.backendInfo) {
     const replicaId = options.primaryBackendId || `${options.backendInfo.type}-replica`;
-    const allBackends = await tempRepo.readAllBackendDescriptors();
     const hasReplica = allBackends.some(b => b.id === replicaId);
     // Also check for duplicate configuration (same type + options, different ID)
     const newKey = backendDedupKey({
@@ -1804,6 +1862,8 @@ export async function createConfigRepo(
         options: options.backendInfo.options,
       });
       console.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
+      // Append to the array instead of re-reading from disk
+      allBackends = [...allBackends, { id: replicaId, type: options.backendInfo.type, options: options.backendInfo.options }];
     } else if (dupConfig) {
       console.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
     } else {
@@ -1811,10 +1871,6 @@ export async function createConfigRepo(
     }
   }
 
-  // -------------------------------------------------------------------
-  // Step 6: Read all backends (replicas only, local-idb is implicit)
-  // -------------------------------------------------------------------
-  const allBackends = await tempRepo.readAllBackendDescriptors();
   console.log(`[createConfigRepo] Replica backends: ${allBackends.map(b => b.id).join(', ') || '(none)'}`);
 
   // -------------------------------------------------------------------
@@ -1848,17 +1904,13 @@ export async function createConfigRepo(
   // Load config cache from local IndexedDB (fast, no network)
   await repo.load();
 
-  // Step 8b: Initial sync + dedup cycle.
-  // setupSync creates sync pairs WITHOUT calling watch() (to avoid
-  // buildInitialSnapshots caching a stale merged snapshot). Now we:
-  //   1. unwatchAll() — safety: ensures no stale snapshots (no-op if never watched)
-  //   2. syncAll() — full bidirectional sync, pulls remote-only files to local
-  //   3. readAllBackendDescriptors() — dedup any duplicates pulled from remote
-  //   4. processTombstones() — delete deduped files on all replicas
-  //   5. watchAll() — start monitoring for future changes
+  // Step 8b: Initial sync + dedup cycle — run in BACKGROUND to avoid
+  // blocking the caller. The sync engine's watchAll() will start
+  // monitoring for changes once the initial sync completes.
+  // flush() and dispose() will await this if called before it finishes.
   if (repo.replicaCount > 0) {
-    console.log('[createConfigRepo] Initial sync + dedup cycle...');
-    await repo.initialSyncAndDedup();
+    console.log('[createConfigRepo] Starting background initial sync + dedup...');
+    repo.startBackgroundSync();
   }
 
   // Sync to replicas in the background — watchers are already running,
