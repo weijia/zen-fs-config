@@ -561,19 +561,32 @@ export class ConfigRepo implements IConfigRepo {
    */
   private async safeExists(fs: any, path: string): Promise<boolean> {
     try {
-      if (typeof fs.exists === 'function') {
-        console.log(`[TOMB-TRACE] safeExists: calling fs.exists(${path})`);
+      // Gather diagnostic info about the fs object
+      const ctorName = fs?.constructor?.name ?? typeof fs;
+      const hasExists = typeof fs?.exists === 'function';
+      const hasStat = typeof fs?.stat === 'function';
+      const innerBackend = fs?.inner?.constructor?.name;
+      const innerBackendName = fs?.inner?.backendName;
+      const directBackendName = fs?.backendName;
+      const backendLabel = innerBackendName ?? directBackendName ?? innerBackend ?? ctorName;
+
+      console.log(`[TOMB-TRACE] safeExists(${path}): fs type=${ctorName} backend=${backendLabel} hasExists=${hasExists} hasStat=${hasStat} inner=${innerBackend ?? 'N/A'}`);
+
+      if (hasExists) {
+        console.log(`[TOMB-TRACE] safeExists(${path}): → calling fs.exists() [backend=${backendLabel}]`);
         const result = await fs.exists(path);
-        console.log(`[TOMB-TRACE] safeExists: fs.exists(${path}) → ${result}`);
+        console.log(`[TOMB-TRACE] safeExists(${path}): ← fs.exists() [backend=${backendLabel}] → ${result}`);
         return result;
       }
       // Fallback: try stat() — if it throws, the file doesn't exist
-      console.log(`[TOMB-TRACE] safeExists: no exists(), calling fs.stat(${path})`);
+      console.log(`[TOMB-TRACE] safeExists(${path}): no exists(), calling fs.stat() [backend=${backendLabel}]`);
       await fs.stat(path);
-      console.log(`[TOMB-TRACE] safeExists: fs.stat(${path}) → OK (exists)`);
+      console.log(`[TOMB-TRACE] safeExists(${path}): ← fs.stat() [backend=${backendLabel}] → OK (exists)`);
       return true;
     } catch (err: any) {
-      console.log(`[TOMB-TRACE] safeExists(${path}): threw ${err?.code ?? err?.status ?? ''} ${err?.message ?? err}`);
+      const errCode = err?.code ?? err?.status ?? '';
+      const errName = err?.constructor?.name ?? '';
+      console.log(`[TOMB-TRACE] safeExists(${path}): ← ERROR ${errName} ${errCode} ${err?.message ?? err}`);
       return false;
     }
   }

@@ -880,18 +880,28 @@ var ConfigRepo = class {
    */
   async safeExists(fs, path) {
     try {
-      if (typeof fs.exists === "function") {
-        console.log(`[TOMB-TRACE] safeExists: calling fs.exists(${path})`);
+      const ctorName = fs?.constructor?.name ?? typeof fs;
+      const hasExists = typeof fs?.exists === "function";
+      const hasStat = typeof fs?.stat === "function";
+      const innerBackend = fs?.inner?.constructor?.name;
+      const innerBackendName = fs?.inner?.backendName;
+      const directBackendName = fs?.backendName;
+      const backendLabel = innerBackendName ?? directBackendName ?? innerBackend ?? ctorName;
+      console.log(`[TOMB-TRACE] safeExists(${path}): fs type=${ctorName} backend=${backendLabel} hasExists=${hasExists} hasStat=${hasStat} inner=${innerBackend ?? "N/A"}`);
+      if (hasExists) {
+        console.log(`[TOMB-TRACE] safeExists(${path}): \u2192 calling fs.exists() [backend=${backendLabel}]`);
         const result = await fs.exists(path);
-        console.log(`[TOMB-TRACE] safeExists: fs.exists(${path}) \u2192 ${result}`);
+        console.log(`[TOMB-TRACE] safeExists(${path}): \u2190 fs.exists() [backend=${backendLabel}] \u2192 ${result}`);
         return result;
       }
-      console.log(`[TOMB-TRACE] safeExists: no exists(), calling fs.stat(${path})`);
+      console.log(`[TOMB-TRACE] safeExists(${path}): no exists(), calling fs.stat() [backend=${backendLabel}]`);
       await fs.stat(path);
-      console.log(`[TOMB-TRACE] safeExists: fs.stat(${path}) \u2192 OK (exists)`);
+      console.log(`[TOMB-TRACE] safeExists(${path}): \u2190 fs.stat() [backend=${backendLabel}] \u2192 OK (exists)`);
       return true;
     } catch (err) {
-      console.log(`[TOMB-TRACE] safeExists(${path}): threw ${err?.code ?? err?.status ?? ""} ${err?.message ?? err}`);
+      const errCode = err?.code ?? err?.status ?? "";
+      const errName = err?.constructor?.name ?? "";
+      console.log(`[TOMB-TRACE] safeExists(${path}): \u2190 ERROR ${errName} ${errCode} ${err?.message ?? err}`);
       return false;
     }
   }
