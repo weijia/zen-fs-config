@@ -32,8 +32,11 @@ import { createChrootFS } from './context-fs';
 import type { PathAwareSerializer } from './serializer';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, mergeAccountFields, getAccountFields, type BackendInstance } from './backend-registry';
+import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 import type { VersionMeta } from './types';
+
+const log = createLogger('zen-fs-config:config-repo');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -221,7 +224,7 @@ export class ConfigRepo implements IConfigRepo {
     this.configCache.set(fullPath, data);
 
     this.persistConfig(fullPath, bytes).catch((err) => {
-      console.error(`[zen-fs-config] Failed to persist ${fullPath}:`, err);
+      log.error(`[zen-fs-config] Failed to persist ${fullPath}:`, err);
     });
   }
 
@@ -405,7 +408,7 @@ export class ConfigRepo implements IConfigRepo {
       } catch { /* no version file */ }
     }
 
-    console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+    log.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
     // Invalidate cache — a new tombstone was written
     this.invalidateTombstoneCache();
 
@@ -434,7 +437,7 @@ export class ConfigRepo implements IConfigRepo {
       // syncAll() on each pair triggers preSyncHook → processTombstones
       // before the snapshot comparison, then postSyncHook for confirmation/GC.
       this.syncEngine.syncAll().catch((err) => {
-        console.warn('[ConfigRepo] post-delete sync failed:', err);
+        log.warn('[ConfigRepo] post-delete sync failed:', err);
       });
     }, 500); // 500ms debounce — coalesce rapid deletions
   }
@@ -491,20 +494,20 @@ export class ConfigRepo implements IConfigRepo {
 
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
-      console.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? 'null'}`);
+      log.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? 'null'}`);
 
       // Delete on primary (in case it was re-created)
       const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
-      console.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) → ${existedOnPrimary}`);
+      log.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) → ${existedOnPrimary}`);
       if (existedOnPrimary) {
-        console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary → EXISTS`);
+        log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary → EXISTS`);
       }
       if (existedOnPrimary) {
         try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* race */ }
       }
       if (tVersionPath) {
         const vExistedOnPrimary = await this.safeExists(this.cachedFS, tVersionPath);
-        console.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) → ${vExistedOnPrimary}`);
+        log.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) → ${vExistedOnPrimary}`);
         if (vExistedOnPrimary) {
           try { await this.cachedFS.unlink(tVersionPath); } catch { /* race */ }
         }
@@ -512,37 +515,37 @@ export class ConfigRepo implements IConfigRepo {
 
       // Delete on all replicas
       for (const [replicaId, replica] of this.replicaBackends) {
-        console.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
+        log.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
         // Check existence before unlink — avoids wasteful DELETE requests
         // on remote backends (RemoteStorage, Gitee, WebDAV) when the file
         // was already deleted on a previous sync cycle.
         const existed = await this.safeExists(replica.instance, tombstone.path);
-        console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) → ${existed}`);
+        log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) → ${existed}`);
         if (existed) {
-          console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} → EXISTS`);
+          log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} → EXISTS`);
           try {
-            console.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
+            log.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
             await replica.instance.unlink(tombstone.path);
-            console.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+            log.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
             processed++;
           } catch (err) {
-            console.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
+            log.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
             // race — file removed between exists and unlink
             alreadyDeleted++;
           }
         } else {
-          console.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
+          log.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
           alreadyDeleted++;
         }
         if (tVersionPath) {
           const vExisted = await this.safeExists(replica.instance, tVersionPath);
-          console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) → ${vExisted}`);
+          log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) → ${vExisted}`);
           if (vExisted) {
             try {
-              console.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
+              log.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
               await replica.instance.unlink(tVersionPath);
             } catch (err) {
-              console.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
+              log.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
             }
           }
         }
@@ -551,7 +554,7 @@ export class ConfigRepo implements IConfigRepo {
 
     // Only log summary — per-file logs only appear for actual deletions
     if (processed > 0 || alreadyDeleted > 0) {
-      console.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
+      log.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
     }
   }
 
@@ -570,23 +573,23 @@ export class ConfigRepo implements IConfigRepo {
       const directBackendName = fs?.backendName;
       const backendLabel = innerBackendName ?? directBackendName ?? innerBackend ?? ctorName;
 
-      console.log(`[TOMB-TRACE] safeExists(${path}): fs type=${ctorName} backend=${backendLabel} hasExists=${hasExists} hasStat=${hasStat} inner=${innerBackend ?? 'N/A'}`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): fs type=${ctorName} backend=${backendLabel} hasExists=${hasExists} hasStat=${hasStat} inner=${innerBackend ?? 'N/A'}`);
 
       if (hasExists) {
-        console.log(`[TOMB-TRACE] safeExists(${path}): → calling fs.exists() [backend=${backendLabel}]`);
+        log.log(`[TOMB-TRACE] safeExists(${path}): → calling fs.exists() [backend=${backendLabel}]`);
         const result = await fs.exists(path);
-        console.log(`[TOMB-TRACE] safeExists(${path}): ← fs.exists() [backend=${backendLabel}] → ${result}`);
+        log.log(`[TOMB-TRACE] safeExists(${path}): ← fs.exists() [backend=${backendLabel}] → ${result}`);
         return result;
       }
       // Fallback: try stat() — if it throws, the file doesn't exist
-      console.log(`[TOMB-TRACE] safeExists(${path}): no exists(), calling fs.stat() [backend=${backendLabel}]`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): no exists(), calling fs.stat() [backend=${backendLabel}]`);
       await fs.stat(path);
-      console.log(`[TOMB-TRACE] safeExists(${path}): ← fs.stat() [backend=${backendLabel}] → OK (exists)`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): ← fs.stat() [backend=${backendLabel}] → OK (exists)`);
       return true;
     } catch (err: any) {
       const errCode = err?.code ?? err?.status ?? '';
       const errName = err?.constructor?.name ?? '';
-      console.log(`[TOMB-TRACE] safeExists(${path}): ← ERROR ${errName} ${errCode} ${err?.message ?? err}`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): ← ERROR ${errName} ${errCode} ${err?.message ?? err}`);
       return false;
     }
   }
@@ -617,10 +620,10 @@ export class ConfigRepo implements IConfigRepo {
   startBackgroundSync(): void {
     this.initialSyncPromise = this.initialSyncAndDedup()
       .then(() => {
-        console.log('[ConfigRepo] Background initial sync complete');
+        log.log('[ConfigRepo] Background initial sync complete');
       })
       .catch((err) => {
-        console.error('[ConfigRepo] Background initial sync failed:', err);
+        log.error('[ConfigRepo] Background initial sync failed:', err);
       })
       .finally(() => {
         this.initialSyncPromise = null;
@@ -655,7 +658,7 @@ export class ConfigRepo implements IConfigRepo {
       } catch { /* ignore write error */ }
     }
 
-    console.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+    log.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
     // Invalidate cache — tombstones were modified (confirmedBy updated)
     this.invalidateTombstoneCache();
   }
@@ -695,7 +698,7 @@ export class ConfigRepo implements IConfigRepo {
           }
         }
 
-        console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
+        log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
       }
     }
   }
@@ -716,7 +719,7 @@ export class ConfigRepo implements IConfigRepo {
     // changed files, and handles conflicts properly.
     const results = await this.flush();
     for (const result of results) {
-      console.log(
+      log.log(
         `[ConfigRepo] syncMetaToReplicas: ${result.pairId} ` +
         `+${result.filesCreated}/~${result.filesUpdated}/-${result.filesDeleted} ` +
         `skip:${result.filesSkipped} ${result.durationMs}ms`,
@@ -851,15 +854,15 @@ export class ConfigRepo implements IConfigRepo {
     primaryBackendId: string,
     pollIntervalMs?: number,
   ): Promise<void> {
-    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? 'default'}ms`);
+    log.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? 'default'}ms`);
 
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
       if ((desc as any).enabled === false) {
-        console.log(`[ConfigRepo] Skipping disabled replica: ${desc.id}`);
+        log.log(`[ConfigRepo] Skipping disabled replica: ${desc.id}`);
         continue;
       }
-      console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
+      log.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
 
@@ -871,7 +874,7 @@ export class ConfigRepo implements IConfigRepo {
         if (this.cacheOptions) {
           const { wrapWithCache } = await import('./cache-wrapper');
           fsInstance = wrapWithCache(instance, desc.id, this.cacheOptions);
-          console.log(`[ConfigRepo] Replica ${desc.id} wrapped with CachedFileSystem (store=${this.cacheOptions.storeType ?? 'IdbCacheStore'})`);
+          log.log(`[ConfigRepo] Replica ${desc.id} wrapped with CachedFileSystem (store=${this.cacheOptions.storeType ?? 'IdbCacheStore'})`);
         }
 
         const syncable = backendToSyncableFS(fsInstance, `${desc.type}(${desc.id})`);
@@ -900,7 +903,7 @@ export class ConfigRepo implements IConfigRepo {
                 this.invalidateTombstoneCache();
                 await this.processTombstones();
               } catch (err) {
-                console.warn('[ConfigRepo] preSyncHook processTombstones failed:', err);
+                log.warn('[ConfigRepo] preSyncHook processTombstones failed:', err);
               }
             },
             postSyncHook: async () => {
@@ -909,7 +912,7 @@ export class ConfigRepo implements IConfigRepo {
                 await this.processTombstones();
                 await this.updateTombstoneConfirmations();
               } catch (err) {
-                console.warn('[ConfigRepo] postSyncHook tombstone processing failed:', err);
+                log.warn('[ConfigRepo] postSyncHook tombstone processing failed:', err);
               }
             },
           },
@@ -931,14 +934,14 @@ export class ConfigRepo implements IConfigRepo {
         // descriptors) un-pulled. The caller (createConfigRepo) will do an
         // initial sync first, then call watchAll().
 
-        console.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
+        log.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
       } catch (err: any) {
-        console.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
+        log.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
       }
     }
 
-    console.log(`[ConfigRepo] setupSync complete. Replicas:`, Array.from(this.replicaBackends.keys()));
-    console.log(`[ConfigRepo] Sync statuses:`, this.getSyncStatuses());
+    log.log(`[ConfigRepo] setupSync complete. Replicas:`, Array.from(this.replicaBackends.keys()));
+    log.log(`[ConfigRepo] Sync statuses:`, this.getSyncStatuses());
   }
 
   // -----------------------------------------------------------------------
@@ -1069,7 +1072,7 @@ export class ConfigRepo implements IConfigRepo {
           await this.resolveConflict(`${conflictId}/meta.json`, customMerge);
         }
       } catch (err) {
-        console.error('[zen-fs-config] Conflict handler error:', err);
+        log.error('[zen-fs-config] Conflict handler error:', err);
       }
     }
   }
@@ -1189,11 +1192,11 @@ export class ConfigRepo implements IConfigRepo {
               } catch { /* mtime unknown */ }
               return { kind: 'ok' as const, desc, mtime };
             } else {
-              console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+              log.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
               return { kind: 'corrupt' as const, filePath };
             }
           } catch (parseErr) {
-            console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+            log.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
             return { kind: 'corrupt' as const, filePath };
           }
         }),
@@ -1250,7 +1253,7 @@ export class ConfigRepo implements IConfigRepo {
       }
 
       if (duplicates.length > 0) {
-        console.log(
+        log.log(
           `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
         );
         for (const dupId of duplicates) {
@@ -1385,7 +1388,7 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     // Create backend instance
-    console.log(`[ConfigRepo] addBackend: creating ${id} (${type})...`);
+    log.log(`[ConfigRepo] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
 
@@ -1405,7 +1408,7 @@ export class ConfigRepo implements IConfigRepo {
             this.invalidateTombstoneCache();
             await this.processTombstones();
           } catch (err) {
-            console.warn('[ConfigRepo] preSyncHook processTombstones failed:', err);
+            log.warn('[ConfigRepo] preSyncHook processTombstones failed:', err);
           }
         },
         postSyncHook: async () => {
@@ -1414,7 +1417,7 @@ export class ConfigRepo implements IConfigRepo {
             await this.processTombstones();
             await this.updateTombstoneConfirmations();
           } catch (err) {
-            console.warn('[ConfigRepo] postSyncHook tombstone processing failed:', err);
+            log.warn('[ConfigRepo] postSyncHook tombstone processing failed:', err);
           }
         },
       },
@@ -1429,7 +1432,7 @@ export class ConfigRepo implements IConfigRepo {
     };
     this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
 
-    console.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
+    log.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
 
     // Trigger initial sync FIRST (pulls remote-only files, pushes local files).
     // Then start watching. If we watch before syncing, buildInitialSnapshots()
@@ -1472,7 +1475,7 @@ export class ConfigRepo implements IConfigRepo {
 
       // 3. Stop watching and remove sync pair
       this.syncEngine.removePair(replica.pairId);
-      console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
+      log.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
 
       // 4. Remove from replica map
       this.replicaBackends.delete(id);
@@ -1488,7 +1491,7 @@ export class ConfigRepo implements IConfigRepo {
       //   - The backend was disabled (enabled === false) and skipped during setupSync
       // We still need to write a tombstone and clean up the descriptor so the
       // deletion propagates to other replicas via sync.
-      console.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
+      log.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
       try {
         await this.deleteFile(descPath);
       } catch {
@@ -1504,7 +1507,7 @@ export class ConfigRepo implements IConfigRepo {
     //    timer hasn't fired yet.
     this.schedulePostDeleteSync();
 
-    console.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
+    log.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
   }
 
   // -----------------------------------------------------------------------
@@ -1518,7 +1521,7 @@ export class ConfigRepo implements IConfigRepo {
       const existing = await this.cachedFS.readFile(GROUP_TYPE_FILE, 'utf-8');
       const current = (existing as string).trim();
       if (current && current !== type) {
-        console.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
+        log.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
         return;
       }
     } catch {
@@ -1526,7 +1529,7 @@ export class ConfigRepo implements IConfigRepo {
     }
     await this.ensureDir(GROUP_TYPE_FILE);
     await this.cachedFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode(type));
-    console.log(`[ConfigRepo] group-type set to "${type}"`);
+    log.log(`[ConfigRepo] group-type set to "${type}"`);
   }
 
   /** Read the group-type marker. Returns null if not set. */
@@ -1579,7 +1582,7 @@ export class ConfigRepo implements IConfigRepo {
       throw new Error(`App data group "${id}" already exists. Use removeAppDataGroup() first.`);
     }
 
-    console.log(`[ConfigRepo] createAppDataGroup: creating "${id}" with ${backends.length} backend(s)`);
+    log.log(`[ConfigRepo] createAppDataGroup: creating "${id}" with ${backends.length} backend(s)`);
 
     // Resolve account fields for each backend
     const resolvedBackends: AppDataBackendDescriptor[] = [];
@@ -1613,7 +1616,7 @@ export class ConfigRepo implements IConfigRepo {
     await this.writeVersionSidecar(descPath, version);
 
     this.appDataGroups.set(id, group);
-    console.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
+    log.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
 
     return group;
   }
@@ -1678,7 +1681,7 @@ export class ConfigRepo implements IConfigRepo {
     const descPath = this.appDataGroupFilePath(id);
     try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
     await this.unlinkVersionSidecar(this.cachedFS, descPath);
-    console.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
+    log.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
   }
 
   async listAccountBackends(): Promise<BackendDescriptor[]> {
@@ -1772,9 +1775,9 @@ class AppDataGroupImpl implements AppDataGroup {
         );
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
         // NOTE: Don't watch yet — sync first, then watch (same pattern as ConfigRepo)
-        console.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
+        log.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err: any) {
-        console.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
+        log.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
       }
     }
 
@@ -1782,7 +1785,7 @@ class AppDataGroupImpl implements AppDataGroup {
     try {
       await this.syncEngine.syncAll();
     } catch (err) {
-      console.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
+      log.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
     }
 
     // Now start watching — snapshots will reflect the synced state
@@ -1809,7 +1812,7 @@ class AppDataGroupImpl implements AppDataGroup {
       throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
     }
 
-    console.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
+    log.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
 
@@ -1827,13 +1830,13 @@ class AppDataGroupImpl implements AppDataGroup {
 
     const desc: AppDataBackendDescriptor = { id, type, options, description };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
-    console.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
+    log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 
     // Initial sync FIRST, then watch (same pattern as ConfigRepo.addBackend)
     try {
       await this.syncEngine.sync(pair.pairId);
     } catch (err) {
-      console.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
+      log.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
     }
     this.syncEngine.watch(pair.pairId);
   }
@@ -1852,7 +1855,7 @@ class AppDataGroupImpl implements AppDataGroup {
       await backend.instance.dispose();
     }
 
-    console.log(`[AppDataGroup:${this.groupId}] removeBackend: ${id} removed`);
+    log.log(`[AppDataGroup:${this.groupId}] removeBackend: ${id} removed`);
   }
 
   listBackends(): AppDataBackendDescriptor[] {
@@ -1896,7 +1899,7 @@ export async function createConfigRepo(
   // Step 1: Create IndexedDB as the local primary backend (always)
   // -------------------------------------------------------------------
   const idbStoreName = options.idbStoreName || `zen-fs-config-${appId}`;
-  console.log(`[createConfigRepo] Creating IndexedDB primary (store: ${idbStoreName})...`);
+  log.log(`[createConfigRepo] Creating IndexedDB primary (store: ${idbStoreName})...`);
 
   const primaryInstance = await createBackend({
     type: 'IndexedDB',
@@ -1917,7 +1920,7 @@ export async function createConfigRepo(
   // -------------------------------------------------------------------
   try {
     await primaryInstance.mkdir(META_DIR);
-    console.log(`[createConfigRepo] /.meta/ ready`);
+    log.log(`[createConfigRepo] /.meta/ ready`);
   } catch (err: any) {
     // EEXIST / File exists is expected on every launch after the first —
     // the directory was already created. Suppress to avoid log noise.
@@ -1925,7 +1928,7 @@ export async function createConfigRepo(
     if (msg.includes('File exists') || msg.includes('EEXIST') || (err as { code?: string }).code === 'EEXIST') {
       // /.meta/ already exists — this is the normal case after first run
     } else {
-      console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+      log.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
     }
   }
 
@@ -1939,10 +1942,10 @@ export async function createConfigRepo(
       await primaryInstance.readFile(`${META_DIR}/group-type`);
     } catch {
       await primaryInstance.writeFile(`${META_DIR}/group-type`, groupTypeBytes);
-      console.log(`[createConfigRepo] group-type set to "config-sync"`);
+      log.log(`[createConfigRepo] group-type set to "config-sync"`);
     }
   } catch (err: any) {
-    console.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
+    log.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
   }
 
   // -------------------------------------------------------------------
@@ -1957,12 +1960,12 @@ export async function createConfigRepo(
   // -------------------------------------------------------------------
   const oldBackendsMeta = await tempRepo.readMetaFile<BackendsMeta>(BACKENDS_FILE);
   if (oldBackendsMeta && oldBackendsMeta.backends?.length > 0) {
-    console.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
+    log.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
     await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
     for (const desc of oldBackendsMeta.backends) {
       // Skip the local IndexedDB primary — it's implicit, not stored
       if (desc.id === LOCAL_IDB_BACKEND_ID || desc.type === 'IndexedDB') {
-        console.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
+        log.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
         continue;
       }
       await tempRepo.writeBackendDescriptor(desc);
@@ -1973,7 +1976,7 @@ export async function createConfigRepo(
       const vPath = versionPathFor(BACKENDS_FILE);
       if (vPath) { try { await cachedFS.unlink(vPath); } catch { /* ignore */ } }
     }
-    console.log(`[createConfigRepo] Migration complete`);
+    log.log(`[createConfigRepo] Migration complete`);
   }
 
   // -------------------------------------------------------------------
@@ -2000,17 +2003,17 @@ export async function createConfigRepo(
         type: options.backendInfo.type,
         options: options.backendInfo.options,
       });
-      console.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
+      log.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
       // Append to the array instead of re-reading from disk
       allBackends = [...allBackends, { id: replicaId, type: options.backendInfo.type, options: options.backendInfo.options }];
     } else if (dupConfig) {
-      console.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
+      log.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
     } else {
-      console.log(`[createConfigRepo] Replica ${replicaId} already registered`);
+      log.log(`[createConfigRepo] Replica ${replicaId} already registered`);
     }
   }
 
-  console.log(`[createConfigRepo] Replica backends: ${allBackends.map(b => b.id).join(', ') || '(none)'}`);
+  log.log(`[createConfigRepo] Replica backends: ${allBackends.map(b => b.id).join(', ') || '(none)'}`);
 
   // -------------------------------------------------------------------
   // Step 7: Determine nodeId
@@ -2020,7 +2023,7 @@ export async function createConfigRepo(
   let nodeId = options.nodeId;
   if (!nodeId) {
     nodeId = `node-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    console.log(`[createConfigRepo] Generated nodeId: ${nodeId}`);
+    log.log(`[createConfigRepo] Generated nodeId: ${nodeId}`);
   }
 
   // -------------------------------------------------------------------
@@ -2048,14 +2051,14 @@ export async function createConfigRepo(
   // monitoring for changes once the initial sync completes.
   // flush() and dispose() will await this if called before it finishes.
   if (repo.replicaCount > 0) {
-    console.log('[createConfigRepo] Starting background initial sync + dedup...');
+    log.log('[createConfigRepo] Starting background initial sync + dedup...');
     repo.startBackgroundSync();
   }
 
   // Sync to replicas in the background — watchers are already running,
   // so this just speeds up the initial push. Don't block the caller.
   repo.syncMetaToReplicas().catch((err) => {
-    console.error('[createConfigRepo] background syncMetaToReplicas failed:', err);
+    log.error('[createConfigRepo] background syncMetaToReplicas failed:', err);
   });
 
   return repo;

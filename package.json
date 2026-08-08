@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-config",
-  "version": "0.5.19",
+  "version": "0.5.20",
   "description": "Distributed config management library built on ZenFS, zen-fs-cache, and zen-fs-sync",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -45,6 +45,9 @@
     "@zenfs/dom": ">=1.0.0",
     "zen-fs-cache": ">=1.0.0",
     "zen-fs-sync": ">=0.4.7"
+  },
+  "dependencies": {
+    "@richard432/localstorage-logger": "^0.1.0"
   },
   "peerDependenciesMeta": {
     "@zenfs/dom": {

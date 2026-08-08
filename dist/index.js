@@ -485,6 +485,9 @@ registerBackend("IndexedDB", async (options) => {
   defaultOptions: { storeName: "" }
 });
 
+// src/config-repo.ts
+var import_localstorage_logger = require("@richard432/localstorage-logger");
+
 // src/version.ts
 function versionPathFor(configFilePath) {
   const lastSlash = configFilePath.lastIndexOf("/");
@@ -573,6 +576,7 @@ async function verifyOrRepairVersion(fs, configFilePath, author) {
 }
 
 // src/config-repo.ts
+var log = (0, import_localstorage_logger.createLogger)("zen-fs-config:config-repo");
 var META_DIR = "/.meta";
 var GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 var BACKENDS_FILE = `${META_DIR}/backends.json`;
@@ -688,7 +692,7 @@ var ConfigRepo = class {
     const bytes = this.serializer.serialize(data, fullPath);
     this.configCache.set(fullPath, data);
     this.persistConfig(fullPath, bytes).catch((err) => {
-      console.error(`[zen-fs-config] Failed to persist ${fullPath}:`, err);
+      log.error(`[zen-fs-config] Failed to persist ${fullPath}:`, err);
     });
   }
   // -----------------------------------------------------------------------
@@ -834,7 +838,7 @@ var ConfigRepo = class {
       } catch {
       }
     }
-    console.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+    log.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
     this.invalidateTombstoneCache();
     this.schedulePostDeleteSync();
   }
@@ -852,7 +856,7 @@ var ConfigRepo = class {
       this.postDeleteSyncTimer = void 0;
       if (this.disposed) return;
       this.syncEngine.syncAll().catch((err) => {
-        console.warn("[ConfigRepo] post-delete sync failed:", err);
+        log.warn("[ConfigRepo] post-delete sync failed:", err);
       });
     }, 500);
   }
@@ -904,11 +908,11 @@ var ConfigRepo = class {
     let alreadyDeleted = 0;
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
-      console.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? "null"}`);
+      log.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? "null"}`);
       const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
-      console.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) \u2192 ${existedOnPrimary}`);
+      log.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) \u2192 ${existedOnPrimary}`);
       if (existedOnPrimary) {
-        console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary \u2192 EXISTS`);
+        log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary \u2192 EXISTS`);
       }
       if (existedOnPrimary) {
         try {
@@ -919,7 +923,7 @@ var ConfigRepo = class {
       }
       if (tVersionPath) {
         const vExistedOnPrimary = await this.safeExists(this.cachedFS, tVersionPath);
-        console.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) \u2192 ${vExistedOnPrimary}`);
+        log.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) \u2192 ${vExistedOnPrimary}`);
         if (vExistedOnPrimary) {
           try {
             await this.cachedFS.unlink(tVersionPath);
@@ -928,40 +932,40 @@ var ConfigRepo = class {
         }
       }
       for (const [replicaId, replica] of this.replicaBackends) {
-        console.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
+        log.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
         const existed = await this.safeExists(replica.instance, tombstone.path);
-        console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) \u2192 ${existed}`);
+        log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) \u2192 ${existed}`);
         if (existed) {
-          console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} \u2192 EXISTS`);
+          log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} \u2192 EXISTS`);
           try {
-            console.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
+            log.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
             await replica.instance.unlink(tombstone.path);
-            console.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+            log.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
             processed++;
           } catch (err) {
-            console.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
+            log.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
             alreadyDeleted++;
           }
         } else {
-          console.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
+          log.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
           alreadyDeleted++;
         }
         if (tVersionPath) {
           const vExisted = await this.safeExists(replica.instance, tVersionPath);
-          console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) \u2192 ${vExisted}`);
+          log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) \u2192 ${vExisted}`);
           if (vExisted) {
             try {
-              console.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
+              log.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
               await replica.instance.unlink(tVersionPath);
             } catch (err) {
-              console.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
+              log.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
             }
           }
         }
       }
     }
     if (processed > 0 || alreadyDeleted > 0) {
-      console.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
+      log.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
     }
   }
   /**
@@ -977,21 +981,21 @@ var ConfigRepo = class {
       const innerBackendName = fs?.inner?.backendName;
       const directBackendName = fs?.backendName;
       const backendLabel = innerBackendName ?? directBackendName ?? innerBackend ?? ctorName;
-      console.log(`[TOMB-TRACE] safeExists(${path}): fs type=${ctorName} backend=${backendLabel} hasExists=${hasExists} hasStat=${hasStat} inner=${innerBackend ?? "N/A"}`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): fs type=${ctorName} backend=${backendLabel} hasExists=${hasExists} hasStat=${hasStat} inner=${innerBackend ?? "N/A"}`);
       if (hasExists) {
-        console.log(`[TOMB-TRACE] safeExists(${path}): \u2192 calling fs.exists() [backend=${backendLabel}]`);
+        log.log(`[TOMB-TRACE] safeExists(${path}): \u2192 calling fs.exists() [backend=${backendLabel}]`);
         const result = await fs.exists(path);
-        console.log(`[TOMB-TRACE] safeExists(${path}): \u2190 fs.exists() [backend=${backendLabel}] \u2192 ${result}`);
+        log.log(`[TOMB-TRACE] safeExists(${path}): \u2190 fs.exists() [backend=${backendLabel}] \u2192 ${result}`);
         return result;
       }
-      console.log(`[TOMB-TRACE] safeExists(${path}): no exists(), calling fs.stat() [backend=${backendLabel}]`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): no exists(), calling fs.stat() [backend=${backendLabel}]`);
       await fs.stat(path);
-      console.log(`[TOMB-TRACE] safeExists(${path}): \u2190 fs.stat() [backend=${backendLabel}] \u2192 OK (exists)`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): \u2190 fs.stat() [backend=${backendLabel}] \u2192 OK (exists)`);
       return true;
     } catch (err) {
       const errCode = err?.code ?? err?.status ?? "";
       const errName = err?.constructor?.name ?? "";
-      console.log(`[TOMB-TRACE] safeExists(${path}): \u2190 ERROR ${errName} ${errCode} ${err?.message ?? err}`);
+      log.log(`[TOMB-TRACE] safeExists(${path}): \u2190 ERROR ${errName} ${errCode} ${err?.message ?? err}`);
       return false;
     }
   }
@@ -1018,9 +1022,9 @@ var ConfigRepo = class {
    */
   startBackgroundSync() {
     this.initialSyncPromise = this.initialSyncAndDedup().then(() => {
-      console.log("[ConfigRepo] Background initial sync complete");
+      log.log("[ConfigRepo] Background initial sync complete");
     }).catch((err) => {
-      console.error("[ConfigRepo] Background initial sync failed:", err);
+      log.error("[ConfigRepo] Background initial sync failed:", err);
     }).finally(() => {
       this.initialSyncPromise = null;
     });
@@ -1048,7 +1052,7 @@ var ConfigRepo = class {
       } catch {
       }
     }
-    console.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+    log.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
     this.invalidateTombstoneCache();
   }
   /**
@@ -1080,7 +1084,7 @@ var ConfigRepo = class {
             }
           }
         }
-        console.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
+        log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
       }
     }
   }
@@ -1096,7 +1100,7 @@ var ConfigRepo = class {
     this.assertNotDisposed();
     const results = await this.flush();
     for (const result of results) {
-      console.log(
+      log.log(
         `[ConfigRepo] syncMetaToReplicas: ${result.pairId} +${result.filesCreated}/~${result.filesUpdated}/-${result.filesDeleted} skip:${result.filesSkipped} ${result.durationMs}ms`
       );
     }
@@ -1198,21 +1202,21 @@ var ConfigRepo = class {
   // Internal — Setup
   // -----------------------------------------------------------------------
   async setupSync(backends, primaryBackendId, pollIntervalMs) {
-    console.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? "default"}ms`);
+    log.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? "default"}ms`);
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
       if (desc.enabled === false) {
-        console.log(`[ConfigRepo] Skipping disabled replica: ${desc.id}`);
+        log.log(`[ConfigRepo] Skipping disabled replica: ${desc.id}`);
         continue;
       }
-      console.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
+      log.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
         let fsInstance = instance;
         if (this.cacheOptions) {
           const { wrapWithCache: wrapWithCache2 } = await Promise.resolve().then(() => (init_cache_wrapper(), cache_wrapper_exports));
           fsInstance = wrapWithCache2(instance, desc.id, this.cacheOptions);
-          console.log(`[ConfigRepo] Replica ${desc.id} wrapped with CachedFileSystem (store=${this.cacheOptions.storeType ?? "IdbCacheStore"})`);
+          log.log(`[ConfigRepo] Replica ${desc.id} wrapped with CachedFileSystem (store=${this.cacheOptions.storeType ?? "IdbCacheStore"})`);
         }
         const syncable = backendToSyncableFS(fsInstance, `${desc.type}(${desc.id})`);
         const pair = this.syncEngine.addPair(
@@ -1227,7 +1231,7 @@ var ConfigRepo = class {
                 this.invalidateTombstoneCache();
                 await this.processTombstones();
               } catch (err) {
-                console.warn("[ConfigRepo] preSyncHook processTombstones failed:", err);
+                log.warn("[ConfigRepo] preSyncHook processTombstones failed:", err);
               }
             },
             postSyncHook: async () => {
@@ -1236,7 +1240,7 @@ var ConfigRepo = class {
                 await this.processTombstones();
                 await this.updateTombstoneConfirmations();
               } catch (err) {
-                console.warn("[ConfigRepo] postSyncHook tombstone processing failed:", err);
+                log.warn("[ConfigRepo] postSyncHook tombstone processing failed:", err);
               }
             }
           },
@@ -1247,13 +1251,13 @@ var ConfigRepo = class {
           this.handleConflict(event);
         };
         this.syncEngine.on(pair.pairId, "conflict", conflictHandler);
-        console.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
+        log.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
       } catch (err) {
-        console.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
+        log.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
       }
     }
-    console.log(`[ConfigRepo] setupSync complete. Replicas:`, Array.from(this.replicaBackends.keys()));
-    console.log(`[ConfigRepo] Sync statuses:`, this.getSyncStatuses());
+    log.log(`[ConfigRepo] setupSync complete. Replicas:`, Array.from(this.replicaBackends.keys()));
+    log.log(`[ConfigRepo] Sync statuses:`, this.getSyncStatuses());
   }
   // -----------------------------------------------------------------------
   // Internal — Persistence
@@ -1365,7 +1369,7 @@ var ConfigRepo = class {
           await this.resolveConflict(`${conflictId}/meta.json`, customMerge);
         }
       } catch (err) {
-        console.error("[zen-fs-config] Conflict handler error:", err);
+        log.error("[zen-fs-config] Conflict handler error:", err);
       }
     }
   }
@@ -1464,11 +1468,11 @@ var ConfigRepo = class {
               }
               return { kind: "ok", desc, mtime };
             } else {
-              console.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+              log.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
               return { kind: "corrupt", filePath };
             }
           } catch (parseErr) {
-            console.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+            log.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
             return { kind: "corrupt", filePath };
           }
         })
@@ -1517,7 +1521,7 @@ var ConfigRepo = class {
         }
       }
       if (duplicates.length > 0) {
-        console.log(
+        log.log(
           `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(", ")}`
         );
         for (const dupId of duplicates) {
@@ -1620,7 +1624,7 @@ var ConfigRepo = class {
         `Backend "${id}" has the same configuration as existing backend "${dup.id}" (type=${type}). Use removeBackend("${dup.id}") first, or connect with the existing backend's ID.`
       );
     }
-    console.log(`[ConfigRepo] addBackend: creating ${id} (${type})...`);
+    log.log(`[ConfigRepo] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
     const desc = { id, type, options, description };
@@ -1636,7 +1640,7 @@ var ConfigRepo = class {
             this.invalidateTombstoneCache();
             await this.processTombstones();
           } catch (err) {
-            console.warn("[ConfigRepo] preSyncHook processTombstones failed:", err);
+            log.warn("[ConfigRepo] preSyncHook processTombstones failed:", err);
           }
         },
         postSyncHook: async () => {
@@ -1645,7 +1649,7 @@ var ConfigRepo = class {
             await this.processTombstones();
             await this.updateTombstoneConfirmations();
           } catch (err) {
-            console.warn("[ConfigRepo] postSyncHook tombstone processing failed:", err);
+            log.warn("[ConfigRepo] postSyncHook tombstone processing failed:", err);
           }
         }
       },
@@ -1656,7 +1660,7 @@ var ConfigRepo = class {
       this.handleConflict(event);
     };
     this.syncEngine.on(pair.pairId, "conflict", conflictHandler);
-    console.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
+    log.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
     await this.syncMetaToReplicas();
     this.syncEngine.watch(pair.pairId);
   }
@@ -1679,13 +1683,13 @@ var ConfigRepo = class {
         await this.removeBackendDescriptor(id);
       }
       this.syncEngine.removePair(replica.pairId);
-      console.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
+      log.log(`[ConfigRepo] removeBackend: sync pair ${replica.pairId} removed`);
       this.replicaBackends.delete(id);
       if (replica.instance?.dispose) {
         await replica.instance.dispose();
       }
     } else {
-      console.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
+      log.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
       try {
         await this.deleteFile(descPath);
       } catch {
@@ -1693,7 +1697,7 @@ var ConfigRepo = class {
       }
     }
     this.schedulePostDeleteSync();
-    console.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
+    log.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
   }
   // -----------------------------------------------------------------------
   // IConfigRepo — Group Type
@@ -1705,14 +1709,14 @@ var ConfigRepo = class {
       const existing = await this.cachedFS.readFile(GROUP_TYPE_FILE, "utf-8");
       const current = existing.trim();
       if (current && current !== type) {
-        console.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
+        log.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
         return;
       }
     } catch {
     }
     await this.ensureDir(GROUP_TYPE_FILE);
     await this.cachedFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode(type));
-    console.log(`[ConfigRepo] group-type set to "${type}"`);
+    log.log(`[ConfigRepo] group-type set to "${type}"`);
   }
   /** Read the group-type marker. Returns null if not set. */
   async getGroupType() {
@@ -1753,7 +1757,7 @@ var ConfigRepo = class {
     if (this.appDataGroups.has(id)) {
       throw new Error(`App data group "${id}" already exists. Use removeAppDataGroup() first.`);
     }
-    console.log(`[ConfigRepo] createAppDataGroup: creating "${id}" with ${backends.length} backend(s)`);
+    log.log(`[ConfigRepo] createAppDataGroup: creating "${id}" with ${backends.length} backend(s)`);
     const resolvedBackends = [];
     for (const desc of backends) {
       const mergedOptions = await this.resolveAppDataBackendOptions(desc);
@@ -1779,7 +1783,7 @@ var ConfigRepo = class {
     const version = await incrementVersion(this.fullFS, descPath, bytes, author);
     await this.writeVersionSidecar(descPath, version);
     this.appDataGroups.set(id, group);
-    console.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
+    log.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
     return group;
   }
   async getAppDataGroup(id) {
@@ -1838,7 +1842,7 @@ var ConfigRepo = class {
     } catch {
     }
     await this.unlinkVersionSidecar(this.cachedFS, descPath);
-    console.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
+    log.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
   }
   async listAccountBackends() {
     this.assertNotDisposed();
@@ -1903,15 +1907,15 @@ var AppDataGroupImpl = class {
           "/"
         );
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
-        console.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
+        log.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err) {
-        console.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
+        log.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
       }
     }
     try {
       await this.syncEngine.syncAll();
     } catch (err) {
-      console.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
+      log.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
     }
     this.syncEngine.watchAll();
   }
@@ -1927,7 +1931,7 @@ var AppDataGroupImpl = class {
     if (this.dataBackends.has(id)) {
       throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
     }
-    console.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
+    log.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
@@ -1943,11 +1947,11 @@ var AppDataGroupImpl = class {
     );
     const desc = { id, type, options, description };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
-    console.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
+    log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
     try {
       await this.syncEngine.sync(pair.pairId);
     } catch (err) {
-      console.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
+      log.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
     }
     this.syncEngine.watch(pair.pairId);
   }
@@ -1962,7 +1966,7 @@ var AppDataGroupImpl = class {
     if (backend.instance?.dispose) {
       await backend.instance.dispose();
     }
-    console.log(`[AppDataGroup:${this.groupId}] removeBackend: ${id} removed`);
+    log.log(`[AppDataGroup:${this.groupId}] removeBackend: ${id} removed`);
   }
   listBackends() {
     return Array.from(this.dataBackends.values()).map((b) => b.desc);
@@ -1988,7 +1992,7 @@ function toUint8Array(raw) {
 }
 async function createConfigRepo(appId, options = {}) {
   const idbStoreName = options.idbStoreName || `zen-fs-config-${appId}`;
-  console.log(`[createConfigRepo] Creating IndexedDB primary (store: ${idbStoreName})...`);
+  log.log(`[createConfigRepo] Creating IndexedDB primary (store: ${idbStoreName})...`);
   const primaryInstance = await createBackend({
     type: "IndexedDB",
     options: { storeName: idbStoreName }
@@ -1997,12 +2001,12 @@ async function createConfigRepo(appId, options = {}) {
   const cacheOptions = options.cache === false ? void 0 : options.cache ?? {};
   try {
     await primaryInstance.mkdir(META_DIR);
-    console.log(`[createConfigRepo] /.meta/ ready`);
+    log.log(`[createConfigRepo] /.meta/ ready`);
   } catch (err) {
     const msg = err.message || "";
     if (msg.includes("File exists") || msg.includes("EEXIST") || err.code === "EEXIST") {
     } else {
-      console.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
+      log.error(`[createConfigRepo] Failed to ensure /.meta/:`, err.message);
     }
   }
   try {
@@ -2011,10 +2015,10 @@ async function createConfigRepo(appId, options = {}) {
       await primaryInstance.readFile(`${META_DIR}/group-type`);
     } catch {
       await primaryInstance.writeFile(`${META_DIR}/group-type`, groupTypeBytes);
-      console.log(`[createConfigRepo] group-type set to "config-sync"`);
+      log.log(`[createConfigRepo] group-type set to "config-sync"`);
     }
   } catch (err) {
-    console.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
+    log.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
   }
   const tempRepo = new ConfigRepo(
     appId,
@@ -2028,11 +2032,11 @@ async function createConfigRepo(appId, options = {}) {
   );
   const oldBackendsMeta = await tempRepo.readMetaFile(BACKENDS_FILE);
   if (oldBackendsMeta && oldBackendsMeta.backends?.length > 0) {
-    console.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
+    log.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
     await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
     for (const desc of oldBackendsMeta.backends) {
       if (desc.id === LOCAL_IDB_BACKEND_ID || desc.type === "IndexedDB") {
-        console.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
+        log.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
         continue;
       }
       await tempRepo.writeBackendDescriptor(desc);
@@ -2050,7 +2054,7 @@ async function createConfigRepo(appId, options = {}) {
         }
       }
     }
-    console.log(`[createConfigRepo] Migration complete`);
+    log.log(`[createConfigRepo] Migration complete`);
   }
   let allBackends = await tempRepo.readAllBackendDescriptors();
   if (options.backendInfo) {
@@ -2068,19 +2072,19 @@ async function createConfigRepo(appId, options = {}) {
         type: options.backendInfo.type,
         options: options.backendInfo.options
       });
-      console.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
+      log.log(`[createConfigRepo] Added replica backend: ${replicaId} (${options.backendInfo.type})`);
       allBackends = [...allBackends, { id: replicaId, type: options.backendInfo.type, options: options.backendInfo.options }];
     } else if (dupConfig) {
-      console.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
+      log.log(`[createConfigRepo] Replica with same config already registered as "${dupConfig.id}", skipping`);
     } else {
-      console.log(`[createConfigRepo] Replica ${replicaId} already registered`);
+      log.log(`[createConfigRepo] Replica ${replicaId} already registered`);
     }
   }
-  console.log(`[createConfigRepo] Replica backends: ${allBackends.map((b) => b.id).join(", ") || "(none)"}`);
+  log.log(`[createConfigRepo] Replica backends: ${allBackends.map((b) => b.id).join(", ") || "(none)"}`);
   let nodeId = options.nodeId;
   if (!nodeId) {
     nodeId = `node-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    console.log(`[createConfigRepo] Generated nodeId: ${nodeId}`);
+    log.log(`[createConfigRepo] Generated nodeId: ${nodeId}`);
   }
   const serializer = createSerializerChain(options.serializer);
   const repo = new ConfigRepo(
@@ -2096,11 +2100,11 @@ async function createConfigRepo(appId, options = {}) {
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
   await repo.load();
   if (repo.replicaCount > 0) {
-    console.log("[createConfigRepo] Starting background initial sync + dedup...");
+    log.log("[createConfigRepo] Starting background initial sync + dedup...");
     repo.startBackgroundSync();
   }
   repo.syncMetaToReplicas().catch((err) => {
-    console.error("[createConfigRepo] background syncMetaToReplicas failed:", err);
+    log.error("[createConfigRepo] background syncMetaToReplicas failed:", err);
   });
   return repo;
 }
@@ -2109,31 +2113,15 @@ async function createConfigRepo(appId, options = {}) {
 var import_zen_fs_sync2 = require("zen-fs-sync");
 
 // src/logger.ts
-var isDebug = (() => {
-  if (typeof process !== "undefined" && process.env?.ZEN_FS_CONFIG_DEBUG) {
-    return true;
-  }
-  if (typeof localStorage !== "undefined") {
-    try {
-      return localStorage.getItem("ZEN_FS_CONFIG_DEBUG") === "1";
-    } catch {
-      return false;
-    }
-  }
-  return false;
-})();
-function createLogger(prefix) {
-  if (!isDebug) {
-    return () => {
-    };
-  }
-  return (...args) => {
-    console.log(`[${prefix}]`, ...args);
-  };
+var import_localstorage_logger2 = require("@richard432/localstorage-logger");
+var MODULE_PREFIX = "zen-fs-config";
+function createLogger2(prefix) {
+  const logger = (0, import_localstorage_logger2.createLogger)(`${MODULE_PREFIX}:${prefix}`);
+  return (...args) => logger.log(...args);
 }
 
 // src/data-sync-group.ts
-var log = createLogger("data-sync-group");
+var log2 = createLogger2("data-sync-group");
 var META_DIR2 = "/.meta";
 var GROUP_TYPE_FILE2 = `${META_DIR2}/group-type`;
 var BACKENDS_DIR2 = `${META_DIR2}/backends`;
@@ -2160,7 +2148,7 @@ var DataSyncGroup = class {
     if (this.dataBackends.has(id)) {
       throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
     }
-    log(`addBackend: creating ${id} (${type})...`);
+    log2(`addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
@@ -2175,12 +2163,12 @@ var DataSyncGroup = class {
     );
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc: { id, type, options, description } });
     this.syncEngine.watch(pair.pairId);
-    log(`addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
+    log2(`addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
     await this.saveBackendDescriptor(id, type, options, description);
     try {
       await this.syncEngine.sync(pair.pairId);
     } catch (err) {
-      log(`addBackend: initial sync failed for ${id}:`, err);
+      log2(`addBackend: initial sync failed for ${id}:`, err);
     }
   }
   /**
@@ -2201,7 +2189,7 @@ var DataSyncGroup = class {
       await this.localFS.unlink(`${BACKENDS_DIR2}/${id}.json`);
     } catch {
     }
-    log(`removeBackend: ${id} removed`);
+    log2(`removeBackend: ${id} removed`);
   }
   getSyncStatuses() {
     return this.syncEngine.getStatusAll();
@@ -2223,7 +2211,7 @@ var DataSyncGroup = class {
       }
     }
     this.dataBackends.clear();
-    log(`disposed`);
+    log2(`disposed`);
   }
   // -----------------------------------------------------------------------
   // Internal — used by the factory function
@@ -2281,7 +2269,7 @@ var DataSyncGroup = class {
 };
 async function createDataSyncGroup(appId, options = {}) {
   const groupId = `data-${appId}-${Date.now().toString(36)}`;
-  log(`createDataSyncGroup: appId=${appId} groupId=${groupId}`);
+  log2(`createDataSyncGroup: appId=${appId} groupId=${groupId}`);
   const localFS = await createBackend({
     type: "InMemory",
     options: { label: `data-sync-${appId}-${Date.now()}` }
@@ -2311,7 +2299,7 @@ async function createDataSyncGroup(appId, options = {}) {
           new TextEncoder().encode("data-sync")
         );
       } catch (writeErr) {
-        log(`Could not write group-type on remote: ${writeErr.message}`);
+        log2(`Could not write group-type on remote: ${writeErr.message}`);
       }
     }
     let remoteBackendDescs = [];
@@ -2356,15 +2344,15 @@ async function createDataSyncGroup(appId, options = {}) {
         const syncable = backendToSyncableFS(instance, `${rdesc.type}(${rdesc.id})`);
         group2._registerBackend(rdesc.id, instance, syncable, options.pollIntervalMs);
       } catch (err) {
-        log(`Failed to add remote backend ${rdesc.id}:`, err);
+        log2(`Failed to add remote backend ${rdesc.id}:`, err);
       }
     }
     try {
       await group2._syncAll();
     } catch (err) {
-      log(`Initial sync failed:`, err);
+      log2(`Initial sync failed:`, err);
     }
-    log(`createDataSyncGroup: ready with ${group2._backendCount} backend(s)`);
+    log2(`createDataSyncGroup: ready with ${group2._backendCount} backend(s)`);
     return group2;
   }
   const group = new DataSyncGroup(appId, groupId, localFS);
@@ -2372,28 +2360,28 @@ async function createDataSyncGroup(appId, options = {}) {
     await localFS.writeFile(GROUP_TYPE_FILE2, new TextEncoder().encode("data-sync"));
   } catch {
   }
-  log(`createDataSyncGroup: local-only group created`);
+  log2(`createDataSyncGroup: local-only group created`);
   return group;
 }
 
 // src/connect.ts
-var log2 = createLogger("connect");
+var log3 = createLogger2("connect");
 var META_DIR3 = "/.meta";
 var GROUP_TYPE_FILE3 = `${META_DIR3}/group-type`;
 async function detectGroupType(type, options) {
-  log2(`detectGroupType: connecting to ${type}...`);
+  log3(`detectGroupType: connecting to ${type}...`);
   const tempBackend = await createBackend({ type, options });
   try {
     const raw = await tempBackend.readFile(GROUP_TYPE_FILE3, "utf-8");
     const groupType = raw.trim();
     if (groupType === "config-sync" || groupType === "data-sync") {
-      log2(`detectGroupType: detected "${groupType}"`);
+      log3(`detectGroupType: detected "${groupType}"`);
       return groupType;
     }
-    log2(`detectGroupType: unknown group-type value "${groupType}", treating as null`);
+    log3(`detectGroupType: unknown group-type value "${groupType}", treating as null`);
     return null;
   } catch {
-    log2(`detectGroupType: no group-type file found (new backend)`);
+    log3(`detectGroupType: no group-type file found (new backend)`);
     return null;
   } finally {
     if (tempBackend?.dispose) {
@@ -2402,10 +2390,10 @@ async function detectGroupType(type, options) {
   }
 }
 async function connect(appId, options = {}) {
-  log2(`connect: appId=${appId}`);
+  log3(`connect: appId=${appId}`);
   if (!options.backendInfo) {
     const groupType2 = options.groupType ?? "config-sync";
-    log2(`connect: no backendInfo, using groupType="${groupType2}"`);
+    log3(`connect: no backendInfo, using groupType="${groupType2}"`);
     if (groupType2 === "data-sync") {
       const dataGroup = await createDataSyncGroup(appId, {});
       return { groupType: "data-sync", dataGroup };
@@ -2429,7 +2417,7 @@ async function connect(appId, options = {}) {
     groupType = detectedType;
   } else {
     groupType = options.groupType ?? "config-sync";
-    log2(`connect: new backend, using groupType="${groupType}"`);
+    log3(`connect: new backend, using groupType="${groupType}"`);
   }
   if (groupType === "data-sync") {
     const dataGroup = await createDataSyncGroup(appId, {
