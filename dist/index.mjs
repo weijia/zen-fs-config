@@ -1148,6 +1148,7 @@ var ConfigRepo = class {
   async unlinkVersionSidecar(fs, configPath) {
     const vPath = versionPathFor(configPath);
     if (!vPath) return;
+    if (!await this.safeExists(fs, vPath)) return;
     try {
       await fs.unlink(vPath);
     } catch {

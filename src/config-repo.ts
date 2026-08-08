@@ -922,7 +922,11 @@ export class ConfigRepo implements IConfigRepo {
   private async unlinkVersionSidecar(fs: any, configPath: string): Promise<void> {
     const vPath = versionPathFor(configPath);
     if (!vPath) return;
-    try { await fs.unlink(vPath); } catch { /* no version sidecar */ }
+    // Check existence before unlink — avoids wasteful DELETE requests
+    // on remote backends (RemoteStorage, Gitee, WebDAV) when the version
+    // sidecar was never created or already deleted on a previous cycle.
+    if (!(await this.safeExists(fs, vPath))) return;
+    try { await fs.unlink(vPath); } catch { /* race — removed between exists and unlink */ }
   }
 
   /** Read version sidecar (returns null for .version files). */
