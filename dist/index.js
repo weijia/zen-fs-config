@@ -904,9 +904,11 @@ var ConfigRepo = class {
     let alreadyDeleted = 0;
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
+      console.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? "null"}`);
       const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
+      console.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) \u2192 ${existedOnPrimary}`);
       if (existedOnPrimary) {
-        console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on primary \u2192 EXISTS`);
+        console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary \u2192 EXISTS`);
       }
       if (existedOnPrimary) {
         try {
@@ -915,36 +917,51 @@ var ConfigRepo = class {
         } catch {
         }
       }
-      if (tVersionPath && await this.safeExists(this.cachedFS, tVersionPath)) {
-        try {
-          await this.cachedFS.unlink(tVersionPath);
-        } catch {
+      if (tVersionPath) {
+        const vExistedOnPrimary = await this.safeExists(this.cachedFS, tVersionPath);
+        console.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) \u2192 ${vExistedOnPrimary}`);
+        if (vExistedOnPrimary) {
+          try {
+            await this.cachedFS.unlink(tVersionPath);
+          } catch {
+          }
         }
       }
       for (const [replicaId, replica] of this.replicaBackends) {
+        console.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
         const existed = await this.safeExists(replica.instance, tombstone.path);
+        console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) \u2192 ${existed}`);
         if (existed) {
-          console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on ${replicaId} \u2192 EXISTS`);
+          console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} \u2192 EXISTS`);
           try {
+            console.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
             await replica.instance.unlink(tombstone.path);
-            console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+            console.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
             processed++;
-          } catch {
+          } catch (err) {
+            console.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
             alreadyDeleted++;
           }
         } else {
+          console.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
           alreadyDeleted++;
         }
-        if (tVersionPath && await this.safeExists(replica.instance, tVersionPath)) {
-          try {
-            await replica.instance.unlink(tVersionPath);
-          } catch {
+        if (tVersionPath) {
+          const vExisted = await this.safeExists(replica.instance, tVersionPath);
+          console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) \u2192 ${vExisted}`);
+          if (vExisted) {
+            try {
+              console.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
+              await replica.instance.unlink(tVersionPath);
+            } catch (err) {
+              console.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
+            }
           }
         }
       }
     }
     if (processed > 0 || alreadyDeleted > 0) {
-      console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
+      console.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
     }
   }
   /**
@@ -954,13 +971,17 @@ var ConfigRepo = class {
   async safeExists(fs, path) {
     try {
       if (typeof fs.exists === "function") {
+        console.log(`[TOMB-TRACE] safeExists: calling fs.exists(${path})`);
         const result = await fs.exists(path);
+        console.log(`[TOMB-TRACE] safeExists: fs.exists(${path}) \u2192 ${result}`);
         return result;
       }
+      console.log(`[TOMB-TRACE] safeExists: no exists(), calling fs.stat(${path})`);
       await fs.stat(path);
+      console.log(`[TOMB-TRACE] safeExists: fs.stat(${path}) \u2192 OK (exists)`);
       return true;
     } catch (err) {
-      console.log(`[ConfigRepo] safeExists(${path}): threw ${err?.code ?? err?.status ?? ""} ${err?.message ?? err}`);
+      console.log(`[TOMB-TRACE] safeExists(${path}): threw ${err?.code ?? err?.status ?? ""} ${err?.message ?? err}`);
       return false;
     }
   }

@@ -491,49 +491,67 @@ export class ConfigRepo implements IConfigRepo {
 
     for (const tombstone of tombstones) {
       const tVersionPath = versionPathFor(tombstone.path);
+      console.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? 'null'}`);
 
       // Delete on primary (in case it was re-created)
       const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
+      console.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) → ${existedOnPrimary}`);
       if (existedOnPrimary) {
-        console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on primary → EXISTS`);
+        console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary → EXISTS`);
       }
       if (existedOnPrimary) {
         try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* race */ }
       }
-      if (tVersionPath && await this.safeExists(this.cachedFS, tVersionPath)) {
-        try { await this.cachedFS.unlink(tVersionPath); } catch { /* race */ }
+      if (tVersionPath) {
+        const vExistedOnPrimary = await this.safeExists(this.cachedFS, tVersionPath);
+        console.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) → ${vExistedOnPrimary}`);
+        if (vExistedOnPrimary) {
+          try { await this.cachedFS.unlink(tVersionPath); } catch { /* race */ }
+        }
       }
 
       // Delete on all replicas
       for (const [replicaId, replica] of this.replicaBackends) {
+        console.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
         // Check existence before unlink — avoids wasteful DELETE requests
         // on remote backends (RemoteStorage, Gitee, WebDAV) when the file
         // was already deleted on a previous sync cycle.
         const existed = await this.safeExists(replica.instance, tombstone.path);
+        console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) → ${existed}`);
         if (existed) {
-          console.log(`[ConfigRepo] tombstone check: ${tombstone.path} on ${replicaId} → EXISTS`);
+          console.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} → EXISTS`);
           try {
+            console.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
             await replica.instance.unlink(tombstone.path);
-            console.log(`[ConfigRepo] tombstone ${tombstone.path}: deleted on ${replicaId}`);
+            console.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
             processed++;
-          } catch {
+          } catch (err) {
+            console.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
             // race — file removed between exists and unlink
             alreadyDeleted++;
           }
         } else {
+          console.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
           alreadyDeleted++;
         }
-        if (tVersionPath && await this.safeExists(replica.instance, tVersionPath)) {
-          try {
-            await replica.instance.unlink(tVersionPath);
-          } catch { /* race */ }
+        if (tVersionPath) {
+          const vExisted = await this.safeExists(replica.instance, tVersionPath);
+          console.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) → ${vExisted}`);
+          if (vExisted) {
+            try {
+              console.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
+              await replica.instance.unlink(tVersionPath);
+            } catch (err) {
+              console.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
+            }
+          }
         }
       }
     }
 
     // Only log summary — per-file logs only appear for actual deletions
     if (processed > 0 || alreadyDeleted > 0) {
-      console.log(`[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
+      console.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
     }
   }
 
@@ -544,14 +562,18 @@ export class ConfigRepo implements IConfigRepo {
   private async safeExists(fs: any, path: string): Promise<boolean> {
     try {
       if (typeof fs.exists === 'function') {
+        console.log(`[TOMB-TRACE] safeExists: calling fs.exists(${path})`);
         const result = await fs.exists(path);
+        console.log(`[TOMB-TRACE] safeExists: fs.exists(${path}) → ${result}`);
         return result;
       }
       // Fallback: try stat() — if it throws, the file doesn't exist
+      console.log(`[TOMB-TRACE] safeExists: no exists(), calling fs.stat(${path})`);
       await fs.stat(path);
+      console.log(`[TOMB-TRACE] safeExists: fs.stat(${path}) → OK (exists)`);
       return true;
     } catch (err: any) {
-      console.log(`[ConfigRepo] safeExists(${path}): threw ${err?.code ?? err?.status ?? ''} ${err?.message ?? err}`);
+      console.log(`[TOMB-TRACE] safeExists(${path}): threw ${err?.code ?? err?.status ?? ''} ${err?.message ?? err}`);
       return false;
     }
   }
