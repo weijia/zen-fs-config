@@ -545,6 +545,78 @@ registerBackend('MyBackend', async (options) => {
 }, metadata);
 ```
 
+## 数据同步组 UI 管理工作流
+
+当应用需要同时管理配置同步和业务数据同步时，UI 应将两者分为独立的管理区域。以下是推荐的 UI 设计模式：
+
+### 配置同步区域（config-sync）
+
+- **已配置后端列表**：展示所有 config-sync 后端，显示类型、描述、同步状态徽章（同步中/已同步/已暂停/已断开），提供暂停/恢复、删除按钮
+- **添加后端表单**：
+  - 后端类型下拉选择（从 `listBackendMetadata()` 获取）
+  - **显示全部字段**（`BackendMetadata.fields`，包括账号字段和存储位置字段）
+  - 用 `defaultOptions` 预填各字段缺省值
+  - 调用 `repo.addBackend(id, type, options, description)`
+- config-sync 后端既同步配置本身，也作为 data-sync 后端的账号来源
+
+### 数据同步区域（data-sync）
+
+- **已配置后端列表**：展示所有 data-sync 后端，显示类型、描述、同步状态，提供删除、立即同步按钮
+- **添加后端表单**（关键差异）：
+  1. **先选择复用的账号后端**：下拉框从 `repo.listAccountBackends()` 获取已配置的 config-sync 后端列表（显示类型 + ID）
+  2. **只显示存储位置字段**：根据选中账号后端的类型，从 `BackendMetadata.fields` 中过滤掉 `accountFields` 中声明的字段，仅展示剩余的"存储位置字段"（如 repo、branch、rootPath、basePath）
+  3. **用 `defaultOptions` 中对应字段预填缺省值**：从 `defaultOptions` 中提取存储位置字段的值作为表单初始值
+  4. 调用 `group.addBackend(id, type, mergedOptions, description)`，其中 `mergedOptions` 由 `mergeAccountFields(type, accountBackend.options, storageFields)` 自动合并
+
+### 字段过滤逻辑
+
+```
+allFields = BackendMetadata.fields            // 如 [token, owner, repo, branch, baseUrl]
+accountFields = BackendMetadata.accountFields  // 如 ['token', 'owner']
+storageFields = allFields.filter(f => !accountFields.includes(f.key))  // 如 [repo, branch, baseUrl]
+storageDefaults = pick(defaultOptions, storageFields.map(f => f.key))  // 如 {repo:'', branch:'master', baseUrl:'...'}
+```
+
+### 多后端数据同步组示例
+
+```typescript
+// 一个数据同步组可以配置多个后端，数据自动在所有后端间双向同步
+const group = await repo.getAppDataGroup('retire-data');
+
+// 添加第一个后端：复用 config-sync 的 Gitee 账号
+const accountBackends = await repo.listAccountBackends();
+const giteeAccount = accountBackends.find(b => b.type === 'Gitee');
+const giteeMeta = getBackendMetadata('Gitee');
+const giteeStorageFields = giteeMeta.fields.filter(f => !giteeMeta.accountFields.includes(f.key));
+const giteeStorageDefaults = Object.fromEntries(
+  Object.entries(giteeMeta.defaultOptions).filter(([k]) => !giteeMeta.accountFields.includes(k))
+);
+// 用户填写 storageFields 表单后：
+const giteeOptions = mergeAccountFields('Gitee', giteeAccount.options, userFilledStorageFields);
+await group.addBackend('gitee-data', 'Gitee', giteeOptions, 'Gitee 数据同步');
+
+// 添加第二个后端：复用 config-sync 的 WebDAV 账号
+const webdavAccount = accountBackends.find(b => b.type === 'WebDAV');
+const webdavOptions = mergeAccountFields('WebDAV', webdavAccount.options, { rootPath: '/retire-data/' });
+await group.addBackend('webdav-data', 'WebDAV', webdavOptions, 'WebDAV 数据同步');
+```
+
+### 关键 API
+
+| API | 用途 |
+|---|---|
+| `listBackendMetadata()` | 获取所有已注册后端类型的元数据（含 fields、defaultOptions、accountFields） |
+| `getBackendMetadata(type)` | 获取指定后端类型的元数据 |
+| `getAccountFields(type)` | 获取指定后端类型的账号字段名列表 |
+| `mergeAccountFields(type, sourceOptions, targetOptions)` | 将源后端的账号字段合并到目标选项中（不覆盖已有字段） |
+| `repo.listAccountBackends()` | 列出所有 config-sync 后端（可作为 data-sync 的账号来源） |
+| `repo.createAppDataGroup(id, backends)` | 创建数据同步组 |
+| `repo.getAppDataGroup(id)` | 获取数据同步组实例 |
+| `repo.listAppDataGroups()` | 列出所有数据同步组 |
+| `group.addBackend(id, type, options, desc?)` | 向数据同步组添加后端 |
+| `group.removeBackend(id)` | 从数据同步组移除后端 |
+| `group.listBackends()` | 列出数据同步组中的所有后端 |
+
 ## 设计约束
 
 1. **IndexedDB 是唯一主后端**，不可移除（ID 固定为 `local-idb`）
