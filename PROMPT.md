@@ -62,7 +62,7 @@ zen-fs-cache 是一个通用缓存层，为所有远程后端提供透明的缓�
 
 | 后端 | 持久化的缓存 | 效果 |
 |---|---|---|
-| GiteeFS | `shaCache`（路径→blob SHA）、`contentCache`（路径→文件内容）、`mtimeCache`（路径→修改时间） | 页面刷新后从 IndexedDB 恢复，API tree SHA 不变的文件跳过重新拉取 |
+| GiteeFS | `shaCache`（路径→blob SHA）、`contentCache`（路径→文件内容）、`mtimeCache`（路径→修改时间）、`lastCommitSha`（分支 commit SHA） | 页面刷新后从 IndexedDB 恢复，API tree SHA 不变的文件跳过重新拉取，`shouldSync()` 通过比较 commit SHA 检测远端变更 |
 | RemoteStorage | `dirListingCache`（目录列表，从 localStorage 迁移到 IndexedDB）、`snapshot`（ETag 快照）、`rootEtag`、`mtimeCache` | 页面刷新后 `shouldSync()` 从 IndexedDB 恢复快照，root ETag 未变则跳过全量扫描 |
 
 ## 关键 API
@@ -226,7 +226,7 @@ registerBackend('GitHub', async (options) => {
 
 **安装**：`npm install zen-fs-gitee`
 
-GiteeFS 已实现 `getRevision()` 钩子（返回 Git blob SHA，零网络往返），并自动将 `shaCache`、`contentCache`、`mtimeCache` 持久化到 IndexedDB，实现跨会话热启动。
+GiteeFS 已内置实现 `getRevision()` 钩子（返回 Git blob SHA，零网络往返）和 `shouldSync()` 钩子（通过 `getLatestCommitSha()` 检测远端 commit 变更），并自动将 `shaCache`、`contentCache`、`mtimeCache`、`lastCommitSha` 持久化到 IndexedDB，实现跨会话热启动。`wrapZenFSFileSystem` 会自动透传 `shouldSync`，无需手动实现。
 
 **注册**：
 ```typescript
@@ -234,7 +234,8 @@ import { registerBackend, wrapZenFSFileSystem } from 'zen-fs-config';
 
 registerBackend('Gitee', async (options) => {
   const { Gitee } = await import('zen-fs-gitee');
-  const backend = wrapZenFSFileSystem({
+  // GiteeFS 内置 shouldSync() + getRevision()，wrapZenFSFileSystem 自动透传
+  return wrapZenFSFileSystem({
     backend: Gitee,
     token: options.token,
     owner: options.owner,
@@ -242,31 +243,6 @@ registerBackend('Gitee', async (options) => {
     branch: options.branch,
     baseUrl: options.baseUrl || undefined,
   });
-
-  // shouldSync：通过 tree SHA 检测远端变更
-  const { owner, repo, branch = 'master', token, baseUrl = 'https://gitee.com/api/v5' } = options;
-  const cacheKey = `zen-fs-gitee-sync:${owner}/${repo}/${branch}`;
-  (backend as any).shouldSync = async (): Promise<boolean> => {
-    try {
-      const base = baseUrl.replace(/\/$/, '');
-      const headers: Record<string, string> = {};
-      if (token) headers['Authorization'] = `token ${token}`;
-      const branchRes = await fetch(`${base}/repos/${owner}/${repo}/branches/${branch}`, { headers });
-      if (!branchRes.ok) return true;
-      const commitSha = (await branchRes.json())?.commit?.sha;
-      if (!commitSha) return true;
-      const commitRes = await fetch(`${base}/repos/${owner}/${repo}/git/commits/${commitSha}`, { headers });
-      if (!commitRes.ok) return true;
-      const treeSha = (await commitRes.json())?.tree?.sha;
-      if (!treeSha) return true;
-      const cached = localStorage.getItem(cacheKey);
-      if (cached === treeSha) return false;
-      localStorage.setItem(cacheKey, treeSha);
-      return true;
-    } catch { return true; }
-  };
-
-  return backend;
 }, {
   type: 'Gitee',
   label: 'Gitee',
@@ -424,7 +400,7 @@ registerBackend('WebStorage', async (options) => {
 | InMemory | `InMemory` | `@zenfs/core`（内置） | — | `maxSize`, `label` | — | — | — |
 | WebStorage | `WebStorage` | `@zenfs/dom`（内置） | — | `storageType` | — | — | — |
 | GitHub | `GitHub` | `zen-fs-github` | `token`, `owner` | `repo`, `branch` | ✅ tree SHA | — | — |
-| Gitee | `Gitee` | `zen-fs-gitee` | `token`, `owner` | `repo`, `branch` | ✅ tree SHA | ✅ blob SHA | ✅ content/SHA/mtime |
+| Gitee | `Gitee` | `zen-fs-gitee` | `token`, `owner` | `repo`, `branch` | ✅ commit SHA（内置） | ✅ blob SHA | ✅ content/SHA/mtime/commitSha |
 | WebDAV | `WebDAV` | 内置（fetch） | `url`, `username`, `password` | `rootPath` | — | — | — |
 | RemoteStorage | `RemoteStorage` | `zen-fs-remotestoragejs` | `href`, `token` | `basePath` | ✅ ETag | ✅ ETag | ✅ dirListing/snapshot/mtime |
 
