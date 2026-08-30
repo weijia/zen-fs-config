@@ -1,192 +1,197 @@
 # zen-fs-config
 
-基于 ZenFS 的分布式配置管理库。以 IndexedDB 为本地主后端（offline-first），用户提供的远程后端作为副本自动同步。支持应用隔离、共享空间、节点本地配置和冲突安全。
+Distributed configuration management library built on [ZenFS](https://github.com/weijia/zen-fs), with IndexedDB as the offline-first local primary backend and user-provided remote backends as replicas that sync automatically. Supports app isolation, shared spaces, node-local config, and conflict-safe operations.
 
 **GitHub**: https://github.com/weijia/zen-fs-config
 **NPM**: `zen-fs-config`
-**设计文档**: [DESIGN.md](./DESIGN.md)
+**Design doc**: [DESIGN.md](./DESIGN.md)
 
-## 安装
+## Features
+
+- **Offline-first** — IndexedDB is always the primary backend; reads and writes work without network
+- **Multi-backend sync** — Add any number of remote replicas (Gitee, GitHub, RemoteStorage, WebDAV, etc.) with automatic bi-directional sync
+- **App isolation** — Each app gets its own namespace under `/{appId}/`
+- **Shared spaces** — Cross-app shared config under `/shared/`
+- **Node-local config** — Per-device settings under `/nodes/{nodeId}/` that never sync
+- **Self-describing topology** — Backend configuration is stored as files in `.meta/backends/`, so re-opening a repo restores everything automatically
+- **Conflict safety** — Conflicts are archived instead of silently overwritten; JSON deep-merge is available as a strategy
+- **Version tracking** — Every config file has a version sidecar with version number and SHA-256 hash
+- **Caching layer** — Optional ETag/TTL caching via `zen-fs-cache` to reduce remote API calls
+
+## Installation
 
 ```bash
 npm install zen-fs-config @zenfs/core @zenfs/dom zen-fs-sync
 ```
 
-> `@zenfs/dom` 提供 IndexedDB 后端（浏览器环境必需）。`zen-fs-cache` 为可选依赖。
+> `@zenfs/dom` provides the IndexedDB backend (required in browser environments). `zen-fs-cache` is an optional dependency for remote request caching.
 
-## 快速开始
+## Quick Start
 
-### 1. 初始化（零参数）
+### 1. Initialize (zero-configuration)
 
 ```typescript
 import { createConfigRepo } from 'zen-fs-config';
 
-// 不传任何后端参数，自动创建 IndexedDB 本地主后端
+// Creates an IndexedDB primary backend automatically
 const repo = await createConfigRepo('my-app');
 
-// 读写配置（同步 API，从 IndexedDB 读取）
+// Read/write config (synchronous API, served from IndexedDB)
 repo.setConfig('/database', { host: 'localhost', port: 5432 });
 const db = repo.getConfig<{ host: string; port: number }>('/database');
 ```
 
-### 2. 设置新的配置
-
-```typescript
-repo.setConfig('/cache', { ttl: 3600, maxSize: '100MB' });
-repo.setConfig('/feature-flags', { newUI: true, beta: false });
-```
-
-### 3. 增加数据后端（副本）
+### 2. Add a remote replica backend
 
 ```typescript
 import { registerBackend } from 'zen-fs-config';
 import { Gitee } from 'zen-fs-gitee';
 
-// 注册后端类型
+// Register the backend type first
 registerBackend('Gitee', async (options) => {
   return Gitee.create(options);
 });
 
-// 动态添加副本后端，自动与本地 IndexedDB 双向同步
+// Dynamically add a replica — auto-syncs bi-directionally with local IndexedDB
 await repo.addBackend('gitee-prod', 'Gitee', {
   token: 'your-token',
   owner: 'your-name',
   repo: 'config-repo',
   branch: 'main',
-}, '生产环境 Gitee 配置仓库');
+}, 'Production Gitee config repo');
 ```
 
-### 4. 自动同步
+### 3. Automatic sync
 
 ```typescript
-// setConfig 写入 IndexedDB 后，自动同步到所有副本后端
+// Writing to IndexedDB triggers auto-sync to all replicas
 repo.setConfig('/database', { host: 'new-host', port: 5432 });
 
-// 手动触发同步（通常不需要，同步是自动的）
+// Manual flush (usually not needed — sync is automatic)
 await repo.flush();
 ```
 
-### 5. 再次打开时初始化
+### 4. Re-open on next page load
 
 ```typescript
-// 重新打开页面时，只需传入 appId
-// IndexedDB 中的配置和后端拓扑会自动恢复
+// Just pass the appId — IndexedDB restores everything
 const repo = await createConfigRepo('my-app');
 
-// 配置直接从 IndexedDB 读取（离线可用）
+// Config is readable immediately (offline)
 const db = repo.getConfig<{ host: string; port: number }>('/database');
 
-// 已注册的副本后端会自动重新连接并同步
+// Registered replicas reconnect and sync automatically
 const backends = await repo.getBackends();
 console.log(backends?.backends.map(b => b.id)); // ['local-idb', 'gitee-prod', ...]
 ```
 
-### 带初始后端初始化
+### Initialize with a backend from the start
 
 ```typescript
-// 首次初始化时可以直接传入远程后端
 const repo = await createConfigRepo('my-app', {
-  primaryBackendId: 'gitee-prod',  // 副本后端 ID
+  primaryBackendId: 'gitee-prod',
   backendInfo: {
     type: 'Gitee',
     options: { token: 'xxx', owner: 'xxx', repo: 'xxx', branch: 'main' },
   },
-  idbStoreName: 'my-app-config',  // 自定义 IndexedDB store 名称
+  idbStoreName: 'my-app-config', // custom IndexedDB store name
 });
 
-// 之后重新打开时不需要再传后端参数
+// Next time you don't need to pass backend info again
 const repo2 = await createConfigRepo('my-app');
 ```
 
-## 目录结构
+## Directory Structure
 
 ```
 /
-├── {appId}/              # 应用私有配置（自动同步到副本）
-├── shared/               # 跨应用共享配置（双向同步）
-├── nodes/{nodeId}/       # 节点本地配置（不同步）
+├── {appId}/              # App-private config (auto-synced to replicas)
+├── shared/               # Cross-app shared config (bi-directional sync)
+├── nodes/{nodeId}/       # Node-local config (never synced)
 └── .meta/
-    ├── backends/          # 后端拓扑（每个后端一个文件）
+    ├── backends/          # Backend topology (one file per backend)
     │   ├── local-idb.json
     │   ├── gitee-prod.json
     │   └── ...
-    ├── .deleted/          # 删除墓碑（跨后端删除传播）
-    └── .conflicts/        # 冲突归档（双方内容都保存）
+    ├── .deleted/          # Deletion tombstones (propagate deletes across backends)
+    └── .conflicts/        # Conflict archives (both sides preserved)
 ```
 
-每个配置文件有 sidecar 版本文件：`db.json` → `.db.json.version`（版本号 + SHA-256 哈希）。
+Each config file has a sidecar version file: `db.json` → `.db.json.version` (version number + SHA-256 hash).
 
-## 核心 API
+## Core API
 
-| 方法 | 说明 |
-|---|---|
-| `createConfigRepo(appId, options?)` | 创建配置仓库。IndexedDB 始终为主后端，`backendInfo` 作为副本 |
-| `getConfig<T>(path)` | 同步读取应用配置（从 IndexedDB） |
-| `setConfig(path, data)` | 同步写入应用配置（异步持久化 + 自动同步） |
-| `addBackend(id, type, options, desc?)` | 动态添加副本后端，自动建立双向同步 |
-| `removeBackend(id)` | 移除副本后端，停止同步 |
-| `getBackends()` | 读取所有后端拓扑（从 `.meta/backends/*.json` 聚合） |
-| `getNodeConfig<T>(nodeId, path)` | 异步读取节点本地配置 |
-| `setNodeConfig(nodeId, path, data)` | 异步写入节点本地配置（不同步） |
-| `publishNodeConfig(nodeId)` | 将节点配置一次性同步到所有后端 |
-| `peekNodeConfig<T>(nodeId, path)` | 只读查看其他节点的已发布配置 |
-| `flush()` | 手动触发所有同步 |
-| `listConflicts()` | 列出所有冲突归档 |
-| `resolveConflict(id, merged)` | 用合并内容解决冲突 |
-| `fs.promises.*` | 标准 fs API，chroot 隔离到 `/{appId}/` |
-| `dispose()` | 停止同步、释放资源 |
+### ConfigRepo
 
-## 后端注册
+| Method | Description |
+|--------|-------------|
+| `createConfigRepo(appId, options?)` | Create a config repo. IndexedDB is always primary; `backendInfo` becomes a replica. |
+| `getConfig<T>(path)` | Synchronously read app config (from IndexedDB) |
+| `setConfig(path, data)` | Synchronously write app config (async persistence + auto-sync) |
+| `addBackend(id, type, options, desc?)` | Dynamically add a replica backend with auto bi-directional sync |
+| `removeBackend(id)` | Remove a replica backend and stop syncing |
+| `getBackends()` | Read backend topology (aggregated from `.meta/backends/*.json`) |
+| `getNodeConfig<T>(nodeId, path)` | Asynchronously read node-local config |
+| `setNodeConfig(nodeId, path, data)` | Asynchronously write node-local config (not synced) |
+| `publishNodeConfig(nodeId)` | One-time push of node config to all backends |
+| `peekNodeConfig<T>(nodeId, path)` | Read-only view of another node's published config |
+| `flush()` | Manually trigger all pending syncs |
+| `listConflicts()` | List all archived conflicts |
+| `resolveConflict(id, merged)` | Resolve a conflict with merged content |
+| `fs.promises.*` | Standard fs API, chrooted to `/{appId}/` |
+| `dispose()` | Stop syncing and release resources |
 
-zen-fs-config 内置两个后端：
-- **IndexedDB** — 本地主后端（基于 `@zenfs/dom`），无需注册
-- **InMemory** — 内存后端（基于 `@zenfs/core`），用于测试
+### Backend Registration
 
-注册自定义后端：
+zen-fs-config includes two built-in backends:
+- **IndexedDB** — local primary backend (based on `@zenfs/dom`), no registration needed
+- **InMemory** — in-memory backend (based on `@zenfs/core`), useful for testing
+
+Register custom backends:
 
 ```typescript
 import { registerBackend } from 'zen-fs-config';
 
-// 注册 Gitee 后端
+// Register Gitee backend
 registerBackend('Gitee', async (options) => {
   const { Gitee } = await import('zen-fs-gitee');
   return Gitee.create(options);
 });
 
-// 注册 S3 后端
-registerBackend('S3Bucket', async (options) => {
-  const { S3Bucket } = await import('@zenfs/core');
-  return S3Bucket.create(options);
+// Register RemoteStorage backend
+registerBackend('RemoteStorage', async (options) => {
+  const { createRemoteStorageFileSystem } = await import('zen-fs-remotestoragejs');
+  return createRemoteStorageFileSystem(options);
 });
 ```
 
-## 架构概览
+## Architecture
 
 ```
 Application code
     ↓ (reads/writes via standard fs API)
-ConfigRepo (this library)
+ConfigRepo
     ├─ IndexedDB (local primary, always)
     │   └─ All config operations target IndexedDB first
     └─ zen-fs-sync → Bi-directional sync
-        ├─ Replica X (e.g., Gitee)
-        ├─ Replica Y (e.g., S3)
-        └─ Replica Z (e.g., RemoteStorage)
+        ├─ Replica 1 (e.g. Gitee)
+        ├─ Replica 2 (e.g. RemoteStorage)
+        └─ Replica 3 (e.g. GitHub)
 ```
 
-- **IndexedDB 是唯一的主后端**：所有读写操作直接操作 IndexedDB，保证离线可用
-- **远程后端是副本**：通过 `addBackend()` 或 `createConfigRepo({ backendInfo })` 添加
-- **自动同步**：对 IndexedDB 的修改会自动同步到所有副本后端
-- **自描述拓扑**：后端配置存储在 `.meta/backends/` 目录中，每个后端一个 JSON 文件
+- **IndexedDB is the only primary backend** — all reads and writes go directly to IndexedDB, guaranteeing offline availability
+- **Remote backends are replicas** — added via `addBackend()` or `createConfigRepo({ backendInfo })`
+- **Auto-sync** — changes to IndexedDB automatically propagate to all replicas
+- **Self-describing topology** — backend configuration lives in `.meta/backends/`, one JSON file per backend
 
-## 依赖
+## Dependencies
 
-| 包 | 说明 | 必需 |
-|---|---|---|
-| `@zenfs/core >=2.3.0` | ZenFS 虚拟文件系统 | 是 |
-| `@zenfs/dom >=1.0.0` | IndexedDB 后端（浏览器） | 是（浏览器） |
-| `zen-fs-sync >=0.1.0` | 跨后端同步引擎 | 是 |
-| `zen-fs-cache >=1.0.0` | ETag/TTL 缓存层 | 否（可选） |
+| Package | Description | Required |
+|---------|-------------|----------|
+| `@zenfs/core >=2.3.0` | ZenFS virtual file system | Yes |
+| `@zenfs/dom >=1.0.0` | IndexedDB backend (browser) | Yes (browser) |
+| `zen-fs-sync >=0.4.7` | Cross-backend sync engine | Yes |
+| `zen-fs-cache >=1.0.0` | ETag/TTL caching layer | No (optional) |
 
 ## License
 
