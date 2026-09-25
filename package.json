@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-config",
-  "version": "0.5.22",
+  "version": "0.5.23",
   "description": "Distributed config management library built on ZenFS, zen-fs-cache, and zen-fs-sync",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -19,7 +19,9 @@
     "DESIGN.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "build": "tsup",
+    "build:npm": "tsup --format cjs,esm --dts",
+    "build:browser": "tsup --format iife --global-name ZenFSConfig --platform browser --no-external /./ --out-extension .js=.browser.js",
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",

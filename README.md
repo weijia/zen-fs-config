@@ -26,6 +26,28 @@ npm install zen-fs-config @zenfs/core @zenfs/dom zen-fs-sync
 
 > `@zenfs/dom` provides the IndexedDB backend (required in browser environments). `zen-fs-cache` is an optional dependency for remote request caching.
 
+## Usage via `<script>` tag (no build step)
+
+A self-contained browser bundle is published at `dist/index.browser.js`. It bundles **all** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page:
+
+```html
+<script src="https://unpkg.com/zen-fs-config/dist/index.browser.js"></script>
+<script>
+  (async () => {
+    const { createConfigRepo } = window.ZenFSConfig;
+
+    // IndexedDB primary backend is created automatically
+    const repo = await createConfigRepo('my-app');
+
+    repo.setConfig('greeting.json', { msg: 'hello' });
+    const cfg = await repo.getConfig('greeting.json');
+    console.log(cfg); // { msg: 'hello' }
+  })();
+</script>
+```
+
+> The browser bundle includes a pure-JS SHA-256 fallback, so version tracking works even in non-secure contexts (plain HTTP) where `crypto.subtle` is unavailable.
+
 ## Quick Start
 
 ### 1. Initialize (zero-configuration)

@@ -14,6 +14,28 @@ npm install zen-fs-config @zenfs/core @zenfs/dom zen-fs-sync
 
 > `@zenfs/dom` 提供 IndexedDB 后端（浏览器环境必需）。`zen-fs-cache` 为可选依赖。
 
+## 通过 `<script>` 标签直接使用（无需构建）
+
+包内置了一个自包含的浏览器构建 `dist/index.browser.js`，它把**所有**依赖（`@zenfs/core`、`@zenfs/dom`、`zen-fs-sync`、`zen-fs-cache`）打包在一起，并将库挂载到全局变量 `window.ZenFSConfig`。无需 npm install、无需打包工具，直接放入任意 HTML 页面即可：
+
+```html
+<script src="https://unpkg.com/zen-fs-config/dist/index.browser.js"></script>
+<script>
+  (async () => {
+    const { createConfigRepo } = window.ZenFSConfig;
+
+    // 自动创建 IndexedDB 主后端
+    const repo = await createConfigRepo('my-app');
+
+    repo.setConfig('greeting.json', { msg: 'hello' });
+    const cfg = await repo.getConfig('greeting.json');
+    console.log(cfg); // { msg: 'hello' }
+  })();
+</script>
+```
+
+> 浏览器构建包含纯 JS 实现的 SHA-256 回退，因此即使在 `crypto.subtle` 不可用的非安全上下文（普通 HTTP）中，版本追踪也能正常工作。
+
 ## 快速开始
 
 ### 1. 初始化（零参数）
