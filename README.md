@@ -28,10 +28,10 @@ npm install zen-fs-config @zenfs/core @zenfs/dom zen-fs-sync
 
 ## Usage via `<script>` tag (no build step)
 
-A self-contained browser bundle is published at `dist/index.browser.js`. It bundles **all** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page:
+A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bundles **all** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page:
 
 ```html
-<script src="https://unpkg.com/zen-fs-config/dist/index.browser.js"></script>
+<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
 <script>
   (async () => {
     const { createConfigRepo } = window.ZenFSConfig;

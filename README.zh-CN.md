@@ -16,10 +16,10 @@ npm install zen-fs-config @zenfs/core @zenfs/dom zen-fs-sync
 
 ## 通过 `<script>` 标签直接使用（无需构建）
 
-包内置了一个自包含的浏览器构建 `dist/index.browser.js`，它把**所有**依赖（`@zenfs/core`、`@zenfs/dom`、`zen-fs-sync`、`zen-fs-cache`）打包在一起，并将库挂载到全局变量 `window.ZenFSConfig`。无需 npm install、无需打包工具，直接放入任意 HTML 页面即可：
+包内置了一个自包含的浏览器构建 `dist/zen-fs-config.js`，它把**所有**依赖（`@zenfs/core`、`@zenfs/dom`、`zen-fs-sync`、`zen-fs-cache`）打包在一起，并将库挂载到全局变量 `window.ZenFSConfig`。无需 npm install、无需打包工具，直接放入任意 HTML 页面即可：
 
 ```html
-<script src="https://unpkg.com/zen-fs-config/dist/index.browser.js"></script>
+<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
 <script>
   (async () => {
     const { createConfigRepo } = window.ZenFSConfig;

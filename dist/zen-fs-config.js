@@ -24748,8 +24748,8 @@ var ZenFSConfig = (() => {
   });
 
   // src/index.ts
-  var index_exports = {};
-  __export(index_exports, {
+  var src_exports = {};
+  __export(src_exports, {
     ConfigRepo: () => ConfigRepo,
     DataSyncGroup: () => DataSyncGroup,
     LOCAL_IDB_BACKEND_ID: () => LOCAL_IDB_BACKEND_ID,
@@ -28445,7 +28445,7 @@ var ZenFSConfig = (() => {
     });
     return { groupType: "config-sync", repo };
   }
-  return __toCommonJS(index_exports);
+  return __toCommonJS(src_exports);
 })();
 /*! Bundled license information:
 

@@ -12,7 +12,7 @@ export default defineConfig([
   // can be loaded directly via <script src="..."> in any HTML page.
   // Exposes the library on window.ZenFSConfig.
   {
-    entry: ['src/index.ts'],
+    entry: { 'zen-fs-config': 'src/index.ts' },
     format: ['iife'],
     globalName: 'ZenFSConfig',
     platform: 'browser',
@@ -22,7 +22,8 @@ export default defineConfig([
     // Avoid splitting so we get exactly one .js file
     splitting: false,
     clean: false,
-    outExtension: () => ({ js: '.browser.js' }),
+    // Output as dist/zen-fs-config.js (no .global suffix)
+    outExtension: () => ({ js: '.js' }),
     // Drop Node.js-only references; browser-safe fallbacks exist in code
     define: {
       'process.env.NODE_ENV': '"production"',
