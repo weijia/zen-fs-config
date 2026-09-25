@@ -97,13 +97,19 @@ export type { PathAwareSerializer };
 /**
  * Map a config key to a file path.
  *
- * - `/db/host` → `/db/host.json` (append .json if no extension)
- * - `/readme.md` → `/readme.md` (preserve existing extension)
+ * Always returns a path with a leading `/` so that callers can safely
+ * concatenate it with a directory prefix (e.g. `/${appId}${filePath}`).
+ *
+ * - `db/host`     → `/db/host.json` (append .json if no extension)
+ * - `/readme.md`  → `/readme.md`   (preserve existing extension)
+ * - `notes`       → `/notes.json`
  */
 export function configKeyToFilePath(configPath: string): string {
-  const ext = getExtension(configPath);
-  if (ext !== '') return configPath;
-  return configPath.endsWith('/') ? configPath : `${configPath}.json`;
+  let p = configPath;
+  if (!p.startsWith('/')) p = '/' + p;
+  const ext = getExtension(p);
+  if (ext !== '') return p;
+  return p.endsWith('/') ? p : `${p}.json`;
 }
 
 /**

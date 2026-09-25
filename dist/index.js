@@ -144,9 +144,11 @@ function createSerializerChain(custom) {
   };
 }
 function configKeyToFilePath(configPath) {
-  const ext = getExtension(configPath);
-  if (ext !== "") return configPath;
-  return configPath.endsWith("/") ? configPath : `${configPath}.json`;
+  let p = configPath;
+  if (!p.startsWith("/")) p = "/" + p;
+  const ext = getExtension(p);
+  if (ext !== "") return p;
+  return p.endsWith("/") ? p : `${p}.json`;
 }
 function getExtension(path) {
   const lastSlash = path.lastIndexOf("/");
@@ -262,6 +264,20 @@ async function ensureParentDir(absolutePath) {
 }
 
 // src/adapters.ts
+function toUint8Array(data) {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (typeof data === "string") return new TextEncoder().encode(data);
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return new Uint8Array(data);
+}
+function toString(data, encoding) {
+  if (typeof data === "string") return data;
+  const bytes = toUint8Array(data);
+  return new TextDecoder().decode(bytes);
+}
 function backendToSyncableFS(backend, name) {
   const syncable = {
     async readdir(path) {
@@ -270,15 +286,9 @@ function backendToSyncableFS(backend, name) {
     async readFile(path, encoding) {
       const result = await backend.readFile(path, encoding);
       if (encoding) {
-        if (typeof result === "string") return result;
-        if (result instanceof Uint8Array) return new TextDecoder().decode(result);
-        if (Buffer.isBuffer(result)) return result.toString(encoding);
-        return String(result);
+        return toString(result, encoding);
       }
-      if (typeof result === "string") return Buffer.from(result);
-      if (result instanceof Uint8Array) return Buffer.from(result);
-      if (Buffer.isBuffer(result)) return result;
-      return Buffer.from(String(result));
+      return toUint8Array(result);
     },
     async writeFile(path, data) {
       return backend.writeFile(path, data);
@@ -499,20 +509,150 @@ function versionPathFor(configFilePath) {
   const versionFileName = fileName.startsWith(".") ? `${fileName}.version` : `.${fileName}.version`;
   return dir ? `${dir}/${versionFileName}` : versionFileName;
 }
+function sha256PureJS(data) {
+  const K = new Uint32Array([
+    1116352408,
+    1899447441,
+    3049323471,
+    3921009573,
+    961987163,
+    1508970993,
+    2453635748,
+    2870763221,
+    3624381080,
+    310598401,
+    607225278,
+    1426881987,
+    1925078388,
+    2162078206,
+    2614888103,
+    3248222580,
+    3835390401,
+    4022224774,
+    264347078,
+    604807628,
+    770255983,
+    1249150122,
+    1555081692,
+    1996064986,
+    2554220882,
+    2821834349,
+    2952996808,
+    3210313671,
+    3336571891,
+    3584528711,
+    113926993,
+    338241895,
+    666307205,
+    773529912,
+    1294757372,
+    1396182291,
+    1695183700,
+    1986661051,
+    2177026350,
+    2456956037,
+    2730485921,
+    2820302411,
+    3259730800,
+    3345764771,
+    3516065817,
+    3600352804,
+    4094571909,
+    275423344,
+    430227734,
+    506948616,
+    659060556,
+    883997877,
+    958139571,
+    1322822218,
+    1537002063,
+    1747873779,
+    1955562222,
+    2024104815,
+    2227730452,
+    2361852424,
+    2428436474,
+    2756734187,
+    3204031479,
+    3329325298
+  ]);
+  const H = new Uint32Array([
+    1779033703,
+    3144134277,
+    1013904242,
+    2773480762,
+    1359893119,
+    2600822924,
+    528734635,
+    1541459225
+  ]);
+  const len = data.length;
+  const bitLen = len * 8;
+  const padLen = (len + 8 >> 6 << 6) + 64;
+  const buf = new Uint8Array(padLen);
+  buf.set(data);
+  buf[len] = 128;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(padLen - 4, bitLen >>> 0, false);
+  dv.setUint32(padLen - 8, Math.floor(bitLen / 4294967296) >>> 0, false);
+  const W = new Uint32Array(64);
+  for (let i = 0; i < padLen; i += 64) {
+    for (let t = 0; t < 16; t++) {
+      W[t] = dv.getUint32(i + t * 4, false);
+    }
+    for (let t = 16; t < 64; t++) {
+      const s0 = (W[t - 15] >>> 7 | W[t - 15] << 25) ^ (W[t - 15] >>> 18 | W[t - 15] << 14) ^ W[t - 15] >>> 3;
+      const s1 = (W[t - 2] >>> 17 | W[t - 2] << 15) ^ (W[t - 2] >>> 19 | W[t - 2] << 13) ^ W[t - 2] >>> 10;
+      W[t] = W[t - 16] + s0 + W[t - 7] + s1 >>> 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let t = 0; t < 64; t++) {
+      const S1 = (e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7);
+      const ch = e & f ^ ~e & g;
+      const temp1 = h + S1 + ch + K[t] + W[t] >>> 0;
+      const S0 = (a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10);
+      const maj = a & b ^ a & c ^ b & c;
+      const temp2 = S0 + maj >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = d + temp1 >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = temp1 + temp2 >>> 0;
+    }
+    H[0] = H[0] + a >>> 0;
+    H[1] = H[1] + b >>> 0;
+    H[2] = H[2] + c >>> 0;
+    H[3] = H[3] + d >>> 0;
+    H[4] = H[4] + e >>> 0;
+    H[5] = H[5] + f >>> 0;
+    H[6] = H[6] + g >>> 0;
+    H[7] = H[7] + h >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const outDv = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) outDv.setUint32(i * 4, H[i], false);
+  return out;
+}
 async function sha256(data) {
   const buffer = data.byteLength === data.buffer.byteLength ? data.buffer : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-  if (typeof crypto !== "undefined" && typeof crypto.subtle?.digest === "function") {
-    const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  const webCrypto = globalThis.crypto;
+  if (webCrypto && typeof webCrypto.subtle?.digest === "function") {
+    const hashBuffer = await webCrypto.subtle.digest("SHA-256", buffer);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const hex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-    return `sha256:${hex}`;
+    const hex2 = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+    return `sha256:${hex2}`;
   }
   if (typeof globalThis.window === "undefined") {
     const nodeCrypto = await new Function("return import('node:crypto')")();
     const hash = nodeCrypto.createHash("sha256").update(Buffer.from(buffer)).digest("hex");
     return `sha256:${hash}`;
   }
-  throw new Error("SHA-256 not available: neither Web Crypto nor Node.js crypto module found");
+  const digest = sha256PureJS(data);
+  const hex = Array.from(digest).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `sha256:${hex}`;
 }
 async function readVersion(fs, versionFilePath) {
   try {
@@ -553,7 +693,7 @@ async function verifyOrRepairVersion(fs, configFilePath, author) {
       data = new TextEncoder().encode(content);
     } else if (content instanceof Uint8Array) {
       data = content;
-    } else if (Buffer.isBuffer(content)) {
+    } else if (typeof Buffer !== "undefined" && Buffer.isBuffer(content)) {
       data = new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
     } else {
       data = new Uint8Array(content);
@@ -704,7 +844,7 @@ var ConfigRepo = class {
     const fullPath = `${NODES_DIR}/${nodeId}${filePath}`;
     try {
       const raw = await this.cachedFS.readFile(fullPath);
-      return this.serializer.deserialize(toUint8Array(raw), fullPath);
+      return this.serializer.deserialize(toUint8Array2(raw), fullPath);
     } catch {
       throw new Error(`Node config not found: ${nodeId}${path}`);
     }
@@ -781,7 +921,7 @@ var ConfigRepo = class {
     const fullPath = `${NODES_DIR}/${nodeId}${filePath}`;
     try {
       const raw = await this.cachedFS.readFile(fullPath);
-      return this.serializer.deserialize(toUint8Array(raw), fullPath);
+      return this.serializer.deserialize(toUint8Array2(raw), fullPath);
     } catch {
       throw new Error(`Node config not found: ${nodeId}${path}`);
     }
@@ -875,7 +1015,7 @@ var ConfigRepo = class {
         if (!entry.endsWith(".json")) continue;
         try {
           const raw = await this.cachedFS.readFile(`${DELETIONS_DIR}/${entry}`);
-          const data = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          const data = JSON.parse(new TextDecoder().decode(toUint8Array2(raw)));
           tombstones.push(data);
         } catch {
         }
@@ -1118,7 +1258,7 @@ var ConfigRepo = class {
     try {
       const raw = await this.cachedFS.readFile(metaPath);
       const archive = JSON.parse(
-        new TextDecoder().decode(toUint8Array(raw))
+        new TextDecoder().decode(toUint8Array2(raw))
       );
       const configPath = archive.conflictPath;
       const bytes = this.serializer.serialize(mergedContent, configPath);
@@ -1154,7 +1294,7 @@ var ConfigRepo = class {
         try {
           const raw = await this.cachedFS.readFile(metaPath);
           const archive = JSON.parse(
-            new TextDecoder().decode(toUint8Array(raw))
+            new TextDecoder().decode(toUint8Array2(raw))
           );
           archives.push(archive);
         } catch {
@@ -1169,7 +1309,7 @@ var ConfigRepo = class {
     const conflictDir = `${CONFLICTS_DIR}/${conflictId}`.replace(/\/meta\.json$/, "");
     const filePath = `${conflictDir}/${fileType}`;
     const raw = await this.cachedFS.readFile(filePath);
-    return new TextDecoder().decode(toUint8Array(raw));
+    return new TextDecoder().decode(toUint8Array2(raw));
   }
   // -----------------------------------------------------------------------
   // IConfigRepo — Lifecycle
@@ -1300,7 +1440,7 @@ var ConfigRepo = class {
         files.map(async (filePath) => {
           try {
             const raw = await this.cachedFS.readFile(filePath);
-            const data = this.serializer.deserialize(toUint8Array(raw), filePath);
+            const data = this.serializer.deserialize(toUint8Array2(raw), filePath);
             return { filePath, data };
           } catch {
             return null;
@@ -1430,7 +1570,7 @@ var ConfigRepo = class {
   async readMetaFile(path) {
     try {
       const raw = await this.cachedFS.readFile(path);
-      return JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+      return JSON.parse(new TextDecoder().decode(toUint8Array2(raw)));
     } catch {
       return null;
     }
@@ -1458,7 +1598,7 @@ var ConfigRepo = class {
           const filePath = `${BACKENDS_DIR}/${entry}`;
           try {
             const raw = await this.cachedFS.readFile(filePath);
-            const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+            const desc = JSON.parse(new TextDecoder().decode(toUint8Array2(raw)));
             if (desc.id && desc.type) {
               let mtime = 0;
               try {
@@ -1793,7 +1933,7 @@ var ConfigRepo = class {
     const descPath = this.appDataGroupFilePath(id);
     try {
       const raw = await this.cachedFS.readFile(descPath);
-      const descriptor = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+      const descriptor = JSON.parse(new TextDecoder().decode(toUint8Array2(raw)));
       const group = new AppDataGroupImpl(
         id,
         this.appId,
@@ -1817,7 +1957,7 @@ var ConfigRepo = class {
         if (!entry.endsWith(".json")) continue;
         try {
           const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
-          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          const desc = JSON.parse(new TextDecoder().decode(toUint8Array2(raw)));
           if (desc.id && desc.groupType === "data-sync") {
             descriptors.push(desc);
           }
@@ -1983,11 +2123,13 @@ var AppDataGroupImpl = class {
     this.dataBackends.clear();
   }
 };
-function toUint8Array(raw) {
+function toUint8Array2(raw) {
   if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
   if (raw instanceof Uint8Array) return raw;
   if (typeof raw === "string") return new TextEncoder().encode(raw);
-  if (Buffer.isBuffer(raw)) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(raw)) {
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  }
   return new Uint8Array(raw);
 }
 async function createConfigRepo(appId, options = {}) {

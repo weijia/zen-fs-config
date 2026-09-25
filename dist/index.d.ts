@@ -349,8 +349,12 @@ declare function createSerializerChain(custom?: ConfigSerializer): PathAwareSeri
 /**
  * Map a config key to a file path.
  *
- * - `/db/host` → `/db/host.json` (append .json if no extension)
- * - `/readme.md` → `/readme.md` (preserve existing extension)
+ * Always returns a path with a leading `/` so that callers can safely
+ * concatenate it with a directory prefix (e.g. `/${appId}${filePath}`).
+ *
+ * - `db/host`     → `/db/host.json` (append .json if no extension)
+ * - `/readme.md`  → `/readme.md`   (preserve existing extension)
+ * - `notes`       → `/notes.json`
  */
 declare function configKeyToFilePath(configPath: string): string;
 /**
@@ -758,6 +762,11 @@ declare function versionPathFor(configFilePath: string): string | null;
 /**
  * Compute SHA-256 hash of a Uint8Array.
  * Returns "sha256:" prefix + hex digest.
+ *
+ * Priority:
+ *   1. Web Crypto (crypto.subtle) — secure contexts (HTTPS, localhost)
+ *   2. Node.js crypto — server-side
+ *   3. Pure-JS fallback — non-secure browser contexts (HTTP, some WebViews)
  */
 declare function sha256(data: Uint8Array): Promise<string>;
 /**

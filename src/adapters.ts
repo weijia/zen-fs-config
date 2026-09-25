@@ -3,10 +3,37 @@
  *
  * Adapters that wrap various FS-like objects into the SyncableFS
  * interface required by zen-fs-sync.
+ *
+ * Browser-safe: uses Uint8Array / TextEncoder / TextDecoder instead of
+ * Node.js Buffer, so adapters work in both browser and Node.js environments.
  */
 
 import type { FileStat, SyncableFS } from 'zen-fs-sync';
 import type { BackendInstance } from './backend-registry';
+
+/**
+ * Safely convert a value to Uint8Array. Works in both browser and Node.js.
+ * Node.js Buffer is a subclass of Uint8Array, so `instanceof Uint8Array`
+ * covers both. We only fall back to Buffer.isBuffer when Buffer exists.
+ */
+function toUint8Array(data: any): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (typeof data === 'string') return new TextEncoder().encode(data);
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return new Uint8Array(data);
+}
+
+/**
+ * Safely decode bytes to string. Handles Uint8Array, ArrayBuffer, and Buffer.
+ */
+function toString(data: any, encoding?: string): string {
+  if (typeof data === 'string') return data;
+  const bytes = toUint8Array(data);
+  return new TextDecoder().decode(bytes);
+}
 
 // ---------------------------------------------------------------------------
 // BackendInstance → SyncableFS
@@ -15,7 +42,7 @@ import type { BackendInstance } from './backend-registry';
 /**
  * Wrap a BackendInstance (from backend-registry) into a SyncableFS.
  * BackendInstance's readFile may return string | Buffer | Uint8Array;
- * SyncableFS requires readFile(path, 'utf-8') → string and readFile(path) → Buffer.
+ * SyncableFS requires readFile(path, 'utf-8') → string and readFile(path) → Uint8Array.
  */
 export function backendToSyncableFS(backend: BackendInstance, name?: string): SyncableFS {
   const syncable: SyncableFS = {
@@ -23,20 +50,14 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
       return backend.readdir(path);
     },
 
-    async readFile(path: string, encoding?: BufferEncoding): Promise<any> {
+    async readFile(path: string, encoding?: string): Promise<any> {
       const result = await backend.readFile(path, encoding);
       // If encoding was requested, ensure string return
       if (encoding) {
-        if (typeof result === 'string') return result;
-        if (result instanceof Uint8Array) return new TextDecoder().decode(result);
-        if (Buffer.isBuffer(result)) return result.toString(encoding);
-        return String(result);
+        return toString(result, encoding);
       }
-      // No encoding — should return Buffer-like
-      if (typeof result === 'string') return Buffer.from(result);
-      if (result instanceof Uint8Array) return Buffer.from(result);
-      if (Buffer.isBuffer(result)) return result;
-      return Buffer.from(String(result));
+      // No encoding — return Uint8Array (browser-safe; works for sync engine)
+      return toUint8Array(result);
     },
 
     async writeFile(path: string, data: string | Uint8Array): Promise<void> {
@@ -126,7 +147,7 @@ export function zenfsPromisesToSyncableFS(promises: Record<string, any>): Syncab
       return entries.map((e: any) => typeof e === 'string' ? e : e.name);
     },
 
-    async readFile(path: string, encoding?: BufferEncoding): Promise<any> {
+    async readFile(path: string, encoding?: string): Promise<any> {
       if (encoding) {
         return promises.readFile(path, encoding);
       }
@@ -190,7 +211,7 @@ export function cachedFSToSyncableFS(cached: any, name?: string): SyncableFS {
       return cached.readdir(path);
     },
 
-    async readFile(path: string, encoding?: BufferEncoding): Promise<any> {
+    async readFile(path: string, encoding?: string): Promise<any> {
       const data = await cached.readFile(path);
       if (encoding) {
         if (typeof data === 'string') return data;
@@ -198,9 +219,10 @@ export function cachedFSToSyncableFS(cached: any, name?: string): SyncableFS {
           data instanceof ArrayBuffer ? new Uint8Array(data) : data,
         );
       }
-      if (typeof data === 'string') return Buffer.from(data);
-      if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
-      return Buffer.from(data);
+      // No encoding — return Uint8Array (browser-safe)
+      if (typeof data === 'string') return new TextEncoder().encode(data);
+      if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      return data;
     },
 
     async writeFile(path: string, data: string | Uint8Array): Promise<void> {

@@ -62,7 +62,7 @@ export function createChrootFS(inner: AsyncFS, root: string) {
   // -----------------------------------------------------------------------
 
   const promises = {
-    async readFile(path: string, encoding?: BufferEncoding): Promise<any> {
+    async readFile(path: string, encoding?: string): Promise<any> {
       return inner.readFile(rp(path), encoding);
     },
 
@@ -120,7 +120,7 @@ export function createChrootFS(inner: AsyncFS, root: string) {
   // -----------------------------------------------------------------------
 
   const syncFs = {
-    readFileSync(path: string, encoding?: BufferEncoding): any {
+    readFileSync(path: string, encoding?: string): any {
       // Sync read is not natively supported — throw a clear error
       throw new Error(
         'zen-fs-config: readFileSync is not supported. ' +

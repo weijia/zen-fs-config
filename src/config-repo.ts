@@ -1883,7 +1883,11 @@ function toUint8Array(raw: any): Uint8Array {
   if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
   if (raw instanceof Uint8Array) return raw;
   if (typeof raw === 'string') return new TextEncoder().encode(raw);
-  if (Buffer.isBuffer(raw)) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  // Node.js Buffer is a subclass of Uint8Array, so the check above covers it.
+  // Fall back to Buffer.isBuffer only when Buffer exists (Node.js).
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(raw)) {
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  }
   return new Uint8Array(raw);
 }
 
