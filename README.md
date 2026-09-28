@@ -123,6 +123,42 @@ const repo = await createConfigRepo('my-app', {
 const repo2 = await createConfigRepo('my-app');
 ```
 
+## Unified entry point: `connect()`
+
+If you don't know in advance whether a backend holds a config-sync repo or a
+data-sync group, use the unified `connect()` entry point. It auto-detects the
+group type by reading `/.meta/group-type` from the provided backend, then
+returns the matching handle — no need to call `createConfigRepo` /
+`createDataSyncGroup` yourself.
+
+```typescript
+import { connect } from 'zen-fs-config';
+
+// 1. No backendInfo → local-only, defaults to config-sync
+const { groupType, repo } = await connect('my-app');
+
+// 2. With a remote backend → detect group type automatically
+const result = await connect('my-app', {
+  backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+});
+if (result.groupType === 'data-sync') {
+  // result.dataGroup — a standalone DataSyncGroup
+} else {
+  // result.repo — a ConfigRepo
+}
+```
+
+Detection & dispatch rules:
+
+- Reads `/.meta/group-type` from the backend: `config-sync` → `ConfigRepo`, `data-sync` → `DataSyncGroup`.
+- If that file is absent (a brand-new backend), falls back to `options.groupType` (default `config-sync`).
+- If you pass `options.groupType` and it conflicts with the backend's actual type, `connect()` throws a `Group type mismatch` error.
+- The returned `ConnectResult` always carries `groupType`, plus either `repo` (config-sync) or `dataGroup` (data-sync).
+
+| Method | Description |
+|--------|-------------|
+| `connect(appId, options?)` | Unified entry: auto-detect group type and return a `ConfigRepo` or `DataSyncGroup` |
+
 ## Directory Structure
 
 ```

@@ -120,6 +120,38 @@ const repo = await createConfigRepo('my-app', {
 const repo2 = await createConfigRepo('my-app');
 ```
 
+## 统一入口：`connect()`
+
+如果你事先不知道某个后端里放的是配置同步仓库（config-sync）还是数据同步组（data-sync），可以用统一的 `connect()` 入口。它会读取后端上的 `/.meta/group-type` 自动判断组类型，再返回对应的句柄——无需自己选择调用 `createConfigRepo` 还是 `createDataSyncGroup`。
+
+```typescript
+import { connect } from 'zen-fs-config';
+
+// 1. 不传 backendInfo → 纯本地，默认 config-sync
+const { groupType, repo } = await connect('my-app');
+
+// 2. 传入远程后端 → 自动探测组类型
+const result = await connect('my-app', {
+  backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+});
+if (result.groupType === 'data-sync') {
+  // result.dataGroup — 独立的 DataSyncGroup
+} else {
+  // result.repo — ConfigRepo
+}
+```
+
+探测与分发规则：
+
+- 读取后端上的 `/.meta/group-type`：`config-sync` → `ConfigRepo`，`data-sync` → `DataSyncGroup`。
+- 若该文件不存在（全新后端），回退到 `options.groupType`（默认 `config-sync`）。
+- 如果你显式传了 `options.groupType`，且与后端实际类型不符，`connect()` 会抛出 `Group type mismatch` 错误。
+- 返回的 `ConnectResult` 始终带 `groupType`，外加 `repo`（config-sync）或 `dataGroup`（data-sync）其中之一。
+
+| 方法 | 说明 |
+|---|---|
+| `connect(appId, options?)` | 统一入口：自动探测组类型并返回 `ConfigRepo` 或 `DataSyncGroup` |
+
 ## 目录结构
 
 ```
