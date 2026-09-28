@@ -167,6 +167,13 @@ export interface ConfigRepoOptions {
   /** IndexedDB store name for the local primary backend. Default: `zen-fs-config-{appId}` */
   idbStoreName?: string;
 
+  /**
+   * Directory for the local primary backend on Node.js (used when IndexedDB is
+   * unavailable). Only applies on Node.js; ignored in browsers. Defaults to
+   * `$ZEN_FS_CONFIG_HOME` (or `~/.zen-fs-config`) when omitted.
+   */
+  folderPath?: string;
+
   /** Node identifier. Auto-detected if not provided (see DESIGN.md §8.2). */
   nodeId?: string;
 

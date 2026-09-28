@@ -9,6 +9,9 @@
 // Factory & main class
 export { createConfigRepo, ConfigRepo, LOCAL_IDB_BACKEND_ID } from './config-repo';
 
+// Node.js local persistent backend (Folder) — self-registers on import
+export { resolveLocalPrimary, localPrimaryType, isBrowserEnv, FolderStore, registerFolderBackend } from './folder-backend';
+
 // Data-sync group (standalone)
 export { DataSyncGroup, createDataSyncGroup } from './data-sync-group';
 export type { DataSyncGroupOptions } from './data-sync-group';

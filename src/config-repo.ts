@@ -32,6 +32,7 @@ import { createChrootFS } from './context-fs';
 import type { PathAwareSerializer } from './serializer';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, mergeAccountFields, getAccountFields, type BackendInstance } from './backend-registry';
+import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 import type { VersionMeta } from './types';
@@ -1319,9 +1320,9 @@ export class ConfigRepo implements IConfigRepo {
     const fullList: BackendDescriptor[] = [
       {
         id: LOCAL_IDB_BACKEND_ID,
-        type: 'IndexedDB',
-        options: { storeName: '' }, // actual storeName is internal
-        description: 'Local IndexedDB primary (implicit)',
+        type: localPrimaryType(),
+        options: { storeName: '' }, // actual storeName / path is internal
+        description: `Local ${localPrimaryType()} primary (implicit)`,
       },
       ...descriptors,
     ];
@@ -1745,12 +1746,10 @@ class AppDataGroupImpl implements AppDataGroup {
   private _pollIntervalMs?: number;
 
   async init(): Promise<void> {
-    // Create local primary backend (InMemory for simplicity in tests/Node, IndexedDB in browser)
+    // Create local primary backend (Folder on Node, IndexedDB on browser)
     try {
-      this.localFS = await createBackend({
-        type: 'InMemory',
-        options: { label: `data-group-${this.groupId}-${Date.now()}` },
-      });
+      const localPrimary = await resolveLocalPrimary(this.appId, 'data');
+      this.localFS = await createBackend(localPrimary);
     } catch {
       throw new Error(`Failed to create local primary for data group "${this.groupId}"`);
     }
@@ -1900,15 +1899,15 @@ export async function createConfigRepo(
   options: ConfigRepoOptions = {},
 ): Promise<IConfigRepo> {
   // -------------------------------------------------------------------
-  // Step 1: Create IndexedDB as the local primary backend (always)
+  // Step 1: Create the local primary backend (IndexedDB on browser, Folder on Node)
   // -------------------------------------------------------------------
-  const idbStoreName = options.idbStoreName || `zen-fs-config-${appId}`;
-  log.log(`[createConfigRepo] Creating IndexedDB primary (store: ${idbStoreName})...`);
-
-  const primaryInstance = await createBackend({
-    type: 'IndexedDB',
-    options: { storeName: idbStoreName },
+  const localPrimary = await resolveLocalPrimary(appId, 'config', {
+    idbStoreName: options.idbStoreName,
+    folderPath: options.folderPath,
   });
+  log.log(`[createConfigRepo] Creating local primary (type: ${localPrimary.type})...`);
+
+  const primaryInstance = await createBackend(localPrimary);
 
   const cachedFS = primaryInstance;
 
@@ -1967,8 +1966,8 @@ export async function createConfigRepo(
     log.log(`[createConfigRepo] Migrating ${oldBackendsMeta.backends.length} backend(s) from backends.json to individual files...`);
     await tempRepo.ensureDir(`${BACKENDS_DIR}/.keep`);
     for (const desc of oldBackendsMeta.backends) {
-      // Skip the local IndexedDB primary — it's implicit, not stored
-      if (desc.id === LOCAL_IDB_BACKEND_ID || desc.type === 'IndexedDB') {
+      // Skip the local primary — it's implicit (always id LOCAL_IDB_BACKEND_ID)
+      if (desc.id === LOCAL_IDB_BACKEND_ID) {
         log.log(`[createConfigRepo] Skipping local backend ${desc.id} during migration`);
         continue;
       }

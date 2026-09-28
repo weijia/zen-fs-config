@@ -155,17 +155,20 @@ beforeAll(() => {
   });
 });
 
-// Mock IndexedDB: use persistent mock for same storeName, InMemory otherwise
+// Mock Folder (Node local primary): zen-fs-config uses the Folder backend as the
+// local primary on Node.js. This mock keeps a persistent in-memory store for the
+// same `path` key so the dedup/corruption tests can introspect the local store
+// across connections (mirrors the previous IndexedDB mock).
 let persistentStoreCounter = 0;
 beforeAll(() => {
-  registerBackend('IndexedDB', async (options) => {
-    const storeName = options.storeName as string;
-    if (storeName && storeName.startsWith('persistent-')) {
-      return createPersistentMock(storeName);
+  registerBackend('Folder', async (options) => {
+    const dir = options.path as string;
+    if (dir && dir.startsWith('persistent-')) {
+      return createPersistentMock(dir);
     }
     return createBackend({
       type: 'InMemory',
-      options: { label: `mock-idb-${storeName ?? Date.now()}` },
+      options: { label: `mock-folder-${dir ?? Date.now()}` },
     });
   });
 });
@@ -269,7 +272,7 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
 
     // First connection: creates a replica with ID 'gitee-prod'
     const repo1 = await createConfigRepo(appId, {
-      idbStoreName: storeName,
+      folderPath: storeName,
       backendInfo: { type: 'InMemory', options: { label: 'shared-store' } },
       primaryBackendId: 'gitee-prod',
       nodeId: 'node-1',
@@ -283,7 +286,7 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
 
     // Second connection: SAME backend config but different (default) ID
     const repo2 = await createConfigRepo(appId, {
-      idbStoreName: storeName,
+      folderPath: storeName,
       backendInfo: { type: 'InMemory', options: { label: 'shared-store' } },
       nodeId: 'node-2',
     }) as ConfigRepo;
@@ -301,7 +304,7 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
 
     // First connection with options in one order
     const repo1 = await createConfigRepo(appId, {
-      idbStoreName: storeName,
+      folderPath: storeName,
       backendInfo: { type: 'InMemory', options: { label: 'store', maxSize: 200 } },
       primaryBackendId: 'mem-1',
       nodeId: 'node-1',
@@ -311,7 +314,7 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
 
     // Second connection with same options in different key order
     const repo2 = await createConfigRepo(appId, {
-      idbStoreName: storeName,
+      folderPath: storeName,
       backendInfo: { type: 'InMemory', options: { maxSize: 200, label: 'store' } },
       primaryBackendId: 'mem-2',
       nodeId: 'node-2',
@@ -331,7 +334,7 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
     const idbStore = `persistent-${appId}`;
 
     const repo = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       nodeId: 'node-1',
     }) as ConfigRepo;
 
@@ -372,7 +375,7 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
     const idbStore = `persistent-${appId}`;
 
     const repo = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       nodeId: 'node-1',
     }) as ConfigRepo;
 
@@ -411,7 +414,7 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
 
     // Create a repo with a MockShared backend
     const repo = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
       primaryBackendId: 'rs-1',
       nodeId: 'node-1',
@@ -462,7 +465,7 @@ describe('dedup during createConfigRepo — survives sync re-introduction', () =
     // Phase 1: Create a repo with one MockShared backend "rs-1"
     // This pushes rs-1.json to the shared remote store.
     const repo1 = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
       primaryBackendId: 'rs-1',
       nodeId: 'node-1',
@@ -498,7 +501,7 @@ describe('dedup during createConfigRepo — survives sync re-introduction', () =
     // The key question: does the deleted duplicate (rs-2) survive the sync,
     // or does syncAll bring it back from remote?
     const repo2 = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       nodeId: 'node-2',
     }) as ConfigRepo;
 
@@ -531,7 +534,7 @@ describe('removeBackend — tombstone-based deletion', () => {
     const sharedStoreKey = `shared-${appId}-${Date.now()}`;
 
     const repo = await createConfigRepo(appId, {
-      idbStoreName: `persistent-${appId}`,
+      folderPath: `persistent-${appId}`,
       backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
       primaryBackendId: 'rs-1',
       nodeId: 'node-1',
@@ -563,7 +566,7 @@ describe('removeBackend — tombstone-based deletion', () => {
     const sharedStoreKey = `shared-${appId}-${Date.now()}`;
 
     const repo = await createConfigRepo(appId, {
-      idbStoreName: `persistent-${appId}`,
+      folderPath: `persistent-${appId}`,
       backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
       primaryBackendId: 'rs-1',
       nodeId: 'node-1',
@@ -601,7 +604,7 @@ describe('removeBackend — tombstone-based deletion', () => {
 
     // Create repo with a MockShared backend "rs-1"
     const repo = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
       primaryBackendId: 'rs-1',
       nodeId: 'node-1',
@@ -639,7 +642,7 @@ describe('removeBackend — tombstone-based deletion', () => {
 
     // Reconnect — no backends should remain
     const repo2 = await createConfigRepo(appId, {
-      idbStoreName: idbStore,
+      folderPath: idbStore,
       nodeId: 'node-2',
     }) as ConfigRepo;
 

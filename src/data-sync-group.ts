@@ -16,6 +16,7 @@ import {
 import type { AppDataGroup, BackendDescriptor } from './types';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, type BackendInstance } from './backend-registry';
+import { resolveLocalPrimary } from './folder-backend';
 import { createChrootFS } from './context-fs';
 import { createLogger } from './logger';
 
@@ -239,6 +240,12 @@ export interface DataSyncGroupOptions {
   nodeId?: string;
   /** Sync polling interval in ms. */
   pollIntervalMs?: number;
+  /**
+   * Directory for the local primary backend on Node.js. Only applies on
+   * Node.js (the local primary is otherwise InMemory); ignored in browsers.
+   * Defaults to `$ZEN_FS_CONFIG_HOME` (or `~/.zen-fs-config`) when omitted.
+   */
+  folderPath?: string;
 }
 
 /**
@@ -257,11 +264,11 @@ export async function createDataSyncGroup(
   const groupId = `data-${appId}-${Date.now().toString(36)}`;
   log(`createDataSyncGroup: appId=${appId} groupId=${groupId}`);
 
-  // Step 1: Create local primary backend
-  const localFS = await createBackend({
-    type: 'InMemory',
-    options: { label: `data-sync-${appId}-${Date.now()}` },
+  // Step 1: Create local primary backend (Folder on Node, IndexedDB on browser)
+  const localPrimary = await resolveLocalPrimary(appId, 'data', {
+    folderPath: options.folderPath,
   });
+  const localFS = await createBackend(localPrimary);
 
   // Step 2: Ensure /.meta/ exists and write group-type
   try {

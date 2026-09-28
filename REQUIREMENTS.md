@@ -1,7 +1,7 @@
 # zen-fs-config 需求文档（Requirements / PRD）
 
 > 本文档定义 `zen-fs-config` 的功能需求、非功能需求、使用场景与验收标准。
-> 配套文档：[DESIGN.md](./DESIGN.md)（架构与设计）、[README.md](./README.md)（快速上手）、[PROMPT.md](./PROMPT.md)（AI 使用提示词）。
+> 配套文档：[DESIGN.md](./DESIGN.md)（架构与设计）、[USE-CASES.md](./USE-CASES.md)（使用场景/用户旅程）、[README.md](./README.md)（快速上手）、[PROMPT.md](./PROMPT.md)（AI 使用提示词）。
 > 状态：基于现有实现整理并标注已知缺口（见 §8）。
 
 ## 1. 文档目的与范围
@@ -30,7 +30,7 @@
 
 - G1：提供配置同步组（config-sync），管理应用配置、共享配置、节点配置。
 - G2：提供数据同步组（data-sync），承载纯应用数据的多后端同步。
-- G3：提供统一入口 `connect()`，按 `.meta/group-type` 自动路由到正确组类型。
+- G3：提供组类型自动路由入口 `connect()`，按 `.meta/group-type` 自动分发到正确工厂（注意：非覆盖全部启动场景的统一生命周期入口，见 FR3.4）。
 - G4：本地主后端持久化，重开时无需外部参数即可恢复拓扑与数据（config-sync）。
 - G5：冲突安全，任何一方内容不丢失，可恢复。
 - G6：可扩展后端与序列化器。
@@ -80,7 +80,7 @@
 
 **验收**：写入数据文件后，组内的所有后端双向同步；可作为 config-sync 的应用数据层使用。
 
-### FR3 — 统一入口 `connect()`（自动组类型探测）
+### FR3 — 组类型自动路由入口 `connect()`（注意：非"统一生命周期入口"）
 
 - FR3.1：`connect(appId, options?)` 若有 `backendInfo`，先临时连上远端读 `.meta/group-type`：
   - `config-sync` → 返回 `{ groupType, repo }`
@@ -88,16 +88,21 @@
   - 缺失 → 回退到 `options.groupType`（默认 `config-sync`）新建
 - FR3.2：若 `options.groupType` 与远端实际类型冲突，抛 `Group type mismatch`。
 - FR3.3：无 `backendInfo` 时，按 `options.groupType`（默认 `config-sync`）创建本地组，等价于 `createConfigRepo(appId)`。
+- FR3.4（边界，重要）：`connect` 只统一了"**组类型探测与工厂分发**"，并不统一"启动生命周期"。它本身**不是**覆盖所有起点的统一入口：
+  - **data-sync 此前需 `backendInfo` 重连（B 落地后消除）**：在决策 B 落地前，因 data-sync 本地主后端为 InMemory（FR4.2），重开无本地记忆，`connect(appId)` 单独调用无法恢复组；B 落地后 data-sync 本地主后端改为持久化，亦能"只传 appId"恢复，与 config-sync 对齐。剩余不统一点仅剩"尚不知道后端"的引导场景（见下条）。
+  - **"尚不知道后端"的引导场景 `connect` 覆盖不了**：首跑时若后端尚未确定（如引导流程里让用户选/填存储位置，或账户复用只先有存储位置），调用方手里没有 `backendInfo`，`connect` 既不能建 data-sync 也不能合理建 config-sync（除非纯本地）。这类"后端发现 / 首次配置向导"必须由调用方在 `connect` 之外自行编排，`connect` 只是"给我后端、我路由"的薄门面。
 
-**验收**：调用方无需预先知道后端里是哪种组，传 `backendInfo` 即可正确路由；类型冲突给出明确报错而非静默误建。
+**验收**：调用方无需预先知道后端里是哪种组，传 `backendInfo` 即可正确路由；类型冲突给出明确报错而非静默误建。但不应宣传为"统一入口"——它不替代首跑引导、也不为 data-sync 提供无参重开。
 
 ### FR4 — 本地持久化与重开恢复
 
 - FR4.1（config-sync）：本地主后端 IndexedDB 持久保存配置数据与拓扑；重开时**仅传 `appId`**（不传 `backendInfo`）即可恢复全部副本并自动重连同步。
-- FR4.2（data-sync）：本地主后端为 InMemory，**不持久化**；重开时本地无数据，需再次传入 `backendInfo` 重新连远端并按远端 `.meta/backends/` 恢复后端拓扑。
+- FR4.2（data-sync）：本地主后端由 `resolveLocalPrimary` 选择——浏览器 `IndexedDB`；Node 在显式 `folderPath` 或环境变量 `ZEN_FS_CONFIG_HOME` 时启用持久化 `Folder` 后端（见 §10 T2），否则回退 `InMemory`（向后兼容、无磁盘状态）。开启持久化后即支持与 config-sync 一致的"只传 `appId` 重开"——拓扑与数据落本地，重开时自动恢复并自动重连远端副本。**已实现（见 §10 T1/T2）；Node 持久化默认为 opt-in，避免破坏既有 Node 行为与测试。**
+  - **背景（为何此前是 InMemory，非缺陷）**：InMemory 是 Node/Browser 都能跑的**可移植默认**——代码注释 `data-sync-group.ts:249` 写作 `(InMemory in Node.js)`，暗示浏览器侧 IndexedDB 持久化本被预想但**未实现**；data-sync 承载任意体积 fs 数据，全量本地持久化本是**存储成本**取舍。注意"避免本地陈旧态与远端冲突"**不是**理由：同步按最新数据收敛、老数据被远端覆盖，真冲突走 FR6 归档+策略；反而 InMemory 会在重开时丢弃未推送的本地离线写。决策 B 已采纳"为换取无参重开与离线写不丢，接受该存储成本"。
+  - **修正（重要）**：FR4.2 旧文称"开启持久化后与 config-sync 一致的'只传 `appId` 重开'"——**该宣称对独立 data-sync 组不成立**。持久化 `Folder` 仅保住数据文件，拓扑重开仍需传 `backendInfo`（详见 §8 #4 / UC4）。作为 config-sync 下挂的 AppDataGroup 时由 config-sync 恢复，不受此限。
 - FR4.3：库应保证"本地有/没有配置"对调用方透明——同一入口在两种情况下都能正确工作（恢复是内部完成）。
 
-**验收**：config-sync 刷新页面后 `getConfig` 仍可读到旧值、旧副本自动重连；data-sync 刷新后需重新 `connect/backendInfo` 才能读到数据。
+**验收**：config-sync 与 data-sync 在开启本地持久化（浏览器默认 IndexedDB / Node 设 `folderPath` 或 `ZEN_FS_CONFIG_HOME`）后，刷新/重启均**仅传 `appId`** 即可读到旧值、旧副本自动重连。
 
 ### FR5 — 后端拓扑自描述与去重
 
@@ -162,44 +167,54 @@
 - NFR4 一致性：最终一致 + 冲突归档，不保证强一致。
 - NFR5 健壮：初次写后崩溃，重启时比对 sidecar 哈希与实际内容，自动修正版本。
 
-## 7. 使用场景（Scenarios）
+## 7. 使用场景（Use Cases / 用户旅程）
 
-### 场景 A：本地无任何配置（首跑 / 新设备）
-
-- A1（接远端）：`connect(appId, { backendInfo })` 或 `createConfigRepo(appId, { backendInfo })`。初始同步把远端配置拉到本地 IndexedDB，并写出 `.meta/backends/{id}.json`。
-- A2（纯本地）：`createConfigRepo(appId)` 后用 `addBackend` 补远端。
-
-### 场景 B：本地已有配置（重开 / 刷新）
-
-- B1（config-sync）：**仅传 `appId`**。`createConfigRepo(appId)` / `connect(appId)` 从 IndexedDB 读 `.meta/backends` 自动恢复并重连副本。**不要**重复传 `backendInfo`（重复添加会被去重拒绝或报已存在）。
-- B2（data-sync）：本地 InMemory 不持久，仍需传 `backendInfo` 重新连远端，按远端 `.meta/backends` 恢复后端拓扑。
-
-### 场景 C：调用方判断"是否首跑 / 本地有无配置"
-
-- C1：库设计上使调用方**无需主动判断**——统一入口对两种状态兼容。
-- C2：确需判断时可用：`getBackends()`（是否已有远端副本）、`getConfig(path)`（某配置是否存在）、以及调用方自己持久化的 `nodeId`（存在即非首跑）。
-- C3：当前**没有** `isFirstRun()/hasLocalConfig()` 专用 API（见 §8 缺口）。
-
-### 场景 D：多后端冗余、冲突、删除
-
-- 同 FR5/FR6/FR9 验收路径。
+> 完整的用户旅程与用例（UC1–UC7、架构前提、`config-sync` 必选根说明）已抽到独立文件
+> [USE-CASES.md](./USE-CASES.md)，便于单独维护与评审。本节仅保留索引，内容以该文件为准。
 
 ## 8. 已知缺口与待办（Open Items）
 
 1. **data-sync 组的参数级去重缺失**：`DataSyncGroup.addBackend` / `AppDataGroupImpl.addBackend` 仅按 `id` 去重，不按 `type+options`。建议补齐 `backendDedupKey` 校验（与 config-sync 对齐）。
-2. **`connect()` 文档此前缺失**：已在 README 补充（见 README "Unified entry point: connect()"）。
-3. **data-sync 本地不持久**：`createDataSyncGroup` 用 InMemory 作主后端，重开必须重连远端；若需本地持久恢复，可考虑支持 IndexedDB 主后端或回读远端拓扑（当前 backendInfo 分支已读远端 `.meta/backends`，可用）。
-4. **首跑判断 API 缺失**：建议增加 `repo.hasLocalConfig()` / 静态 `isFirstRun(appId)` 之类便捷方法。
-5. **Node.js 环境主后端**：`createConfigRepo` 硬编码 IndexedDB（浏览器专属），Node 下需显式提供主后端或兜底。
+2. **首跑判断 API（`hasLocalConfig`）归属待定**：建议增加便捷方法，但**只能面向 config-sync**，原因：
+   - config-sync 本地主后端是 IndexedDB（持久），`hasLocalConfig(appId)` 可静态检查该 appId 的 IndexedDB store 是否存在 / 是否非空 —— 这是唯一能可靠回答"本机是否已有配置"的 repo。
+   - **data-sync 当前无"本地配置"可查**：决策 B（见 §9）落地前其本地是 InMemory，每次启动都是空的；B 落地后 data-sync 本地亦持久，因此 `hasLocalConfig` 是否也扩展到 `DataSyncGroup` 可一并决定（建议先仅 `ConfigRepo`，保持 API 简单，data-sync 仍回退到 `nodeId` + 远端探测）。
+   - 对 data-sync 的"首跑"判定不能靠本地配置，而要靠：(a) 调用方自己持久化的 `nodeId`（FR7.3）；(b) 连上远端后远端 `.meta/group-type` / `.meta/backends` 是否存在（存在 = 组已在别处建过，非首次）。
+   - 结论：建议暴露 `ConfigRepo.hasLocalConfig(appId)`（静态，查 IndexedDB）作为 config-sync 首跑依据；data-sync 不提供该方法，统一回退到 `nodeId` + 远端探测。
+3. **Node.js 环境主后端（data-sync 持久化的前置）**：`createConfigRepo` 硬编码 IndexedDB（浏览器专属），Node 下需显式提供主后端或兜底。该磁盘后端同样供 data-sync 持久化（决策 B / §9）使用——落地后 config-sync 与 data-sync 在 Node 下均可用同一 `Folder` 后端**保存数据文件**；但 data-sync 的"只传 `appId` 重开（拓扑恢复）"**仍未实现**（见 #4）。
+4. **独立 data-sync 组"只传 `appId` 重开"未实现（拓扑不重建）**：`createDataSyncGroup` 的无 `backendInfo` 分支（`data-sync-group.ts:376`）只建空组、不读取本地已持久化的 `.meta/backends/*.json` 重建同步对；带 `backendInfo` 的分支是从**远端**（非本地）`.meta/backends/` 恢复拓扑。即 FR4.2 / §9 D1 宣称的"data-sync 与 config-sync 对齐、只传 appId 重开"**当前不成立**——本地 `Folder` 只保住了数据文件，拓扑重开仍依赖每次传 `backendInfo`。修复方向：无 `backendInfo` 时从本地主后端读 `.meta/backends/` 重建同步对（对齐 config-sync 的 init 行为）；或明确文档：独立 data-sync 重开必传 `backendInfo`。作为 config-sync 下挂的 AppDataGroup 不受此限（由 config-sync 恢复）。
 
-## 9. 验收总表
+> 已完成 / 已决策（已移出本清单）：
+> - `connect()` 文档此前缺失 → 已在 README 补充（"Unified entry point: connect()"）。
+> - data-sync 是否本地持久化 → 已决策 **B**（与 config-sync 对齐），详见 §9 决策记录与 §10 实现任务清单。
+
+## 9. 决策记录（Decision Log）
+
+### D1 — data-sync 是否本地持久化：选 B（与 config-sync 对齐）
+- **状态**：已决策（B）。
+- **背景**：此前 `createDataSyncGroup` 本地主后端硬编码 `InMemory`（可移植默认，代码注释 `(InMemory in Node.js)` 暗示浏览器 IndexedDB 预想但未实现）。
+- **选项**：
+  - A 维持 InMemory：零本地存储成本；但 data-sync 无法"只传 `appId` 重开"、与 `connect` 统一叙事冲突（FR3.4）、重开丢弃未推送的本地离线写。
+  - B 增加持久化本地主后端：浏览器 IndexedDB / Node 磁盘后端（见 Open Items #3），重开亦可"只传 `appId`"、离线写不丢；代价是大体积 fs 数据的本地存储成本。
+- **决策**：选 B。接受存储成本，换取无参重开与离线写安全，并使两种组恢复路径一致。
+- **影响**：FR4.2、FR3.4、FR4 验收已更新为目标态。
+- **实现状态（已落地）**：新增 `Folder` 后端（`src/folder-backend.ts`）与 `resolveLocalPrimary`；`createConfigRepo`/`createDataSyncGroup`/`AppDataGroup` 的本地主后端经其选择。**Node 持久化默认 opt-in**（传 `folderPath` 或设 `ZEN_FS_CONFIG_HOME`），以保留既有 Node 行为与测试稳定性；浏览器仍默认 IndexedDB。详见 §10 T1/T2。
+
+## 10. 实现任务清单（Implementation Backlog）
+
+- **T1（data-sync 持久化主后端 · 决策 D1/B）【已实现】**：`createDataSyncGroup` 主后端改为 `resolveLocalPrimary`（浏览器 `IndexedDB` / Node 按需 `Folder`）；首跑仍需 `backendInfo` 建远端，之后开启持久化即仅传 `appId` 重开。拓扑落本地主后端。Node 持久化为 **opt-in**（避免破坏既有 Node 行为与测试）。剩余可选优化：大体积数据"仅缓存元数据/按需拉取"开关（原第 4 点）。
+- **T2（Node 主后端）【已实现】**：新增 `src/folder-backend.ts`——基于 `node:fs` 的 `FolderStore`（`SyncMapStore`，每 key 一文件）+ 注册 `Folder` 后端（`wrapZenFSFileSystem`）。`node:fs`/`node:path` 经动态 import 注入，浏览器打包不受影响（已验证 tsup IIFE 构建通过）。`createConfigRepo` / `AppDataGroup` / `createDataSyncGroup` 的本地主后端均经 `resolveLocalPrimary` 选择。
+  - 验证：`npm run build` 全目标通过；`vitest` 109/109 通过（含把 `dedup-fix` 测试 mock 迁到 `Folder` 后端）。
+- **T3（data-sync 参数级去重）**：`DataSyncGroup.addBackend` / `AppDataGroupImpl.addBackend` 补 `backendDedupKey` 校验，与 config-sync 对齐（Open Items #1）。
+- **T4（`hasLocalConfig` API）**：落地 `ConfigRepo.hasLocalConfig(appId)`（静态，查 IndexedDB）；是否扩展到 `DataSyncGroup` 待定（Open Items #2）。
+
+## 11. 验收总表
 
 | 需求 | 验收要点 |
 |---|---|
 | FR1 config-sync | setConfig 本地立即可读、副本自动同步、拓扑可增删 |
 | FR2 data-sync | fs 直读写、组内多后端双向同步 |
 | FR3 connect | 自动探测组类型路由、类型冲突报错 |
-| FR4 持久化/恢复 | config-sync 仅 appId 恢复；data-sync 需重连远端 |
+| FR4 持久化/恢复 | config-sync 仅 appId 恢复；data-sync 开启本地持久化（Node opt-in）后亦可仅 appId 恢复 |
 | FR5 去重 | config-sync 按 type+options 去重；data-sync 仅 id（缺口） |
 | FR6 冲突安全 | 归档 + 策略 + 可恢复 |
 | FR7 节点配置 | 默认不同步、可发布/查看 |
@@ -208,7 +223,7 @@
 | FR10 缓存 | 零下载重校验、持久热启动 |
 | FR11 扩展 | 自定义后端/序列化/冲突回调 |
 
-## 10. 依赖
+## 12. 依赖
 
 | 包 | 角色 | 必需 |
 |---|---|---|
