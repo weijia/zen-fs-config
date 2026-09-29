@@ -84,29 +84,6 @@ Global build → global variable mapping:
 
 `zen-fs-config` auto-detects these globals (`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`) and uses them directly, skipping the bare `import()`. Because all three packages declare a `browser`/`unpkg` field, a bare package URL (e.g. `https://unpkg.com/zen-fs-github`) also returns the global build — so you may shorten the three `<script>` lines to bare URLs if you prefer.
 
-**Alternative — import map (optional, only if you want ESM semantics).** Instead of global scripts, you can map the bare package names to an ESM CDN so the bundle's dynamic `import()` resolves them. This is entirely optional — the UMD globals above are simpler and need no import map:
-
-```html
-<script type="importmap">
-{
-  "imports": {
-    "zen-fs-github": "https://esm.sh/zen-fs-github",
-    "zen-fs-gitee": "https://esm.sh/zen-fs-gitee",
-    "zen-fs-remotestoragejs": "https://esm.sh/zen-fs-remotestoragejs"
-  }
-}
-</script>
-<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
-<script>
-  (async () => {
-    const { connect } = window.ZenFSConfig;
-    const { repo } = await connect('my-app', {
-      backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
-    });
-  })();
-</script>
-```
-
 ## Quick Start
 
 ### 1. Initialize (zero-configuration)

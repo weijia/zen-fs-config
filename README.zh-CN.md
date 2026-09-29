@@ -81,29 +81,6 @@ npm install zen-fs-remotestoragejs # RemoteStorage 副本
 
 `zen-fs-config` 会自动识别这些全局变量（`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`）并直接使用，跳过裸 `import()`。由于三个包都声明了 `browser`/`unpkg` 字段，裸包名 URL（如 `https://unpkg.com/zen-fs-github`）同样会返回全局构建——如果你愿意，也可以把前面三行 `<script>` 简写成裸 URL。
 
-**备选 —— import map（可选，仅当你需要 ESM 语义时）**。如果不想用全局脚本，也可以把裸包名映射到 ESM CDN，由包内的动态 `import()` 去解析。这完全是可选的——上面的 UMD 全局方式更简单，且不需要 import map：
-
-```html
-<script type="importmap">
-{
-  "imports": {
-    "zen-fs-github": "https://esm.sh/zen-fs-github",
-    "zen-fs-gitee": "https://esm.sh/zen-fs-gitee",
-    "zen-fs-remotestoragejs": "https://esm.sh/zen-fs-remotestoragejs"
-  }
-}
-</script>
-<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
-<script>
-  (async () => {
-    const { connect } = window.ZenFSConfig;
-    const { repo } = await connect('my-app', {
-      backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
-    });
-  })();
-</script>
-```
-
 ## 快速开始
 
 ### 1. 初始化（零参数）
