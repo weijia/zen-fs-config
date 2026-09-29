@@ -1195,7 +1195,7 @@ backend actually persists it. Implementation status per backend:
 | Backend | Protocol can set mtime? | Strategy | `write` path writes sidecar? | Status |
 |---|---|---|---|---|
 | RemoteStorage (`zen-fs-remotestoragejs`) | No — server `Last-Modified` is the PUT arrival time, client cannot control it | `.mtime` sidecar | **Yes** — `writeFile` writes the sidecar when `preciseMtime` is enabled (default on) | Working |
-| Gitee (`zen-fs-gitee`) | No — Git has no per-file mtime | `.mtime` sidecar | **Yes** — `write()` / `writeSync()` and `writeFile` / `writeFileSync` all persist it (since 1.2.17) | **Fixed in 1.2.17** |
+| Gitee (`zen-fs-gitee`) | No — Git has no per-file mtime | `.mtime` sidecar | **Yes** — `write()` / `writeSync()` and `writeFile` / `writeFileSync` persist it; `createSnapshot()` reads it (write fix since 1.2.17, snapshot fix since 1.2.18) | **Fixed in 1.2.18** |
 
 Consequence of the Gitee gap: files pushed through the normal write path have
 no `.mtime` sidecar, so `stat()` falls back to the commit time. That commit
