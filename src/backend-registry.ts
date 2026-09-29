@@ -368,7 +368,11 @@ function _cacheSet(key: string, value: string): void {
  */
 const OPTIONAL_BACKEND_GLOBALS: Record<string, string[]> = {
   'zen-fs-github': ['ZenFSGitHub', 'Github'],
-  'zen-fs-gitee': ['ZenFSGitee', 'Gitee'],
+  // Only 'ZenFSGitee' — the UMD global name emitted by zen-fs-gitee's IIFE
+  // build. Do NOT add 'Gitee' here: a coincidental window.Gitee (e.g. some
+  // third-party Gitee widget) would shadow the real backend and break mounting
+  // with "Invalid mount configuration".
+  'zen-fs-gitee': ['ZenFSGitee'],
   'zen-fs-remotestoragejs': ['ZenFSRemoteStorage', 'RemoteStorageFileSystem'],
 };
 
@@ -387,15 +391,22 @@ const OPTIONAL_BACKEND_GLOBALS: Record<string, string[]> = {
  */
 async function importOptionalBackend(pkg: string): Promise<any> {
   const candidates = OPTIONAL_BACKEND_GLOBALS[pkg];
-  if (candidates) {
-    for (const name of candidates) {
-      const g = (globalThis as any)[name];
-      if (g) return g;
-    }
-  }
   try {
+    // Prefer a real ESM/CJS module import. In a bundler (Vite/webpack) or
+    // import-map environment this is the only correct path and yields the
+    // named exports (e.g. `Gitee`). Falling back to a global first would let a
+    // coincidental `window.Gitee` (some third-party Gitee widget) shadow the
+    // real backend and break mounting with "Invalid mount configuration".
     return await import(pkg);
   } catch {
+    // Fall back to a UMD global only when a module import is impossible
+    // (no-build <script> environments that loaded the UMD bundle).
+    if (candidates) {
+      for (const name of candidates) {
+        const g = (globalThis as any)[name];
+        if (g) return g;
+      }
+    }
     const globalHint = candidates?.length
       ? `, or load its UMD bundle via <script src=".../${pkg}.js"> (exposes global "${candidates[0]}")`
       : '';
