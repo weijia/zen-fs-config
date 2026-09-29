@@ -32,6 +32,12 @@ jobs:
         run: npm run build
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "zen-fs-config@${VERSION}" version 2>/dev/null | grep -q "${VERSION}"; then
+            echo "zen-fs-config@${VERSION} already published on npm, skipping publish step"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
