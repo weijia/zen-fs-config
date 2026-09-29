@@ -35,7 +35,7 @@ npm install zen-fs-remotestoragejs # RemoteStorage 副本
 
 ## 通过 `<script>` 标签直接使用（无需构建）
 
-包内置了一个自包含的浏览器构建 `dist/zen-fs-config.js`，它把**核心**依赖（`@zenfs/core`、`@zenfs/dom`、`zen-fs-sync`、`zen-fs-cache`）打包在一起，并将库挂载到全局变量 `window.ZenFSConfig`。无需 npm install、无需打包工具，直接放入任意 HTML 页面即可。**云后端（GitHub / Gitee / RemoteStorage）并不包含在自包含包内**——见下方小节了解如何在 `<script>` 模式下启用它们。
+包内置了一个自包含的浏览器构建 `dist/zen-fs-config.js`，它把**核心**依赖（`@zenfs/core`、`@zenfs/dom`、`zen-fs-sync`、`zen-fs-cache`）打包在一起，并将库挂载到全局变量 `window.ZenFSConfig`。无需 npm install、无需打包工具，直接放入任意 HTML 页面即可。**云后端（GitHub / Gitee / RemoteStorage）并不包含在自包含包内**——见下方小节，了解如何在 `<script>` 模式下启用它们（**无需 import map**）。
 
 ```html
 <script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
@@ -55,11 +55,33 @@ npm install zen-fs-remotestoragejs # RemoteStorage 副本
 
 > 浏览器构建包含纯 JS 实现的 SHA-256 回退，因此即使在 `crypto.subtle` 不可用的非安全上下文（普通 HTTP）中，版本追踪也能正常工作。
 
-### 在 `<script>` 模式下启用云后端（GitHub / Gitee / RemoteStorage）
+### 在 `<script>` 模式下启用云后端（GitHub / Gitee / RemoteStorage）—— **无需 import map**
 
-自包含包**不包含**云后端实现——它们是可选对等依赖，为保持包体积精简而被排除在核心之外。在无编译的 `<script>` 场景下，用以下任一方式启用：
+自包含核心包**不包含**云后端实现——它们是可选对等依赖，为保持包体积精简而被排除在核心之外。好消息是：**三个云包现在都已发布浏览器全局（UMD）构建**，因此在无编译的 `<script>` 页面里，你只需用普通的 `<script>` 标签即可启用它们——**无需 import map、也无需打包器**：
 
-**方式 A — import map（推荐，无需 UMD 构建）**。把裸包名映射到 ESM CDN；包内的动态 `import('zen-fs-gitee')` 会由浏览器的 import map 解析到 CDN 上的 ESM 模块（import map 对动态 `import()` 同样生效，所有现代浏览器均支持）。用法与打包器环境完全一致：
+```html
+<script src="https://unpkg.com/zen-fs-gitee/dist/zen-fs-gitee.global.js"></script>
+<script src="https://unpkg.com/zen-fs-github/dist/zen-fs-github.global.js"></script>
+<script src="https://unpkg.com/zen-fs-remotestoragejs/dist/zen-fs-remotestoragejs.global.js"></script>
+<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
+<script>
+  (async () => {
+    const { connect } = window.ZenFSConfig;
+    const { repo } = await connect('my-app', {
+      backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+    });
+  })();
+</script>
+```
+
+构建文件 → 全局变量映射：
+- `zen-fs-gitee` → `window.ZenFSGitee`（构建文件：`dist/zen-fs-gitee.global.js`）
+- `zen-fs-github` → `window.ZenFSGitHub`（构建文件：`dist/zen-fs-github.global.js`；v1.1.3+）
+- `zen-fs-remotestoragejs` → `window.ZenFSRemoteStorage`（构建文件：`dist/zen-fs-remotestoragejs.global.js`）
+
+`zen-fs-config` 会自动识别这些全局变量（`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`）并直接使用，跳过裸 `import()`。由于三个包都声明了 `browser`/`unpkg` 字段，裸包名 URL（如 `https://unpkg.com/zen-fs-github`）同样会返回全局构建——如果你愿意，也可以把前面三行 `<script>` 简写成裸 URL。
+
+**备选 —— import map（可选，仅当你需要 ESM 语义时）**。如果不想用全局脚本，也可以把裸包名映射到 ESM CDN，由包内的动态 `import()` 去解析。这完全是可选的——上面的 UMD 全局方式更简单，且不需要 import map：
 
 ```html
 <script type="importmap">
@@ -81,21 +103,6 @@ npm install zen-fs-remotestoragejs # RemoteStorage 副本
   })();
 </script>
 ```
-
-**方式 B — UMD 全局（适用于发布了 `.global.js` 构建的包）**。三个云包现在都已发布浏览器全局构建：
-- `zen-fs-gitee` → `window.ZenFSGitee`（构建文件：`dist/zen-fs-gitee.global.js`）
-- `zen-fs-remotestoragejs` → `window.ZenFSRemoteStorage`（构建文件：`dist/zen-fs-remotestoragejs.global.js`）
-- `zen-fs-github` → `window.ZenFSGitHub`（构建文件：`dist/zen-fs-github.global.js`；v1.1.3+ 起提供）
-
-用额外的 `<script>` 引入对应的 `.global.js`。**推荐显式指向 `.global.js` 文件**——若只写裸包名 URL，unpkg 默认返回 CJS 的 `main`，在浏览器里直接执行会报错；**除非**该包声明了 `browser`/`unpkg` 字段（如 `zen-fs-github` 已声明），此时裸 URL 也会返回全局构建。`zen-fs-config` 会自动识别全局变量（`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`）并直接使用，跳过裸 `import()`：
-
-```html
-<script src="https://unpkg.com/zen-fs-gitee/dist/zen-fs-gitee.global.js"></script>
-<script src="https://unpkg.com/zen-fs-github/dist/zen-fs-github.global.js"></script>
-<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
-```
-
-> 三种云后端现已都提供 UMD 全局构建，纯 `<script>` 页面均可直接通过对应的 `<script src=".../dist/*.global.js">` 使用 GitHub/Gitee/RemoteStorage。（`zen-fs-github` 需升级到 v1.1.3+，该版本新增了 `dist/zen-fs-github.global.js` 全局构建。）
 
 ## 快速开始
 

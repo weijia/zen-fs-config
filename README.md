@@ -38,7 +38,7 @@ npm install zen-fs-remotestoragejs # RemoteStorage replica
 
 ## Usage via `<script>` tag (no build step)
 
-A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bundles the **core** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page. **Cloud backends (GitHub / Gitee / RemoteStorage) are NOT bundled** — see the section below for how to enable them in `<script>` mode.
+A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bundles the **core** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page. **Cloud backends (GitHub / Gitee / RemoteStorage) are NOT bundled** — see the section below to enable them in `<script>` mode with **no import map required**.
 
 ```html
 <script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
@@ -58,11 +58,33 @@ A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bund
 
 > The browser bundle includes a pure-JS SHA-256 fallback, so version tracking works even in non-secure contexts (plain HTTP) where `crypto.subtle` is unavailable.
 
-### Enabling cloud backends (GitHub / Gitee / RemoteStorage) in `<script>` mode
+### Enabling cloud backends (GitHub / Gitee / RemoteStorage) in `<script>` mode — **no import map required**
 
-The self-contained bundle does **not** include the cloud backend implementations — they are optional peer packages kept out of the core to keep the bundle small. In a no-build `<script>` setup you enable them in one of two ways:
+The self-contained core bundle does **not** include the cloud backend implementations — they are optional peer packages kept out of the core to keep the bundle small. The good news: **all three cloud packages now ship a browser global (UMD) build**, so in a no-build `<script>` page you can enable them with plain `<script>` tags — **no import map and no bundler needed**:
 
-**Option A — import map (recommended, no UMD build needed).** Map the bare package names to an ESM CDN; the dynamic `import('zen-fs-gitee')` inside the bundle is then resolved by the browser's import map to the CDN ESM module (import maps apply to dynamic `import()` in all modern browsers). Use the backends exactly as in a bundler project:
+```html
+<script src="https://unpkg.com/zen-fs-gitee/dist/zen-fs-gitee.global.js"></script>
+<script src="https://unpkg.com/zen-fs-github/dist/zen-fs-github.global.js"></script>
+<script src="https://unpkg.com/zen-fs-remotestoragejs/dist/zen-fs-remotestoragejs.global.js"></script>
+<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
+<script>
+  (async () => {
+    const { connect } = window.ZenFSConfig;
+    const { repo } = await connect('my-app', {
+      backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+    });
+  })();
+</script>
+```
+
+Global build → global variable mapping:
+- `zen-fs-gitee` → `window.ZenFSGitee` (build: `dist/zen-fs-gitee.global.js`)
+- `zen-fs-github` → `window.ZenFSGitHub` (build: `dist/zen-fs-github.global.js`; v1.1.3+)
+- `zen-fs-remotestoragejs` → `window.ZenFSRemoteStorage` (build: `dist/zen-fs-remotestoragejs.global.js`)
+
+`zen-fs-config` auto-detects these globals (`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`) and uses them directly, skipping the bare `import()`. Because all three packages declare a `browser`/`unpkg` field, a bare package URL (e.g. `https://unpkg.com/zen-fs-github`) also returns the global build — so you may shorten the three `<script>` lines to bare URLs if you prefer.
+
+**Alternative — import map (optional, only if you want ESM semantics).** Instead of global scripts, you can map the bare package names to an ESM CDN so the bundle's dynamic `import()` resolves them. This is entirely optional — the UMD globals above are simpler and need no import map:
 
 ```html
 <script type="importmap">
@@ -84,21 +106,6 @@ The self-contained bundle does **not** include the cloud backend implementations
   })();
 </script>
 ```
-
-**Option B — UMD global (for packages that ship a `.global.js` build).** All three cloud packages now publish a browser global build:
-- `zen-fs-gitee` → `window.ZenFSGitee` (build: `dist/zen-fs-gitee.global.js`)
-- `zen-fs-remotestoragejs` → `window.ZenFSRemoteStorage` (build: `dist/zen-fs-remotestoragejs.global.js`)
-- `zen-fs-github` → `window.ZenFSGitHub` (build: `dist/zen-fs-github.global.js`; available from v1.1.3+)
-
-Load the matching `.global.js` with an extra `<script>`. Pointing at the `.global.js` file explicitly is recommended; a bare package URL serves the CJS `main` and throws in the browser **unless** the package declares a `browser`/`unpkg` field (e.g. `zen-fs-github` does), in which case the bare URL also returns the global build. `zen-fs-config` auto-detects the global (`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`) and uses it directly, skipping the bare `import()`:
-
-```html
-<script src="https://unpkg.com/zen-fs-gitee/dist/zen-fs-gitee.global.js"></script>
-<script src="https://unpkg.com/zen-fs-github/dist/zen-fs-github.global.js"></script>
-<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
-```
-
-> All three cloud backends now ship a UMD global build, so a pure-`<script>` page can use GitHub/Gitee/RemoteStorage directly via the matching `<script src=".../dist/*.global.js">`. (For `zen-fs-github`, upgrade to v1.1.3+, which adds the `dist/zen-fs-github.global.js` global build.)
 
 ## Quick Start
 
