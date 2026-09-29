@@ -1187,6 +1187,22 @@ Source file: /app-a/db.json (mtime=1700000000123)
      → Next sync: source.mtimeMs === target.mtimeMs → skip (no spurious copy)
 ```
 
+### Backend mtime implementation status
+
+The `writeFileWithMtime` mechanism (above) only preserves mtime if the target
+backend actually persists it. Implementation status per backend:
+
+| Backend | Protocol can set mtime? | Strategy | `write` path writes sidecar? | Status |
+|---|---|---|---|---|
+| RemoteStorage (`zen-fs-remotestoragejs`) | No — server `Last-Modified` is the PUT arrival time, client cannot control it | `.mtime` sidecar | **Yes** — `writeFile` writes the sidecar when `preciseMtime` is enabled (default on) | Working |
+| Gitee (`zen-fs-gitee`) | No — Git has no per-file mtime | `.mtime` sidecar | **Yes** — `write()` / `writeSync()` and `writeFile` / `writeFileSync` all persist it (since 1.2.17) | **Fixed in 1.2.17** |
+
+Consequence of the Gitee gap: files pushed through the normal write path have
+no `.mtime` sidecar, so `stat()` falls back to the commit time. That commit
+time never equals the source's real mtime, so the sync engine re-PUTs
+content-identical files every cycle (empty / "no-diff" commits on Gitee). Fix
+tracked in `zen-fs-gitee/DESIGN.md` §5.
+
 ## 13. Peer Dependencies
 
 | Package | Role | Version | Required |
