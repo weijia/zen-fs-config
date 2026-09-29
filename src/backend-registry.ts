@@ -6,12 +6,14 @@
  * Core principle: zen-fs-config does NOT hardcode every ZenFS backend.
  * Instead, it provides:
  *   1. A simple registry API (registerBackend, createBackend, etc.)
- *   2. Two built-in backends (InMemory + IndexedDB) — zero extra config
+ *   2. Built-in backends: InMemory + IndexedDB (zero extra config), plus
+ *      GitHub / Gitee / RemoteStorage registered by default (optional peer
+ *      packages — install the package to activate; see importOptionalBackend)
  *   3. A wrapZenFSFileSystem() helper to adapt any ZenFS FileSystem
  *      implementation into the BackendInstance interface
  *
- * Applications (like zen-fs-config-admin) register whatever backends
- * they need at startup.  Adding a new backend never requires changing
+ * Applications may still register additional custom backends (e.g. WebDAV)
+ * at startup.  Adding a brand-new backend type never requires forking
  * zen-fs-config itself.
  */
 
@@ -328,4 +330,179 @@ registerBackend('IndexedDB', async (options) => {
     { key: 'storeName', label: 'Store Name', type: 'text', placeholder: 'zen-fs-config' },
   ],
   defaultOptions: { storeName: '' },
+});
+
+// ---------------------------------------------------------------------------
+// Cloud backends (optional peer packages) — registered by default.
+//
+// These backends live in separate packages so the core stays lean. They are
+// registered here so applications get them "out of the box" — just install the
+// optional package and the type becomes available. If the package is missing,
+// createBackend() throws a clear install hint instead of a cryptic error.
+//
+//   npm install zen-fs-github          (GitHub)
+//   npm install zen-fs-gitee           (Gitee)
+//   npm install zen-fs-remotestoragejs (RemoteStorage)
+// ---------------------------------------------------------------------------
+
+/** In-memory fallback used when localStorage is unavailable (e.g. Node.js). */
+const _memCache = new Map<string, string>();
+function _cacheGet(key: string): string | null {
+  const ls = (globalThis as any).localStorage;
+  try {
+    if (ls) return ls.getItem(key);
+  } catch { /* ignore */ }
+  return _memCache.get(key) ?? null;
+}
+function _cacheSet(key: string, value: string): void {
+  const ls = (globalThis as any).localStorage;
+  try {
+    if (ls) { ls.setItem(key, value); return; }
+  } catch { /* ignore */ }
+  _memCache.set(key, value);
+}
+
+/**
+ * Map optional peer package name -> candidate global variable names exposed by
+ * a UMD bundle (used in the no-build <script> environment). First match wins.
+ */
+const OPTIONAL_BACKEND_GLOBALS: Record<string, string[]> = {
+  'zen-fs-github': ['ZenFSGitHub', 'Github'],
+  'zen-fs-gitee': ['ZenFSGitee', 'Gitee'],
+  'zen-fs-remotestoragejs': ['ZenFSRemoteStorage', 'RemoteStorageFileSystem'],
+};
+
+/**
+ * Lazily import an optional backend package, script-mode friendly.
+ *
+ * Resolution order:
+ *   1. A UMD bundle loaded via <script> may have exposed the module namespace
+ *      on `globalThis` (e.g. `window.ZenFSGitee`). This is what makes the
+ *      no-build <script> workflow work without a bundler.
+ *   2. Otherwise fall back to a dynamic `import()` — which works in a bundler
+ *      environment, or in any environment that provides an import map mapping
+ *      the bare specifier to a URL (e.g. <script type="importmap">).
+ *
+ * Throws a clear, actionable error only if neither path resolves the package.
+ */
+async function importOptionalBackend(pkg: string): Promise<any> {
+  const candidates = OPTIONAL_BACKEND_GLOBALS[pkg];
+  if (candidates) {
+    for (const name of candidates) {
+      const g = (globalThis as any)[name];
+      if (g) return g;
+    }
+  }
+  try {
+    return await import(pkg);
+  } catch {
+    const globalHint = candidates?.length
+      ? `, or load its UMD bundle via <script src=".../${pkg}.js"> (exposes global "${candidates[0]}")`
+      : '';
+    throw new Error(
+      `Backend package "${pkg}" is not available. ` +
+      `In a bundler/import-map environment run: npm install ${pkg}${globalHint}.`,
+    );
+  }
+}
+
+registerBackend('GitHub', async (options) => {
+  const { Github } = await importOptionalBackend('zen-fs-github');
+  const backend = await wrapZenFSFileSystem({
+    backend: Github,
+    token: options.token,
+    owner: options.owner,
+    repo: options.repo,
+    branch: options.branch,
+    baseUrl: options.baseUrl || undefined,
+  });
+
+  // shouldSync: detect remote changes via Git tree SHA (cross-session cached)
+  const { owner, repo, branch = 'main', token, baseUrl = 'https://api.github.com' } = options as Record<string, string>;
+  const cacheKey = `zen-fs-github-sync:${owner}/${repo}/${branch}`;
+  (backend as any).shouldSync = async (): Promise<boolean> => {
+    try {
+      const headers: Record<string, string> = { Accept: 'application/vnd.github.v3+json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const base = String(baseUrl).replace(/\/$/, '');
+      const branchRes = await (globalThis as any).fetch(`${base}/repos/${owner}/${repo}/branches/${branch}`, { headers });
+      if (!branchRes.ok) return true;
+      const commitSha = (await branchRes.json())?.commit?.sha;
+      if (!commitSha) return true;
+      const commitRes = await (globalThis as any).fetch(`${base}/repos/${owner}/${repo}/git/commits/${commitSha}`, { headers });
+      if (!commitRes.ok) return true;
+      const treeSha = (await commitRes.json())?.tree?.sha;
+      if (!treeSha) return true;
+      const cached = _cacheGet(cacheKey);
+      if (cached === treeSha) return false;
+      _cacheSet(cacheKey, treeSha);
+      return true;
+    } catch { return true; }
+  };
+
+  return backend;
+}, {
+  type: 'GitHub',
+  label: 'GitHub',
+  icon: '🐙',
+  fields: [
+    { key: 'owner', label: 'Owner', type: 'text', placeholder: 'weijia', required: true },
+    { key: 'repo', label: 'Repo', type: 'text', placeholder: 'my-configs', required: true },
+    { key: 'branch', label: 'Branch', type: 'text', placeholder: 'main' },
+    { key: 'token', label: 'Token', type: 'password', placeholder: 'ghp_xxxx' },
+    { key: 'baseUrl', label: 'API URL', type: 'text', placeholder: 'https://api.github.com' },
+  ],
+  defaultOptions: { owner: '', repo: '', branch: 'main', token: '', baseUrl: '' },
+  accountFields: ['token', 'owner', 'baseUrl'],
+});
+
+registerBackend('Gitee', async (options) => {
+  const { Gitee } = await importOptionalBackend('zen-fs-gitee');
+  // GiteeFS has built-in shouldSync() + getRevision() that wrapZenFSFileSystem
+  // auto-passthrough; its caches are persisted to IndexedDB internally.
+  return wrapZenFSFileSystem({
+    backend: Gitee,
+    token: options.token,
+    owner: options.owner,
+    repo: options.repo,
+    branch: options.branch,
+    baseUrl: options.baseUrl || undefined,
+  });
+}, {
+  type: 'Gitee',
+  label: 'Gitee',
+  icon: '🦊',
+  fields: [
+    { key: 'owner', label: 'Owner', type: 'text', placeholder: 'weijia', required: true },
+    { key: 'repo', label: 'Repo', type: 'text', placeholder: 'my-configs', required: true },
+    { key: 'branch', label: 'Branch', type: 'text', placeholder: 'master' },
+    { key: 'token', label: 'Token', type: 'password', placeholder: 'gitee token' },
+    { key: 'baseUrl', label: 'API URL', type: 'text', placeholder: 'https://gitee.com/api/v5' },
+  ],
+  defaultOptions: { owner: '', repo: '', branch: 'master', token: '', baseUrl: '' },
+  accountFields: ['token', 'owner', 'baseUrl'],
+});
+
+registerBackend('RemoteStorage', async (options) => {
+  const { RemoteStorageFileSystem } = await importOptionalBackend('zen-fs-remotestoragejs');
+  // RemoteStorageFileSystem already implements the BackendInstance interface
+  // (getRevision via ETag, shouldSync via persisted ETag snapshot).
+  return new RemoteStorageFileSystem({
+    href: options.href,
+    token: options.token,
+    basePath: options.basePath || undefined,
+    preciseMtime: true,
+    persistCache: true,
+  });
+}, {
+  type: 'RemoteStorage',
+  label: 'RemoteStorage',
+  icon: '📡',
+  fields: [
+    { key: 'href', label: 'User Address (href)', type: 'text', placeholder: 'user@5apps.com', required: true },
+    { key: 'token', label: 'Bearer Token', type: 'password', placeholder: 'rs-xxxxxxxx', required: true },
+    { key: 'basePath', label: 'Base Path', type: 'text', placeholder: '/zen-fs-config/' },
+  ],
+  defaultOptions: { href: '', token: '', basePath: '/' },
+  accountFields: ['href', 'token'],
 });

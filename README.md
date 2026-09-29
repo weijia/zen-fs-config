@@ -2,6 +2,8 @@
 
 Distributed configuration management library built on [ZenFS](https://github.com/weijia/zen-fs), with IndexedDB as the offline-first local primary backend and user-provided remote backends as replicas that sync automatically. Supports app isolation, shared spaces, node-local config, and conflict-safe operations.
 
+> **Architecture direction (REQUIREMENTS §9 D2)**: the core uses a **GenericSyncGroup base with two type implementations** — `config-sync` (versioning/tombstone/conflict + hosts `.meta/app-data-groups/`) and `data-sync` (plain file sync, optionally governed as an app-data-group under config-sync); **backend-type management and data-backend info persistence stay in the core `zen-fs-config` (UI is presentation-only)**. This document describes the **current implementation (two classes)**; the target architecture follows D2.
+
 **GitHub**: https://github.com/weijia/zen-fs-config
 **NPM**: `zen-fs-config`
 **Design doc**: [DESIGN.md](./DESIGN.md)
@@ -12,7 +14,7 @@ Distributed configuration management library built on [ZenFS](https://github.com
 - **Multi-backend sync** — Add any number of remote replicas (Gitee, GitHub, RemoteStorage, WebDAV, etc.) with automatic bi-directional sync
 - **App isolation** — Each app gets its own namespace under `/{appId}/`
 - **Shared spaces** — Cross-app shared config under `/shared/`
-- **Node-local config** — Per-device settings under `/nodes/{nodeId}/` that never sync
+- **Node-local config** — Per-device settings under `/nodes/{nodeId}/`, synced to backends by the main bidirectional pair (each node isolated by its `nodeId` subdirectory)
 - **Self-describing topology** — Backend configuration is stored as files in `.meta/backends/`, so re-opening a repo restores everything automatically
 - **Conflict safety** — Conflicts are archived instead of silently overwritten; JSON deep-merge is available as a strategy
 - **Version tracking** — Every config file has a version sidecar with version number and SHA-256 hash
@@ -21,23 +23,31 @@ Distributed configuration management library built on [ZenFS](https://github.com
 ## Installation
 
 ```bash
+# Core dependencies (always required)
 npm install zen-fs-config @zenfs/core @zenfs/dom zen-fs-sync
+
+# Optional cloud backends — peer dependencies, install only the ones you actually use
+npm install zen-fs-github           # GitHub (repo/branch) replica
+npm install zen-fs-gitee            # Gitee (repo/branch) replica
+npm install zen-fs-remotestoragejs # RemoteStorage replica
 ```
 
 > `@zenfs/dom` provides the IndexedDB backend (required in browser environments). `zen-fs-cache` is an optional dependency for remote request caching.
+>
+> **Cloud backends are optional peer dependencies, installed by you (the consumer), not bundled by `zen-fs-config`.** The core *pre-registers* the `GitHub`, `Gitee`, and `RemoteStorage` backend **types** (so you can pass `type: 'Gitee'`, etc. straight to `addBackend`/`connect` without calling `registerBackend`), but it does **not** ship their implementations. You must `npm install` the matching package yourself; otherwise `createBackend()` throws a clear "package not installed — run `npm install <pkg>`" hint. This keeps the core bundle small and avoids forcing an internet dependency on everyone.
 
 ## Usage via `<script>` tag (no build step)
 
-A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bundles **all** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page:
+A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bundles the **core** dependencies (`@zenfs/core`, `@zenfs/dom`, `zen-fs-sync`, `zen-fs-cache`) and exposes the library on the global `window.ZenFSConfig`. No npm install, no bundler — just drop it into any HTML page. **Cloud backends (GitHub / Gitee / RemoteStorage) are NOT bundled** — see the section below for how to enable them in `<script>` mode.
 
 ```html
 <script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
 <script>
   (async () => {
-    const { createConfigRepo } = window.ZenFSConfig;
+    const { connect } = window.ZenFSConfig;
 
     // IndexedDB primary backend is created automatically
-    const repo = await createConfigRepo('my-app');
+    const { repo } = await connect('my-app');
 
     repo.setConfig('greeting.json', { msg: 'hello' });
     const cfg = await repo.getConfig('greeting.json');
@@ -48,42 +58,86 @@ A self-contained browser bundle is published at `dist/zen-fs-config.js`. It bund
 
 > The browser bundle includes a pure-JS SHA-256 fallback, so version tracking works even in non-secure contexts (plain HTTP) where `crypto.subtle` is unavailable.
 
+### Enabling cloud backends (GitHub / Gitee / RemoteStorage) in `<script>` mode
+
+The self-contained bundle does **not** include the cloud backend implementations — they are optional peer packages kept out of the core to keep the bundle small. In a no-build `<script>` setup you enable them in one of two ways:
+
+**Option A — import map (recommended, no UMD build needed).** Map the bare package names to an ESM CDN; the dynamic `import('zen-fs-gitee')` inside the bundle is then resolved by the browser's import map to the CDN ESM module (import maps apply to dynamic `import()` in all modern browsers). Use the backends exactly as in a bundler project:
+
+```html
+<script type="importmap">
+{
+  "imports": {
+    "zen-fs-github": "https://esm.sh/zen-fs-github",
+    "zen-fs-gitee": "https://esm.sh/zen-fs-gitee",
+    "zen-fs-remotestoragejs": "https://esm.sh/zen-fs-remotestoragejs"
+  }
+}
+</script>
+<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
+<script>
+  (async () => {
+    const { connect } = window.ZenFSConfig;
+    const { repo } = await connect('my-app', {
+      backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+    });
+  })();
+</script>
+```
+
+**Option B — UMD global (for packages that ship a `.global.js` build).** All three cloud packages now publish a browser global build:
+- `zen-fs-gitee` → `window.ZenFSGitee` (build: `dist/zen-fs-gitee.global.js`)
+- `zen-fs-remotestoragejs` → `window.ZenFSRemoteStorage` (build: `dist/zen-fs-remotestoragejs.global.js`)
+- `zen-fs-github` → `window.ZenFSGitHub` (build: `dist/zen-fs-github.global.js`; available from v1.1.3+)
+
+Load the matching `.global.js` with an extra `<script>`. Pointing at the `.global.js` file explicitly is recommended; a bare package URL serves the CJS `main` and throws in the browser **unless** the package declares a `browser`/`unpkg` field (e.g. `zen-fs-github` does), in which case the bare URL also returns the global build. `zen-fs-config` auto-detects the global (`window.ZenFSGitee` / `window.ZenFSGitHub` / `window.ZenFSRemoteStorage`) and uses it directly, skipping the bare `import()`:
+
+```html
+<script src="https://unpkg.com/zen-fs-gitee/dist/zen-fs-gitee.global.js"></script>
+<script src="https://unpkg.com/zen-fs-github/dist/zen-fs-github.global.js"></script>
+<script src="https://unpkg.com/zen-fs-config/dist/zen-fs-config.js"></script>
+```
+
+> All three cloud backends now ship a UMD global build, so a pure-`<script>` page can use GitHub/Gitee/RemoteStorage directly via the matching `<script src=".../dist/*.global.js">`. (For `zen-fs-github`, upgrade to v1.1.3+, which adds the `dist/zen-fs-github.global.js` global build.)
+
 ## Quick Start
 
 ### 1. Initialize (zero-configuration)
 
 ```typescript
-import { createConfigRepo } from 'zen-fs-config';
+import { connect } from 'zen-fs-config';
 
 // Creates an IndexedDB primary backend automatically
-const repo = await createConfigRepo('my-app');
+const { repo } = await connect('my-app');
 
 // Read/write config (synchronous API, served from IndexedDB)
 repo.setConfig('/database', { host: 'localhost', port: 5432 });
 const db = repo.getConfig<{ host: string; port: number }>('/database');
 ```
 
-### 2. Add a remote replica backend
+### 2. Write config values
 
 ```typescript
-import { registerBackend } from 'zen-fs-config';
-import { Gitee } from 'zen-fs-gitee';
+// You can write as many config files as you like under the app root
+repo.setConfig('/cache', { ttl: 3600, maxSize: '100MB' });
+repo.setConfig('/feature-flags', { newUI: true, beta: false });
+```
 
-// Register the backend type first
-registerBackend('Gitee', async (options) => {
-  return Gitee.create(options);
-});
+### 3. Add a remote replica backend
 
-// Dynamically add a replica — auto-syncs bi-directionally with local IndexedDB
+```typescript
+// GitHub / Gitee / RemoteStorage are pre-registered by the core — no registerBackend needed.
+// Install the package first (e.g. `npm install zen-fs-gitee` — see Installation), then:
 await repo.addBackend('gitee-prod', 'Gitee', {
   token: 'your-token',
   owner: 'your-name',
   repo: 'config-repo',
   branch: 'main',
 }, 'Production Gitee config repo');
+// ↑ auto-syncs bi-directionally with the local IndexedDB primary
 ```
 
-### 3. Automatic sync
+### 4. Automatic sync
 
 ```typescript
 // Writing to IndexedDB triggers auto-sync to all replicas
@@ -93,11 +147,11 @@ repo.setConfig('/database', { host: 'new-host', port: 5432 });
 await repo.flush();
 ```
 
-### 4. Re-open on next page load
+### 5. Re-open on next page load
 
 ```typescript
 // Just pass the appId — IndexedDB restores everything
-const repo = await createConfigRepo('my-app');
+const { repo } = await connect('my-app');
 
 // Config is readable immediately (offline)
 const db = repo.getConfig<{ host: string; port: number }>('/database');
@@ -107,10 +161,10 @@ const backends = await repo.getBackends();
 console.log(backends?.backends.map(b => b.id)); // ['local-idb', 'gitee-prod', ...]
 ```
 
-### Initialize with a backend from the start
+### 6. Initialize with a backend from the start
 
 ```typescript
-const repo = await createConfigRepo('my-app', {
+const { repo } = await connect('my-app', {
   primaryBackendId: 'gitee-prod',
   backendInfo: {
     type: 'Gitee',
@@ -120,16 +174,17 @@ const repo = await createConfigRepo('my-app', {
 });
 
 // Next time you don't need to pass backend info again
-const repo2 = await createConfigRepo('my-app');
+const { repo: repo2 } = await connect('my-app');
 ```
 
 ## Unified entry point: `connect()`
 
 If you don't know in advance whether a backend holds a config-sync repo or a
-data-sync group, use the unified `connect()` entry point. It auto-detects the
-group type by reading `/.meta/group-type` from the provided backend, then
-returns the matching handle — no need to call `createConfigRepo` /
-`createDataSyncGroup` yourself.
+data-sync group, use the unified `connect()` entry point. It always anchors on
+a config-sync repo (which hosts the data groups) and, when the backend is a
+data-sync backend, attaches it to the default app data group. There is no
+separate standalone data-sync entry — data groups are always
+managed by a config-sync repo via `createAppDataGroup` (decision A / T5).
 
 ```typescript
 import { connect } from 'zen-fs-config';
@@ -142,7 +197,7 @@ const result = await connect('my-app', {
   backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
 });
 if (result.groupType === 'data-sync') {
-  // result.dataGroup — a standalone DataSyncGroup
+  // result.dataGroup — a config-managed data group (result.repo is its host)
 } else {
   // result.repo — a ConfigRepo
 }
@@ -150,14 +205,17 @@ if (result.groupType === 'data-sync') {
 
 Detection & dispatch rules:
 
-- Reads `/.meta/group-type` from the backend: `config-sync` → `ConfigRepo`, `data-sync` → `DataSyncGroup`.
+- Always creates (or reuses) a **config-sync `ConfigRepo`** as the anchor.
+- Reads `/.meta/group-type` from the backend: `config-sync` → connect the repo to that backend; `data-sync` → attach the backend to the default app data group inside the config-sync repo.
 - If that file is absent (a brand-new backend), falls back to `options.groupType` (default `config-sync`).
 - If you pass `options.groupType` and it conflicts with the backend's actual type, `connect()` throws a `Group type mismatch` error.
-- The returned `ConnectResult` always carries `groupType`, plus either `repo` (config-sync) or `dataGroup` (data-sync).
+- The returned `ConnectResult` always carries `groupType` and `repo` (the config-sync repo). It also carries `dataGroup` (the default app data group) on first launch and when a data-sync backend was connected.
 
 | Method | Description |
 |--------|-------------|
-| `connect(appId, options?)` | Unified entry: auto-detect group type and return a `ConfigRepo` or `DataSyncGroup` |
+| `connect(appId, options?)` | Unified entry: always returns a `ConfigRepo`, optionally with a default data group |
+
+`connect()` accepts the same options as `createConfigRepo` (`backendInfo`, `primaryBackendId`, `idbStoreName`, `nodeId`, `folderPath`, `cache`, `serializer`, `onConflict`, `syncPollIntervalMs`) plus `groupType`. On Node.js, pass `folderPath` (or set `ZEN_FS_CONFIG_HOME`) to enable local disk persistence.
 
 ## Directory Structure
 
@@ -165,7 +223,7 @@ Detection & dispatch rules:
 /
 ├── {appId}/              # App-private config (auto-synced to replicas)
 ├── shared/               # Cross-app shared config (bi-directional sync)
-├── nodes/{nodeId}/       # Node-local config (never synced)
+├── nodes/{nodeId}/       # Node-local config (synced; namespaced by nodeId)
 └── .meta/
     ├── backends/          # Backend topology (one file per backend)
     │   ├── local-idb.json
@@ -179,20 +237,21 @@ Each config file has a sidecar version file: `db.json` → `.db.json.version` (v
 
 ## Core API
 
+> **Entry point**: use the unified `connect(appId, options?)` (see above) to obtain a `ConfigRepo`. `createConfigRepo` is still exported as a lower-level factory but `connect` is recommended — it also handles data-sync groups and Node.js local persistence (`folderPath` / `ZEN_FS_CONFIG_HOME`).
+
 ### ConfigRepo
 
 | Method | Description |
 |--------|-------------|
-| `createConfigRepo(appId, options?)` | Create a config repo. IndexedDB is always primary; `backendInfo` becomes a replica. |
 | `getConfig<T>(path)` | Synchronously read app config (from IndexedDB) |
 | `setConfig(path, data)` | Synchronously write app config (async persistence + auto-sync) |
 | `addBackend(id, type, options, desc?)` | Dynamically add a replica backend with auto bi-directional sync |
 | `removeBackend(id)` | Remove a replica backend and stop syncing |
 | `getBackends()` | Read backend topology (aggregated from `.meta/backends/*.json`) |
 | `getNodeConfig<T>(nodeId, path)` | Asynchronously read node-local config |
-| `setNodeConfig(nodeId, path, data)` | Asynchronously write node-local config (not synced) |
-| `publishNodeConfig(nodeId)` | One-time push of node config to all backends |
-| `peekNodeConfig<T>(nodeId, path)` | Read-only view of another node's published config |
+| `setNodeConfig(nodeId, path, data)` | Write node-local config (local primary; synced to replicas via main pair) |
+| `publishNodeConfig(nodeId)` | Explicit one-shot push of node config to all backends (auto-sync also covers it) |
+| `peekNodeConfig<T>(nodeId, path)` | Read another node's config (from the synced-in local copy) |
 | `flush()` | Manually trigger all pending syncs |
 | `listConflicts()` | List all archived conflicts |
 | `resolveConflict(id, merged)` | Resolve a conflict with merged content |
@@ -201,25 +260,19 @@ Each config file has a sidecar version file: `db.json` → `.db.json.version` (v
 
 ### Backend Registration
 
-zen-fs-config includes two built-in backends:
-- **IndexedDB** — local primary backend (based on `@zenfs/dom`), no registration needed
+zen-fs-config bundles two built-in backends (no install needed):
+- **IndexedDB** — local primary backend (based on `@zenfs/dom`)
 - **InMemory** — in-memory backend (based on `@zenfs/core`), useful for testing
 
-Register custom backends:
+Three **cloud backend types are pre-registered by the core** (lazy-loaded on first use): `GitHub` (`zen-fs-github`), `Gitee` (`zen-fs-gitee`), and `RemoteStorage` (`zen-fs-remotestoragejs`). You do **not** need to call `registerBackend` for them — just install the matching package (see Installation) and pass `type: 'Gitee'`, etc. to `addBackend`/`connect`. `registerBackend` is only needed to add a *fully custom* backend or to override a built-in registration:
 
 ```typescript
 import { registerBackend } from 'zen-fs-config';
 
-// Register Gitee backend
+// Example: override the built-in Gitee registration with a custom factory
 registerBackend('Gitee', async (options) => {
   const { Gitee } = await import('zen-fs-gitee');
   return Gitee.create(options);
-});
-
-// Register RemoteStorage backend
-registerBackend('RemoteStorage', async (options) => {
-  const { createRemoteStorageFileSystem } = await import('zen-fs-remotestoragejs');
-  return createRemoteStorageFileSystem(options);
 });
 ```
 
@@ -238,7 +291,7 @@ ConfigRepo
 ```
 
 - **IndexedDB is the only primary backend** — all reads and writes go directly to IndexedDB, guaranteeing offline availability
-- **Remote backends are replicas** — added via `addBackend()` or `createConfigRepo({ backendInfo })`
+- **Remote backends are replicas** — added via `addBackend()` or `connect({ backendInfo })`
 - **Auto-sync** — changes to IndexedDB automatically propagate to all replicas
 - **Self-describing topology** — backend configuration lives in `.meta/backends/`, one JSON file per backend
 
@@ -250,6 +303,9 @@ ConfigRepo
 | `@zenfs/dom >=1.0.0` | IndexedDB backend (browser) | Yes (browser) |
 | `zen-fs-sync >=0.4.7` | Cross-backend sync engine | Yes |
 | `zen-fs-cache >=1.0.0` | ETag/TTL caching layer | No (optional) |
+| `zen-fs-github` | GitHub replica backend (**optional peer**) | No |
+| `zen-fs-gitee` | Gitee replica backend (**optional peer**) | No |
+| `zen-fs-remotestoragejs` | RemoteStorage replica backend (**optional peer**) | No |
 
 ## License
 

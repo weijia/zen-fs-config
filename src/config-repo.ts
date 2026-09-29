@@ -1598,6 +1598,7 @@ export class ConfigRepo implements IConfigRepo {
       this.appId,
       resolvedBackends,
       this.pollIntervalMs,
+      this,
     );
     await group.init();
 
@@ -1622,6 +1623,27 @@ export class ConfigRepo implements IConfigRepo {
     return group;
   }
 
+  /**
+   * Rewrite an app data group's descriptor (e.g. after addBackend/removeBackend)
+   * into .meta/app-data-groups/{appId}/{id}.json, keeping config-sync as the
+   * authoritative source of the data group's backend topology (FR2.3).
+   */
+  async updateAppDataGroupDescriptor(id: string, backends: AppDataBackendDescriptor[]): Promise<void> {
+    this.assertNotDisposed();
+    const descriptor: AppDataGroupDescriptor = {
+      id,
+      groupType: 'data-sync',
+      backends,
+    };
+    const descPath = this.appDataGroupFilePath(id);
+    await this.ensureDir(descPath);
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    await this.cachedFS.writeFile(descPath, bytes);
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
+    await this.writeVersionSidecar(descPath, version);
+  }
+
   async getAppDataGroup(id: string): Promise<AppDataGroup> {
     this.assertNotDisposed();
 
@@ -1639,6 +1661,7 @@ export class ConfigRepo implements IConfigRepo {
         this.appId,
         descriptor.backends,
         this.pollIntervalMs,
+        this,
       );
       await group.init();
       this.appDataGroups.set(id, group);
@@ -1731,10 +1754,12 @@ class AppDataGroupImpl implements AppDataGroup {
     groupId: string,
     appId: string,
     backends: AppDataBackendDescriptor[],
-    pollIntervalMs?: number,
+    pollIntervalMs: number | undefined,
+    parent: ConfigRepo,
   ) {
     this.groupId = groupId;
     this.appId = appId;
+    this.parent = parent;
     this.syncEngine = new ZenFSSync();
     this.localFS = null as any;
     this.fs = null as any;
@@ -1742,6 +1767,7 @@ class AppDataGroupImpl implements AppDataGroup {
     this._pollIntervalMs = pollIntervalMs;
   }
 
+  private parent: ConfigRepo;
   private _backends: AppDataBackendDescriptor[];
   private _pollIntervalMs?: number;
 
@@ -1838,6 +1864,9 @@ class AppDataGroupImpl implements AppDataGroup {
       log.warn(`[AppDataGroup:${this.groupId}] addBackend: initial sync failed for ${id}:`, err);
     }
     this.syncEngine.watch(pair.pairId);
+
+    // Write the updated backend list back into config-sync's app-data-groups (FR2.3).
+    await this.parent.updateAppDataGroupDescriptor(this.groupId, this.listBackends());
   }
 
   async removeBackend(id: string): Promise<void> {
@@ -1849,6 +1878,9 @@ class AppDataGroupImpl implements AppDataGroup {
 
     this.syncEngine.removePair(backend.pairId);
     this.dataBackends.delete(id);
+
+    // Write the updated backend list back into config-sync's app-data-groups (FR2.3).
+    await this.parent.updateAppDataGroupDescriptor(this.groupId, this.listBackends());
 
     if (backend.instance?.dispose) {
       await backend.instance.dispose();

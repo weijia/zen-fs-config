@@ -140,7 +140,8 @@ describe('Unified fs access for data storage', () => {
 
     expect(result.groupType).toBe('config-sync');
     expect(result.repo).toBeDefined();
-    expect(result.dataGroup).toBeUndefined();
+    // Data groups are always managed by config-sync: a default data group is created.
+    expect(result.dataGroup).toBeDefined();
 
     const repo = result.repo!;
 
@@ -162,6 +163,7 @@ describe('Unified fs access for data storage', () => {
     // Both fs.writeFile and setConfig write to the same /{appId}/ directory
     // and both are synced via the config-sync group's sync pairs.
 
+    await result.dataGroup?.dispose();
     await repo.dispose();
   });
 
@@ -180,7 +182,8 @@ describe('Unified fs access for data storage', () => {
 
     expect(result.groupType).toBe('data-sync');
     expect(result.dataGroup).toBeDefined();
-    expect(result.repo).toBeUndefined();
+    // Even when targeting a data group, config-sync always anchors it.
+    expect(result.repo).toBeDefined();
 
     const dataGroup = result.dataGroup!;
 
@@ -193,6 +196,7 @@ describe('Unified fs access for data storage', () => {
     expect(readBack).toBe(dataContent);
 
     await dataGroup.dispose();
+    await result.repo!.dispose();
   });
 
   // -------------------------------------------------------------------------
@@ -208,6 +212,7 @@ describe('Unified fs access for data storage', () => {
 
     const repo = configResult.repo!;
     const dataGroup = dataResult.dataGroup!;
+    const dataRepo = dataResult.repo!;
 
     // Both have .fs property
     expect(repo.fs).toBeDefined();
@@ -250,6 +255,7 @@ describe('Unified fs access for data storage', () => {
 
     await repo.dispose();
     await dataGroup.dispose();
+    await dataRepo.dispose();
   });
 
   // -------------------------------------------------------------------------

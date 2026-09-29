@@ -64,11 +64,13 @@ describe('connect() — unified entry point', () => {
   // -------------------------------------------------------------------------
   // Case 1: No backendInfo — defaults to config-sync
   // -------------------------------------------------------------------------
-  it('connect with no backendInfo defaults to config-sync', async () => {
+  it('connect with no backendInfo defaults to config-sync and creates a default data group', async () => {
     const result: ConnectResult = await connect('test-conn-app1', { nodeId: 'test-node' });
     expect(result.groupType).toBe('config-sync');
     expect(result.repo).toBeDefined();
-    expect(result.dataGroup).toBeUndefined();
+    // Data groups are always managed by config-sync: a default data group is created.
+    expect(result.dataGroup).toBeDefined();
+    await result.dataGroup!.dispose();
     await result.repo!.dispose();
   });
 
@@ -82,8 +84,10 @@ describe('connect() — unified entry point', () => {
     });
     expect(result.groupType).toBe('data-sync');
     expect(result.dataGroup).toBeDefined();
-    expect(result.repo).toBeUndefined();
+    // Even when targeting a data group, config-sync always anchors it.
+    expect(result.repo).toBeDefined();
     await result.dataGroup!.dispose();
+    await result.repo!.dispose();
   });
 
   // -------------------------------------------------------------------------

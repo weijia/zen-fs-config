@@ -12,11 +12,9 @@ export { createConfigRepo, ConfigRepo, LOCAL_IDB_BACKEND_ID } from './config-rep
 // Node.js local persistent backend (Folder) — self-registers on import
 export { resolveLocalPrimary, localPrimaryType, isBrowserEnv, FolderStore, registerFolderBackend } from './folder-backend';
 
-// Data-sync group (standalone)
-export { DataSyncGroup, createDataSyncGroup } from './data-sync-group';
-export type { DataSyncGroupOptions } from './data-sync-group';
-
-// Unified connect entry point
+// Unified connect entry point — the single recommended external entry.
+// Data-sync groups are always managed by a config-sync repo (decision A / T5);
+// the standalone `createDataSyncGroup` factory is deprecated and NOT exported.
 export { connect } from './connect';
 
 // Backend registry

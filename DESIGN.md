@@ -1,5 +1,7 @@
 # zen-fs-config — Design Document
 
+> **Architecture direction (REQUIREMENTS §9 D2)**: the core uses a **GenericSyncGroup base with two type implementations** — `config-sync` (versioning/tombstone/conflict + hosts `.meta/app-data-groups/`) and `data-sync` (plain file sync, always governed as an app-data-group under config-sync via `ConfigRepo.createAppDataGroup`); **backend-type management and data-backend info persistence stay in the core `zen-fs-config` (UI is presentation-only)**. This document describes the **current implementation (two classes)**; the target architecture follows D2.
+
 ## 1. Overview
 
 zen-fs-config is a distributed configuration management library built on top of:
@@ -12,7 +14,7 @@ It allows multiple application instances (programs) running on different nodes t
 zen-fs-config supports two types of **sync groups**, each backed by a multi-backend sync network but serving different purposes:
 
 - **Config-sync group** — Synchronizes the configuration repository itself: backend topology, app configs, shared configs, node-local configs. This is the "meta layer."
-- **Data-sync group** — Synchronizes application data only. A data-sync group can be used standalone, or referenced by a config-sync group as an app's data storage layer.
+- **Data-sync group** — Synchronizes application data only. A data-sync group is always referenced and managed by a config-sync group as an app's data storage layer (via `ConfigRepo.createAppDataGroup`).
 
 A config-sync group can reference one or more data-sync groups per app, allowing apps to store bulk data on separate backends (e.g., a different repo/branch under the same account) while keeping configuration management unified.
 
@@ -86,8 +88,7 @@ A **sync group** is a set of backends that synchronize with each other. There ar
 **Data-sync group**:
 - Synced content: application data files only (no config meta layer)
 - Backends: full credentials + storage location, but typically reusing the same account as a config-sync backend with a different storage target (e.g., same token/owner, different repo/branch)
-- Can be used standalone (no config-sync group needed)
-- Can be referenced by a config-sync group as an app's data storage
+- Can be referenced by a config-sync group as an app's data storage (via `ConfigRepo.createAppDataGroup`)
 
 **Group type detection**: When connecting to a backend, the library reads `.meta/group-type` to determine the group type. If the file is absent, the backend is treated as a new empty group and the caller decides which type to create.
 
@@ -130,7 +131,7 @@ A **sync group** is a set of backends that synchronize with each other. There ar
 │  ├─ api-version.json
 │  └─ .feature-flags.json.version
 │
-└─ nodes/                               [not synced by default]
+└─ nodes/                               [synced — bidirectional, not node-scoped]
    ├─ {nodeId}/
    │  ├─ local.json                     Node-local config
    │  └─ env.json
@@ -252,17 +253,6 @@ The `accountFields` metadata for each backend type (registered via `BackendMetad
 | WebDAV | `url`, `username`, `password` | `rootPath` |
 | RemoteStorage | `userAddress`, `token` | (none) |
 
-### Standalone Data-Sync Group
-
-A data-sync group can also be used **without** a config-sync group. In this case:
-
-1. The user provides a single backend configuration (e.g., Gitee: token + owner + repo + branch)
-2. The library connects and reads `.meta/group-type` → `"data-sync"`
-3. The app directly reads/writes data files on these backends
-4. No config meta layer, no version sidecars, no tombstones — just raw data sync
-
-Multiple data-sync backends can be registered within a single data-sync group, providing redundancy and multi-device sync for app data.
-
 ## 5. Sync Rules (`.meta/sync-rules.json`)
 
 ```json
@@ -301,7 +291,8 @@ Multiple data-sync backends can be registered within a single data-sync group, p
 
 - Private app directories (`/{appId}/`): one-way push, no conflict possible
 - Shared directory (`/shared/`): bi-directional, conflict possible, merge strategy
-- Nodes and meta: excluded from sync
+- Nodes directory (`/nodes/{nodeId}/`): bi-directional via the main sync pair (not node-scoped — every node's config syncs to every replica)
+- Meta directory (`/.meta/`): bi-directional (topology, tombstones, conflict archives)
 
 ## 6. Versioning & Change Detection
 
@@ -391,11 +382,11 @@ zen-fs-sync emits a `conflict` event with full conflict details. Application can
 
 ## 8. Node-Local Configuration
 
-Some configs are specific to a single node and should not be auto-synced.
+Some configs are specific to a single node and live under `/nodes/{nodeId}/`. They are synced to backends by the main bidirectional sync pair (there is no `direction: "none"` exclusion).
 
 ### 8.1 Storage
 
-Node-local configs live under `/nodes/{nodeId}/`. The `/nodes/` directory is excluded from sync rules (`direction: "none"`).
+Node-local configs live under `/nodes/{nodeId}/`. There is no `direction: "none"` exclusion for `/nodes/` — the main bidirectional sync pair (`fullFS` ↔ replica, root `/`, no filter) replicates it to every replica exactly like `/{appId}/` or `/shared/` (sync is not node-scoped).
 
 ```
 /nodes/server-1/
@@ -413,7 +404,7 @@ Priority order:
 ### 8.3 API
 
 ```typescript
-// Write node-local config (no sync, local only)
+// Write node-local config (writes local primary; synced to replicas on next poll/flush)
 repo.setNodeConfig('server-1', '/local.json', { ip: '10.0.0.1' });
 
 // Read node-local config
@@ -431,9 +422,9 @@ const otherConfig = repo.peekNodeConfig<{ ip: string }>('server-2', '/local.json
 | API | Write Target | Persisted | Synced | Purpose |
 |---|---|---|---|---|
 | `getConfig` / `setConfig` | CachedFS → auto-sync to replicas | Yes | Yes | Normal config |
-| `getNodeConfig` / `setNodeConfig` | CachedFS → no sync | Yes (primary backend only) | No | Node-private config |
-| `publishNodeConfig` | One-time manual sync | Yes | Yes (one-time) | Debug: push to other backends |
-| `peekNodeConfig` | CachedFS read | N/A | N/A | Read other nodes' published config |
+| `getNodeConfig` / `setNodeConfig` | Local primary → synced to replicas via main pair (eventual) | Yes | Yes (all `/nodes/*`, not node-scoped) | Node config, namespaced by nodeId |
+| `publishNodeConfig` | Explicit one-shot push to replicas | Yes | Yes (one-shot) | Force immediate sync of node files |
+| `peekNodeConfig` | Read local (synced-in) copy | N/A | N/A | Read another node's config (after it has synced in) |
 
 ## 9. ConfigRepo Interface
 
@@ -458,7 +449,7 @@ interface ConfigRepo {
   /** Read node-local config */
   getNodeConfig<T>(nodeId: string, path: string): T;
 
-  /** Write node-local config (no auto-sync) */
+  /** Write node-local config (writes local primary; synced to replicas via main pair) */
   setNodeConfig(nodeId: string, path: string, data: any): void;
 
   /** Publish node-local config to sync backends (one-time, for debugging) */
@@ -561,7 +552,7 @@ interface AppDataBackendDescriptor {
 
 ## 10. Initialization
 
-The recommended entry point is `connect`, which auto-detects the group type. The lower-level `createConfigRepo` and `createDataSyncGroup` are also available for explicit control.
+The recommended entry point is `connect`, which always anchors on a config-sync repo (the host for data groups) and auto-detects the backend type. The lower-level `createConfigRepo` is also available; data groups are always created via `ConfigRepo.createAppDataGroup` (decision A / T5).
 
 ### `connect` (recommended — auto-detect)
 
@@ -577,8 +568,8 @@ const result = await connect('my-app', {
 });
 
 // result.groupType → "config-sync" or "data-sync"
-// result.repo      → ConfigRepo (if config-sync)
-// result.dataGroup → DataSyncGroup (if data-sync)
+// result.repo      → ConfigRepo (always — it hosts the data groups)
+// result.dataGroup → config-managed data group (default group on first launch / data-sync connect)
 ```
 
 ### Zero-parameter (offline-first)
@@ -634,18 +625,22 @@ const backends = await repo.getBackends();
 // backends.backends = [{ id: 'local-idb', ... }, { id: 's3-backup', ... }]
 ```
 
-### Standalone Data-Sync Group (no config layer)
+### Data-Sync Group via Config-Sync (recommended)
+
+> Data groups are always managed by a config-sync repo via `createAppDataGroup` (decision A / T5). The snippet below shows the supported path.
 
 ```typescript
-import { createDataSyncGroup } from 'zen-fs-config';
+import { connect } from 'zen-fs-config';
 
-// User provides a data backend directly — no config-sync layer needed
-const dataGroup = await createDataSyncGroup('my-app', {
-  backendInfo: {
-    type: 'Gitee',
-    options: { token: '...', owner: '...', repo: 'my-app-data', branch: 'main' },
-  },
-});
+// connect always returns a config-sync repo; data groups live under it
+const result = await connect('my-app', { nodeId: 'node-1' });
+const repo = result.repo!;
+
+// Create a data group and attach a data backend — config-sync stores the
+// data group's backend topology in .meta/app-data-groups/{appId}/{id}.json
+const dataGroup = await repo.createAppDataGroup('notes', [
+  { id: 'gitee-data', type: 'Gitee', options: { token: '...', owner: '...', repo: 'my-app-data', branch: 'main' } },
+]);
 
 // Read/write data files directly
 await dataGroup.fs.promises.writeFile('/notes/todo.json', JSON.stringify({ task: 'buy milk' }));
@@ -658,6 +653,7 @@ await dataGroup.addBackend('gitee-backup', 'Gitee', {
 
 // Cleanup
 await dataGroup.dispose();
+await repo.dispose();
 ```
 
 ### Config-Sync with App Data Group (account reuse)
@@ -905,51 +901,32 @@ watch() triggers:
 
 **Key difference from previous design**: The old approach merged source and target snapshots into a single map (`source ∪ target`), which lost information about which filesystem a file belonged to. The new approach keeps them separate, enabling precise per-side change detection and bidirectional deletion propagation (see §11.10).
 
-### 11.8 Standalone Data-Sync Group (`createDataSyncGroup`)
+### 11.8 Standalone Data-Sync Entry — REMOVED
 
-```
-createDataSyncGroup('my-app', options?)
-  │
-  ├─ 1. Connect to user-provided backend (options.backendInfo)
-  │
-  ├─ 2. Read /.meta/group-type
-  │     ├─ "data-sync" → existing group, read .meta/backends/ for all data backends
-  │     ├─ absent      → new group, write /.meta/group-type = "data-sync"
-  │     └─ "config-sync" → error: this is a config-sync backend, use createConfigRepo()
-  │
-  ├─ 3. Create IndexedDB as local primary (for offline access)
-  │
-  ├─ 4. Setup sync: IndexedDB ↔ each data backend (bi-directional)
-  │     NOTE: Does NOT watch yet — sync first
-  │
-  ├─ 5. syncAll() — pull data from remote backends
-  │
-  ├─ 6. watchAll() — start monitoring AFTER sync completes
-  │
-  └─ 7. Return DataSyncGroup handle with direct fs access
-```
+The standalone data-sync entry has been **removed** from the public API (decision A / T5). Data groups are created exclusively via `ConfigRepo.createAppDataGroup` and are always owned by a config-sync repo, whose `.meta/app-data-groups/{appId}/{id}.json` is the authoritative source of the data group's backend topology.
 
 ### 11.9 Unified Entry Point (`connect`)
 
-`createConfigRepo` and `createDataSyncGroup` are lower-level factory functions. The recommended entry point is `connect`, which auto-detects the group type and dispatches to the appropriate factory:
+`createConfigRepo` is the lower-level factory for a config-sync repo. The recommended entry point is `connect`, which always anchors on a config-sync repo and dispatches the backend as follows:
 
 ```
 connect('my-app', options?)
   │
-  ├─ 1. Connect to user-provided backend (options.backendInfo)
+  ├─ 1. Determine config-sync repo (create or reuse) — this always hosts the data groups
   │
-  ├─ 2. Read /.meta/group-type
+  ├─ 2. If options.backendInfo provided, read /.meta/group-type
   │
-  ├─ "config-sync" → dispatch to createConfigRepo()
-  │                  return { groupType: "config-sync", repo }
+  ├─ "config-sync" → connect the repo to that backend; then load every app
+  │                  data group from .meta/app-data-groups/{appId}/*.json (UC2)
+  │                  return { groupType: "config-sync", repo, appDataGroups }
   │
-  ├─ "data-sync"   → dispatch to createDataSyncGroup()
-  │                  return { groupType: "data-sync", dataGroup }
+  ├─ "data-sync"   → keep the config repo local-only; ensure the default data
+  │                  group exists and attach the backend to it (UC3). The backend
+  │                  info is written back into app-data-groups by addBackend.
+  │                  return { groupType: "data-sync", repo, dataGroup }
   │
-  └─ absent        → new empty backend
-     ├─ options.groupType === "data-sync" → dispatch to createDataSyncGroup()
-     ├─ options.groupType === "config-sync" (or omitted) → dispatch to createConfigRepo()
-     └─ default: config-sync
+  └─ absent (no backendInfo) → local-only config repo + a default data group
+     └─ return { groupType: "config-sync" (or options.groupType), repo, dataGroup }
 ```
 
 **Usage**:
@@ -970,7 +947,7 @@ if (result.groupType === 'config-sync') {
   const repo = result.repo;
   repo.setConfig('/db/host', { hostname: 'localhost' });
 } else {
-  // result.dataGroup is a DataSyncGroup — lightweight data-only system
+  // result.dataGroup is a config-managed data group (result.repo is its host)
   const dataGroup = result.dataGroup;
   await dataGroup.fs.promises.writeFile('/data.json', '{"key":"value"}');
 }
@@ -988,14 +965,16 @@ const result = await connect('my-app', {
 interface ConnectResult {
   /** Detected or forced group type */
   groupType: 'config-sync' | 'data-sync';
-  /** Present when groupType === "config-sync" */
+  /** The config-sync repo — always present; it hosts the data groups */
   repo?: ConfigRepo;
-  /** Present when groupType === "data-sync" */
-  dataGroup?: DataSyncGroup;
+  /** The default app data group (config-managed); present on first launch / data-sync connect */
+  dataGroup?: AppDataGroup;
+  /** All app data groups loaded for this app (may be empty) */
+  appDataGroups?: AppDataGroup[];
 }
 ```
 
-**Offline / zero-parameter mode**: When no `backendInfo` is provided, `connect` defaults to `config-sync` and creates an IndexedDB-only repo (same as `createConfigRepo` with no options).
+**Offline / zero-parameter mode**: When no `backendInfo` is provided, `connect` defaults to `config-sync`, creates an IndexedDB-only config repo, and also creates a default app data group under it via `createAppDataGroup` (same as `createConfigRepo` with no options, plus the default data group).
 
 ### 11.10 Snapshot Optimization Design
 
@@ -1127,13 +1106,13 @@ Application
   → Sync to replicas per sync-rules
 ```
 
-### Write Path (node-local, no sync)
+### Write Path (node-local, synced)
 ```
 Application
   → repo.setNodeConfig('server-1', '/local.json', { ip: '10.0.0.1' })
-  → Serialize + write to /nodes/server-1/local.json
-  → zen-fs-sync ignores /nodes/ (direction: "none")
-  → File stays local to primary backend only
+  → Serialize + write to /nodes/server-1/local.json (local primary)
+  → Main bidirectional sync pair replicates /nodes/ to replicas on next poll/flush
+  → File is also present on other replicas (sync is not node-scoped)
 ```
 
 ### Publish (one-time sync)

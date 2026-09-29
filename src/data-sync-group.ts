@@ -251,6 +251,12 @@ export interface DataSyncGroupOptions {
 /**
  * Create a standalone data-sync group.
  *
+ * @deprecated Data-sync groups are now always managed by a config-sync group
+ * via `ConfigRepo.createAppDataGroup()` — there is no standalone top-level
+ * entry (decision A in REQUIREMENTS.md §8). `connect()` no longer uses this;
+ * kept only for backwards-compatible callers / tests. Prefer
+ * `ConfigRepo.createAppDataGroup()`.
+ *
  * 1. Connects to the user-provided backend
  * 2. Reads /.meta/group-type to verify it's a data-sync group (or new)
  * 3. Creates a local primary (InMemory in Node.js)

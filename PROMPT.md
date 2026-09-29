@@ -4,6 +4,10 @@
 
 ---
 
+> **架构方向（REQUIREMENTS §9 D2）**：本文档描述**当前实现（config-sync / data-sync 两类 repo）**的 API 与用法；目标架构为**通用同步组（GenericSyncGroup）基类 + 两种类型实现**（config-sync 承载 `.meta/app-data-groups/` 纳管数据同步组配置），详见 REQUIREMENTS.md §9 D2。新代码请以 D2 目标架构为准。
+>
+> **数据组纳管（决策 A / T5）**：数据同步组已统一由配置同步组经 `ConfigRepo.createAppDataGroup` 纳管，**不存在独立的顶层数据组入口**，新代码一律用 `createAppDataGroup` 创建数据组。
+
 你是一个精通 zen-fs-config 的开发助手。zen-fs-config 是一个基于 ZenFS 的分布式配置管理库，具有以下核心特性：
 
 ## 核心架构
@@ -68,9 +72,9 @@ zen-fs-cache 是一个通用缓存层，为所有远程后端提供透明的缓�
 ## 关键 API
 
 ### 入口函数
-- `connect(appId, options?)` — 统一入口，自动检测组类型
-- `createConfigRepo(appId, options?)` — 直接创建配置同步组
-- `createDataSyncGroup(appId, options?)` — 直接创建数据同步组
+- `connect(appId, options?)` — 统一入口，始终以配置同步组为锚点并自动检测后端类型
+- `createConfigRepo(appId, options?)` — 直接创建配置同步组（数据组一律由其纳管）
+
 
 ### ConfigRepoOptions
 | 选项 | 类型 | 默认值 | 说明 |
@@ -92,7 +96,7 @@ zen-fs-cache 是一个通用缓存层，为所有远程后端提供透明的缓�
 - `getConfig<T>(path)` — 同步读取配置（从 IndexedDB）
 - `setConfig(path, data)` — 同步写入配置（自动异步同步到副本）
 - `getNodeConfig<T>(nodeId, path)` — 异步读取节点本地配置
-- `setNodeConfig(nodeId, path, data)` — 异步写入节点本地配置（不同步）
+- `setNodeConfig(nodeId, path, data)` — 写入节点本地配置（写本地主后端，经主同步对同步到副本，最终一致）
 - `publishNodeConfig(nodeId, options?)` — 发布节点配置到其他节点（可选 `paths` 过滤）
 - `peekNodeConfig<T>(nodeId, path)` — 查看其他节点配置
 - `addBackend(id, type, options, desc?)` — 动态添加副本后端
@@ -411,7 +415,7 @@ registerBackend('WebStorage', async (options) => {
 ├── {appId}/              # 应用私有配置（双向同步）
 │   └── .{file}.version   # 每个配置文件的版本 sidecar
 ├── shared/               # 跨应用共享配置（双向同步）
-├── nodes/{nodeId}/       # 节点本地配置（不同步）
+├── nodes/{nodeId}/       # 节点本地配置（同步；按 nodeId 命名空间隔离）
 └── .meta/
     ├── group-type        # 组类型标记
     ├── backends/         # 后端拓扑（每个后端一个 JSON 文件）
@@ -468,14 +472,20 @@ if (result.groupType === 'config-sync') {
 }
 ```
 
-### 4. 数据同步组（纯数据存储）
+### 4. 数据同步组（纯数据存储，由配置同步组纳管）
+
+数据同步组**一律由配置同步组纳管**（决策 A / T5）。先用 `connect` 或 `createConfigRepo` 拿到配置同步组，再用 `createAppDataGroup` 创建数据组：
+
 ```typescript
-import { createDataSyncGroup } from 'zen-fs-config';
-const dataGroup = await createDataSyncGroup('my-app', {
-  backendInfo: { type: 'GitHub', options: { token, owner, repo, branch } },
-});
+import { connect } from 'zen-fs-config';
+const result = await connect('my-app', { nodeId: 'node-1' });
+const repo = result.repo!;                       // 配置同步组
+const dataGroup = await repo.createAppDataGroup('notes', [  // 由配置同步组纳管
+  { id: 'gh-notes', type: 'GitHub', options: { token, owner, repo, branch } },
+]);
 await dataGroup.fs.promises.writeFile('/notes/todo.json', JSON.stringify({ task: 'buy milk' }));
 await dataGroup.dispose();
+await repo.dispose();
 ```
 
 ### 5. 节点本地配置
@@ -623,7 +633,7 @@ await group.addBackend('webdav-data', 'WebDAV', webdavOptions, 'WebDAV 数据同
 2. **getConfig/setConfig 是同步 API**（从 IndexedDB 读取），其他方法多为异步
 3. **setConfig 写入后自动同步**，通常不需要手动 flush
 4. **删除文件用 `deleteFile()`** 而非 `fs.unlink()`，否则同步会重新创建文件
-5. **节点配置默认不同步**，用 `publishNodeConfig()` 手动发布
+5. **节点配置随主同步对双向同步到所有后端**（按 `/nodes/{nodeId}/` 区分，不按节点隔离）；`publishNodeConfig()` 可显式立即推送
 6. **冲突自动归档**到 `.meta/.conflicts/`，不会丢失数据
 7. **accountFields** 用于 data-sync 后端复用 config-sync 后端的账户凭证（如 token、owner），只需指定存储位置字段
 8. **缓存默认开启**（IdbCacheStore），远程后端读取时通过 `getRevision` 零下载重校验，缓存持久化到 IndexedDB
@@ -632,12 +642,12 @@ await group.addBackend('webdav-data', 'WebDAV', webdavOptions, 'WebDAV 数据同
 
 ## 帮助我时的注意事项
 
-- 根据我的需求选择合适的入口函数（connect vs createConfigRepo vs createDataSyncGroup）
+- 根据需求选择入口函数：`connect`（自动探测，始终返回配置同步组，推荐）或 `createConfigRepo`（直接配置同步组）；数据组一律用 `ConfigRepo.createAppDataGroup` 创建
 - 提醒我先注册自定义后端类型再使用
 - 涉及删除操作时，使用 `deleteFile()` 而非 `fs.unlink()`
-- 涉及节点配置时，提醒我这些配置默认不同步
+- 涉及节点配置时，提醒我这些配置会随主同步对同步到后端（按 nodeId 区分目录，非节点隔离）
 - 如果我需要存储大量应用数据（非配置），建议使用 data-sync group 而非 config-sync group
-- 如果我提到某个后端类型（如 GitHub、Gitee、WebDAV、RemoteStorage），提醒我先安装对应 npm 包并注册
+- 如果我提到某个后端类型，**GitHub / Gitee / RemoteStorage 已在库中默认注册**，只需提醒我 `npm install` 对应包（如 `zen-fs-github`）；WebDAV 为内置实现无需安装；其它自定义后端才需要 `registerBackend` 注册
 - 注册后端时，建议提供 `metadata`（第三个参数）以便 UI 表单自动生成
 - 如果我关心性能，提醒我缓存默认开启（IdbCacheStore），Gitee 和 RemoteStorage 后端的内部缓存也持久化到 IndexedDB，页面刷新后可热启动
 - 如果我需要自定义缓存策略，可通过 `createConfigRepo` 的 `cache` 选项配置（`MemoryCacheStore` / `IdbCacheStore` / `false`）

@@ -10,9 +10,9 @@ import type {
   ConnectOptions,
   ConnectResult,
   SyncGroupType,
+  AppDataGroup,
 } from './types';
 import { createConfigRepo } from './config-repo';
-import { createDataSyncGroup } from './data-sync-group';
 import { createBackend } from './backend-registry';
 import { createLogger } from './logger';
 
@@ -62,7 +62,10 @@ async function detectGroupType(
  * 1. If `backendInfo` is provided, connect to the backend and read
  *    `/.meta/group-type` to detect the group type.
  * 2. If group-type is "config-sync", dispatch to `createConfigRepo()`.
- * 3. If group-type is "data-sync", dispatch to `createDataSyncGroup()`.
+ * 3. If group-type is "data-sync", create a config-sync repo (the host for
+ *    data groups) and register a default app data group under it via
+ *    `ConfigRepo.createAppDataGroup()` (the standalone `createDataSyncGroup()`
+ *    is deprecated — decision A / T5).
  * 4. If group-type is absent (new backend), use `options.groupType`
  *    or default to "config-sync".
  * 5. If no `backendInfo` is provided, use `options.groupType` or
@@ -79,24 +82,28 @@ export async function connect(
   log(`connect: appId=${appId}`);
 
   // -----------------------------------------------------------------
-  // Case 1: No backendInfo — local-only operation
+  // Case 1: No backendInfo — first launch (local-only)
   // -----------------------------------------------------------------
   if (!options.backendInfo) {
-    const groupType: SyncGroupType = options.groupType ?? 'config-sync';
-    log(`connect: no backendInfo, using groupType="${groupType}"`);
-
-    if (groupType === 'data-sync') {
-      const dataGroup = await createDataSyncGroup(appId, {});
-      return { groupType: 'data-sync', dataGroup };
-    }
-
-    // Default: config-sync
+    // Data groups are always managed by config-sync: create the config repo
+    // first, then register a default app data group under it.
     const repo = await createConfigRepo(appId, {
       idbStoreName: options.idbStoreName,
       nodeId: options.nodeId,
+      primaryBackendId: options.primaryBackendId,
+      folderPath: options.folderPath,
+      cache: options.cache,
+      serializer: options.serializer,
+      onConflict: options.onConflict,
       syncPollIntervalMs: options.syncPollIntervalMs,
     });
-    return { groupType: 'config-sync', repo };
+    const dataGroup = await repo.createAppDataGroup('default', []);
+    return {
+      groupType: options.groupType ?? 'config-sync',
+      repo,
+      dataGroup,
+      appDataGroups: [dataGroup],
+    };
   }
 
   // -----------------------------------------------------------------
@@ -120,21 +127,59 @@ export async function connect(
     log(`connect: new backend, using groupType="${groupType}"`);
   }
 
-  if (groupType === 'data-sync') {
-    const dataGroup = await createDataSyncGroup(appId, {
-      backendInfo: options.backendInfo,
-      primaryBackendId: options.idbStoreName,
-      nodeId: options.nodeId,
-    });
-    return { groupType: 'data-sync', dataGroup };
+  // The config-sync repo always hosts the data groups' topology. For a
+  // config-sync remote we connect the repo to that backend; for a data-sync
+  // remote we keep the config repo local-only and attach the data backend to
+  // the data group instead (see below). See USE-CASES UC2 / UC3.
+  const repo = await createConfigRepo(
+    appId,
+    groupType === 'config-sync'
+      ? {
+          backendInfo: options.backendInfo,
+          idbStoreName: options.idbStoreName,
+          nodeId: options.nodeId,
+          primaryBackendId: options.primaryBackendId,
+          folderPath: options.folderPath,
+          cache: options.cache,
+          serializer: options.serializer,
+          onConflict: options.onConflict,
+          syncPollIntervalMs: options.syncPollIntervalMs,
+        }
+      : {
+          idbStoreName: options.idbStoreName,
+          nodeId: options.nodeId,
+          folderPath: options.folderPath,
+          serializer: options.serializer,
+          onConflict: options.onConflict,
+          syncPollIntervalMs: options.syncPollIntervalMs,
+        },
+  );
+
+  // Spin up sync for every app data group already registered in config-sync.
+  const descriptors = await repo.listAppDataGroups();
+  const appDataGroups: AppDataGroup[] = [];
+  for (const d of descriptors) {
+    try {
+      appDataGroups.push(await repo.getAppDataGroup(d.id));
+    } catch (err) {
+      log(`connect: failed to load app data group "${d.id}":`, err);
+    }
   }
 
-  // config-sync
-  const repo = await createConfigRepo(appId, {
-    backendInfo: options.backendInfo,
-    idbStoreName: options.idbStoreName,
-    nodeId: options.nodeId,
-    syncPollIntervalMs: options.syncPollIntervalMs,
-  });
-  return { groupType: 'config-sync', repo };
+  // If the remote is itself a data-sync backend (UC3): ensure the default data
+  // group exists and attach this backend to it. AppDataGroupImpl.addBackend
+  // writes the backend info back into config-sync's app-data-groups.
+  let dataGroup: AppDataGroup | undefined = appDataGroups[0];
+  if (groupType === 'data-sync') {
+    if (!dataGroup) {
+      dataGroup = await repo.createAppDataGroup('default', []);
+      appDataGroups.push(dataGroup);
+    }
+    const backendId = `${type}-primary`;
+    if (!dataGroup.listBackends().some(b => b.id === backendId)) {
+      await dataGroup.addBackend(backendId, type, backendOptions);
+    }
+  }
+
+  return { groupType, repo, dataGroup, appDataGroups };
 }

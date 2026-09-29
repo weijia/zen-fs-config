@@ -283,8 +283,30 @@ export interface ConnectOptions {
   groupType?: SyncGroupType;
   /** IndexedDB store name. Default: `zen-fs-config-{appId}` */
   idbStoreName?: string;
-  /** Node identifier. */
+  /**
+   * ID for a user-provided replica backend. If `backendInfo` is provided,
+   * this ID identifies the replica in `.meta/backends/`. If omitted, a default
+   * ID based on the backend type is generated.
+   */
+  primaryBackendId?: string;
+  /**
+   * Directory for the local primary backend on Node.js (used when IndexedDB is
+   * unavailable). Only applies on Node.js; ignored in browsers. Defaults to
+   * `$ZEN_FS_CONFIG_HOME` (or `~/.zen-fs-config`) when omitted.
+   */
+  folderPath?: string;
+  /** Node identifier. Auto-detected if not provided. */
   nodeId?: string;
+  /**
+   * Cache configuration for replica backends. Omit for the default
+   * (`IdbCacheStore`, persists across reloads); pass `false` to disable; pass a
+   * `CacheOptions` object to customize.
+   */
+  cache?: CacheOptions | false;
+  /** Custom serializer. */
+  serializer?: ConfigSerializer;
+  /** Custom conflict handler. Called before auto-resolution. */
+  onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>;
   /** Sync polling interval in ms. Default: 1800000 (30 min). */
   syncPollIntervalMs?: number;
 }
@@ -293,10 +315,18 @@ export interface ConnectOptions {
 export interface ConnectResult {
   /** Detected or forced group type. */
   groupType: SyncGroupType;
-  /** Present when groupType === "config-sync". */
+  /**
+   * The config-sync repo. Under the "data groups always managed by config-sync"
+   * model this is always present — it hosts the data groups' topology.
+   */
   repo?: IConfigRepo;
-  /** Present when groupType === "data-sync". */
+  /**
+   * Handle to the default (`default`) app data group. Always owned by `repo`;
+   * present on first launch and when a data-sync backend was connected.
+   */
   dataGroup?: AppDataGroup;
+  /** All app data group handles loaded for this app (may be empty). */
+  appDataGroups?: AppDataGroup[];
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,8 @@
 
 本文档描述 zen-fs-config 的初始化流程、同步引擎内部机制、墓碑删除传播、后端去重等核心逻辑。
 
+> **架构方向（REQUIREMENTS §9 D2）**：核心采用**通用同步组（GenericSyncGroup）基类 + 两种类型实现**——`config-sync`（版本化/墓碑/冲突，并承载 `.meta/app-data-groups/`）与 `data-sync`（纯文件同步，可经配置同步组以 app-data-groups 纳管）；**后端类型管理与数据后端信息写入仍留在核心 `zen-fs-config`（UI 仅做呈现）**。本文档描述的是**当前实现（两类 repo）**，目标架构以 D2 为准。
+
 ---
 
 ## 1. 初始化流程
@@ -223,51 +225,31 @@ watch() 触发：
 
 **与旧设计的区别**：旧方法将 source 和 target 快照合并为一个 Map（`source ∪ target`），丢失了文件属于哪个文件系统的信息。新方法保持分离，实现了精确的按端变更检测和双向删除传播（见 §1.10）。
 
-### 1.8 独立 Data-Sync Group（`createDataSyncGroup`）
+### 1.8 独立 Data-Sync 入口 — 已移除
 
-```
-createDataSyncGroup('my-app', options?)
-  │
-  ├─ 1. 连接到用户提供的后端（options.backendInfo）
-  │
-  ├─ 2. 读取 /.meta/group-type
-  │     ├─ "data-sync" → 已有组，读取 .meta/backends/ 获取所有数据后端
-  │     ├─ 不存在     → 新组，写入 /.meta/group-type = "data-sync"
-  │     └─ "config-sync" → 错误：这是配置同步后端，请使用 createConfigRepo()
-  │
-  ├─ 3. 创建 IndexedDB 作为本地主后端（用于离线访问）
-  │
-  ├─ 4. 建立同步：IndexedDB ↔ 每个数据后端（双向）
-  │     注意：此时不 watch — 先同步
-  │
-  ├─ 5. syncAll() — 从远程后端拉取数据
-  │
-  ├─ 6. watchAll() — 同步完成后再开始监听
-  │
-  └─ 7. 返回 DataSyncGroup 句柄，提供直接 fs 访问
-```
+独立 data-sync 入口已从公开 API **移除**（决策 A / T5）。数据组一律经 `ConfigRepo.createAppDataGroup` 创建，且始终归属某个配置同步组，其 `.meta/app-data-groups/{appId}/{id}.json` 是数据组后端拓扑的权威来源。
 
 ### 1.9 统一入口（`connect`）
 
-`createConfigRepo` 和 `createDataSyncGroup` 是底层工厂函数。推荐使用 `connect` 入口，它自动检测组类型并分派到相应的工厂：
+`createConfigRepo` 是创建配置同步组的底层工厂。推荐使用 `connect` 入口，它**始终以配置同步组为锚点**并按如下方式分派后端（独立 data-sync 入口已移除，见 §1.8）：
 
 ```
 connect('my-app', options?)
   │
-  ├─ 1. 连接到用户提供的后端（options.backendInfo）
+  ├─ 1. 确定配置同步组（创建或复用）— 它始终承载数据组
   │
-  ├─ 2. 读取 /.meta/group-type
+  ├─ 2. 若提供了 options.backendInfo，读取 /.meta/group-type
   │
-  ├─ "config-sync" → 分派到 createConfigRepo()
-  │                  返回 { groupType: "config-sync", repo }
+  ├─ "config-sync" → 将该后端连到配置同步组；再按 .meta/app-data-groups/{appId}/*.json
+  │                  加载每个数据组（UC2）
+  │                  返回 { groupType: "config-sync", repo, appDataGroups }
   │
-  ├─ "data-sync"   → 分派到 createDataSyncGroup()
-  │                  返回 { groupType: "data-sync", dataGroup }
+  ├─ "data-sync"   → 配置同步组保持本地；确保默认数据组存在并把该后端挂上去（UC3）。
+  │                  后端信息经 addBackend 回写进 app-data-groups。
+  │                  返回 { groupType: "data-sync", repo, dataGroup }
   │
-  └─ 不存在        → 新的空后端
-     ├─ options.groupType === "data-sync" → 分派到 createDataSyncGroup()
-     ├─ options.groupType === "config-sync"（或省略）→ 分派到 createConfigRepo()
-     └─ 默认：config-sync
+  └─ 不存在（无 backendInfo）→ 本地配置同步组 + 一个默认数据组
+     └─ 返回 { groupType: "config-sync"（或 options.groupType）, repo, dataGroup }
 ```
 
 ---
@@ -425,7 +407,7 @@ syncBidirectional()
 ├─ shared/                              [双向同步，跨应用共享]
 │  └─ feature-flags.json
 │
-└─ nodes/                               [默认不同步]
+└─ nodes/                               [同步：双向，不按节点隔离]
    └─ {nodeId}/
       ├─ local.json                     节点本地配置
       └─ env.json
@@ -437,7 +419,7 @@ syncBidirectional()
 |-----|---------|---------|------|
 | `/{appId}/` | 双向（主 ↔ 副本） | 低（单设备） | 应用私有配置 |
 | `/shared/` | 双向 | 可能（多写入者） | 跨应用共享配置 |
-| `/nodes/` | 无（默认） | 无 | 节点本地配置 |
+| `/nodes/` | 双向（不按节点隔离） | 可能（多节点写入同名路径） | 节点本地配置，按 `/nodes/{nodeId}/` 区分 |
 | `/.meta/` | 双向 | 无（拓扑文件） | 后端拓扑、墓碑、冲突归档 |
 
 ---
