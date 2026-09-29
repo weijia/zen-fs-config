@@ -638,30 +638,35 @@ export class ConfigRepo implements IConfigRepo {
     const tombstones = await this.readTombstones();
     if (tombstones.length === 0) return;
 
-    // Get all backend IDs from backends.json
-    const backendsMeta = await this.getBackends();
-    const allBackendIds = backendsMeta?.backends.map(b => b.id) ?? [this.primaryBackendId];
-
+    let modified = 0;
     for (const tombstone of tombstones) {
       const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
       // Add all replica IDs that we just synced with
+      let changed = false;
       for (const replicaId of this.replicaBackends.keys()) {
         if (!tombstone.confirmedBy.includes(replicaId)) {
           tombstone.confirmedBy.push(replicaId);
+          changed = true;
         }
       }
-      // Write updated tombstone back
-      try {
-        await this.cachedFS.writeFile(
-          tombstonePath,
-          new TextEncoder().encode(JSON.stringify(tombstone, null, 2)),
-        );
-      } catch { /* ignore write error */ }
+      // Only rewrite when the confirmation set actually changed — otherwise we
+      // would re-touch the tombstone's mtime every cycle and feed the sync
+      // engine a spurious "changed file", causing needless MTIME NORMALIZE churn
+      // until the tombstone is eventually GC'd.
+      if (changed) {
+        try {
+          await this.cachedFS.writeFile(
+            tombstonePath,
+            new TextEncoder().encode(JSON.stringify(tombstone, null, 2)),
+          );
+          modified++;
+        } catch { /* ignore write error */ }
+      }
     }
 
-    log.log(`[ConfigRepo] updateTombstoneConfirmations: ${tombstones.length} tombstone(s) updated`);
+    log.log(`[ConfigRepo] updateTombstoneConfirmations: ${modified} tombstone(s) updated`);
     // Invalidate cache — tombstones were modified (confirmedBy updated)
-    this.invalidateTombstoneCache();
+    if (modified > 0) this.invalidateTombstoneCache();
   }
 
   /**
@@ -676,8 +681,13 @@ export class ConfigRepo implements IConfigRepo {
     const tombstones = await this.readTombstones();
     if (tombstones.length === 0) return;
 
-    const backendsMeta = await this.getBackends();
-    const allBackendIds = backendsMeta?.backends.map(b => b.id) ?? [this.primaryBackendId];
+    // Only require confirmation from the replica backends. The implicit local
+    // primary is the origin of the deletion and is never expected to appear in
+    // confirmedBy as a *replica*; getBackends() also lists it (and any
+    // non-replica descriptors), which made `every()` unsatisfiable and left
+    // tombstones alive forever — re-touched (mtime=now) on every sync cycle and
+    // feeding the sync engine spurious MTIME NORMALIZE churn.
+    const allBackendIds = [...this.replicaBackends.keys()];
 
     for (const tombstone of tombstones) {
       const allConfirmed = allBackendIds.every(id => tombstone.confirmedBy.includes(id));
