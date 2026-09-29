@@ -960,10 +960,14 @@ export class ConfigRepo implements IConfigRepo {
   	// (local-first), so this is a cheap local check that saves a network write.
   	try {
   		const existing = await readVersion(this.fullFS, vPath);
-  		if (existing && existing.hash === version.hash) return;
+  		if (existing && existing.hash === version.hash) {
+  			log.log('[ConfigRepo] skip version sidecar (hash unchanged):', vPath);
+  			return;
+  		}
   	} catch {
   		// No existing sidecar (or unreadable) — proceed to write.
   	}
+  	log.log('[ConfigRepo] write version sidecar:', vPath, 'v' + version.version);
   	await this.ensureDir(vPath);
   	await writeVersion(this.fullFS, vPath, version);
   }
