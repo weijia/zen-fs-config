@@ -34,10 +34,10 @@ export interface BackendsMeta {
 
 /** Content of a sidecar `.version` file. */
 export interface VersionMeta {
-  /** Monotonically increasing version number. */
-  version: number;
-  /** SHA-256 hash of the corresponding config file content. */
-  hash: string;
+	/** Version number; increases only when the config content hash changes. */
+	version: number;
+	/** SHA-256 hash of the corresponding config file content. */
+	hash: string;
   /** Author identifier (e.g., "app-a/server-1"). */
   author: string;
   /** Timestamp when the version was created. */

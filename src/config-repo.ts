@@ -951,10 +951,21 @@ export class ConfigRepo implements IConfigRepo {
 
   /** Write version sidecar for a config file (no-op for .version files). */
   private async writeVersionSidecar(configPath: string, version: VersionMeta): Promise<void> {
-    const vPath = versionPathFor(configPath);
-    if (!vPath) return;
-    await this.ensureDir(vPath);
-    await writeVersion(this.fullFS, vPath, version);
+  	const vPath = versionPathFor(configPath);
+  	if (!vPath) return;
+  	// Skip the write if the stored sidecar already records the same content
+  	// hash. This prevents redundant PUTs to remote backends when the config
+  	// data is unchanged (incrementVersion already returns the previous record
+  	// in that case, so the hashes match). readVersion goes through fullFS
+  	// (local-first), so this is a cheap local check that saves a network write.
+  	try {
+  		const existing = await readVersion(this.fullFS, vPath);
+  		if (existing && existing.hash === version.hash) return;
+  	} catch {
+  		// No existing sidecar (or unreadable) — proceed to write.
+  	}
+  	await this.ensureDir(vPath);
+  	await writeVersion(this.fullFS, vPath, version);
   }
 
   /** Delete version sidecar on a backend (no-op for .version files). */

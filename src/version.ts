@@ -193,13 +193,21 @@ export async function incrementVersion(
   const prev = vPath ? await readVersion(fs, vPath) : null;
   const hash = await sha256(newContent);
 
+  // If the content hash is unchanged, keep the previous version record as-is.
+  // This avoids bumping the version number (and re-writing the .version
+  // sidecar) — and therefore avoids redundant PUTs to remote backends — when
+  // the config data has not actually changed.
+  if (prev && prev.hash === hash) {
+  	return prev;
+  }
+
   return {
-    version: (prev?.version ?? 0) + 1,
-    hash,
-    author,
-    timestamp: Date.now(),
+  	version: (prev?.version ?? 0) + 1,
+  	hash,
+  	author,
+  	timestamp: Date.now(),
   };
-}
+  }
 
 // ---------------------------------------------------------------------------
 // Crash Recovery
