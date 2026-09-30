@@ -104,6 +104,52 @@ function backendDedupKey(desc: BackendDescriptor): string {
   return `${desc.type}:${stableOptionsKey(desc.options)}`;
 }
 
+/**
+ * Age rank for a data backend — SMALLER means OLDER.
+ * - backends with a numeric `createdAt` use that timestamp;
+ * - legacy backends without `createdAt` are treated as the oldest; among
+ *   those, a fixed id (not ending in a numeric timestamp, e.g.
+ *   `RemoteStorage-primary`) ranks oldest, while dynamic ids like
+ *   `remotestorage-1784761846529` rank by their embedded timestamp.
+ */
+function backendAgeRank(b: AppDataBackendDescriptor): number {
+  if (typeof b.createdAt === 'number') return b.createdAt;
+  const m = /-(\d{10,})$/.exec(b.id);
+  if (m) return Number(m[1]);
+  return -Infinity; // fixed/legacy id → oldest
+}
+
+/**
+ * Deduplicate data backends that point to the same endpoint (same type +
+ * options). When duplicates are found, the OLDEST one is kept (per product
+ * requirement) and the rest are returned as `removed` so the caller can drop
+ * them from the persisted descriptor. This cleans up the case where a
+ * data-sync backend got registered twice — e.g. once with a fixed `*-primary`
+ * id and again with a dynamically generated `remotestorage-<timestamp>` id.
+ */
+function dedupeAppDataBackends(
+  backends: AppDataBackendDescriptor[],
+): { kept: AppDataBackendDescriptor[]; removed: AppDataBackendDescriptor[] } {
+  const byKey = new Map<string, AppDataBackendDescriptor>();
+  const removed: AppDataBackendDescriptor[] = [];
+  for (const b of backends) {
+    const key = backendDedupKey({ id: b.id, type: b.type, options: b.options });
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, b);
+      continue;
+    }
+    // Duplicate endpoint — keep the older of the two.
+    if (backendAgeRank(b) < backendAgeRank(existing)) {
+      removed.push(existing);
+      byKey.set(key, b);
+    } else {
+      removed.push(b);
+    }
+  }
+  return { kept: Array.from(byKey.values()), removed };
+}
+
 // ---------------------------------------------------------------------------
 // Minimal async FS interface for internal use
 // ---------------------------------------------------------------------------
@@ -1808,6 +1854,20 @@ class AppDataGroupImpl implements AppDataGroup {
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
     this.fs = createChrootFS(this.localFS, '/');
 
+    // Deduplicate backends pointing to the same endpoint — keep the oldest.
+    // Fixes the case where a data-sync backend is registered twice (e.g. as a
+    // fixed `*-primary` id AND a dynamically generated `remotestorage-<ts>` id),
+    // which otherwise creates two sync pairs to the same remote and causes
+    // redundant/looping PUTs.
+    const { kept, removed } = dedupeAppDataBackends(this._backends);
+    if (removed.length > 0) {
+      log.warn(
+        `[AppDataGroup:${this.groupId}] dedupe: removing ${removed.length} duplicate backend(s) ` +
+        `(${removed.map(b => b.id).join(', ')}) — keeping ${kept.map(b => b.id).join(', ')}`,
+      );
+      this._backends = kept;
+    }
+
     // Setup sync with each data backend
     for (const desc of this._backends) {
       try {
@@ -1840,6 +1900,16 @@ class AppDataGroupImpl implements AppDataGroup {
 
     // Now start watching — snapshots will reflect the synced state
     this.syncEngine.watchAll();
+
+    // Persist the deduplicated backend list so the duplicate is gone for good
+    // (otherwise it would reappear on the next load).
+    if (removed.length > 0) {
+      try {
+        await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends);
+      } catch (err) {
+        log.warn(`[AppDataGroup:${this.groupId}] dedupe: failed to persist deduplicated backends:`, err);
+      }
+    }
   }
 
   getSyncStatuses(): Map<string, SyncPairStatus> {
@@ -1878,7 +1948,7 @@ class AppDataGroupImpl implements AppDataGroup {
       '/',
     );
 
-    const desc: AppDataBackendDescriptor = { id, type, options, description };
+    const desc: AppDataBackendDescriptor = { id, type, options, description, createdAt: Date.now() };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
     log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 

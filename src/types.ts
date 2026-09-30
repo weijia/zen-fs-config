@@ -220,6 +220,12 @@ export interface AppDataBackendDescriptor {
   /** Optional: reuse account fields from a config-sync backend. */
   accountBackendId?: string;
   description?: string;
+  /**
+   * Optional creation timestamp (ms). Used when deduplicating backends that
+   * point to the same endpoint — the OLDEST one is kept. Backends without
+   * this field are treated as legacy/oldest (e.g. a fixed `*-primary` id).
+   */
+  createdAt?: number;
 }
 
 /** Descriptor for a data-sync group referenced by a config-sync group. */
