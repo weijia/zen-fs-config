@@ -391,22 +391,35 @@ const OPTIONAL_BACKEND_GLOBALS: Record<string, string[]> = {
  */
 async function importOptionalBackend(pkg: string): Promise<any> {
   const candidates = OPTIONAL_BACKEND_GLOBALS[pkg];
+  const fromGlobal = (): any => {
+    if (!candidates) return undefined;
+    for (const name of candidates) {
+      const g = (globalThis as any)[name];
+      if (g) return g;
+    }
+    return undefined;
+  };
   try {
     // Prefer a real ESM/CJS module import. In a bundler (Vite/webpack) or
     // import-map environment this is the only correct path and yields the
     // named exports (e.g. `Gitee`). Falling back to a global first would let a
     // coincidental `window.Gitee` (some third-party Gitee widget) shadow the
     // real backend and break mounting with "Invalid mount configuration".
-    return await import(pkg);
+    const mod = await import(pkg);
+    // Some packages ship a UMD/IIFE build (e.g. an import map pointing at
+    // "*.global.js") that has no ESM exports. Importing it runs the IIFE, which
+    // only sets a global — so if the ESM namespace is empty, prefer that global
+    // instead of returning an unusable `{}`.
+    if (mod && Object.keys(mod).length === 0) {
+      const g = fromGlobal();
+      if (g) return g;
+    }
+    return mod;
   } catch {
     // Fall back to a UMD global only when a module import is impossible
     // (no-build <script> environments that loaded the UMD bundle).
-    if (candidates) {
-      for (const name of candidates) {
-        const g = (globalThis as any)[name];
-        if (g) return g;
-      }
-    }
+    const g = fromGlobal();
+    if (g) return g;
     const globalHint = candidates?.length
       ? `, or load its UMD bundle via <script src=".../${pkg}.js"> (exposes global "${candidates[0]}")`
       : '';
@@ -418,7 +431,14 @@ async function importOptionalBackend(pkg: string): Promise<any> {
 }
 
 registerBackend('GitHub', async (options) => {
-  const { Github } = await importOptionalBackend('zen-fs-github');
+  const _gh = await importOptionalBackend('zen-fs-github');
+  const Github = _gh?.Github ?? _gh?.default;
+  if (typeof Github !== 'function') {
+    throw new Error(
+      `Backend package "zen-fs-github" loaded, but its Github export is not a constructor ` +
+      `(typeof=${typeof Github}). Load its UMD bundle so it exposes the global "ZenFSGitHub".`,
+    );
+  }
   const backend = await wrapZenFSFileSystem({
     backend: Github,
     token: options.token,
@@ -468,7 +488,14 @@ registerBackend('GitHub', async (options) => {
 });
 
 registerBackend('Gitee', async (options) => {
-  const { Gitee } = await importOptionalBackend('zen-fs-gitee');
+  const _gt = await importOptionalBackend('zen-fs-gitee');
+  const Gitee = _gt?.Gitee ?? _gt?.default;
+  if (typeof Gitee !== 'function') {
+    throw new Error(
+      `Backend package "zen-fs-gitee" loaded, but its Gitee export is not a constructor ` +
+      `(typeof=${typeof Gitee}). Load its UMD bundle so it exposes the global "ZenFSGitee".`,
+    );
+  }
   // GiteeFS has built-in shouldSync() + getRevision() that wrapZenFSFileSystem
   // auto-passthrough; its caches are persisted to IndexedDB internally.
   return wrapZenFSFileSystem({
@@ -495,7 +522,19 @@ registerBackend('Gitee', async (options) => {
 });
 
 registerBackend('RemoteStorage', async (options) => {
-  const { RemoteStorageFileSystem } = await importOptionalBackend('zen-fs-remotestoragejs');
+  const _rs = await importOptionalBackend('zen-fs-remotestoragejs');
+  const RemoteStorageFileSystem =
+    _rs?.RemoteStorageFileSystem ??
+    _rs?.default ??
+    (typeof _rs === 'function' ? _rs : undefined);
+  if (typeof RemoteStorageFileSystem !== 'function') {
+    throw new Error(
+      `Backend package "zen-fs-remotestoragejs" loaded, but its RemoteStorageFileSystem ` +
+      `export is not a constructor (typeof=${typeof RemoteStorageFileSystem}). ` +
+      `Load its UMD bundle via <script src=".../zen-fs-remotestoragejs.global.js"> ` +
+      `so it exposes the global "ZenFSRemoteStorage".`,
+    );
+  }
   // RemoteStorageFileSystem already implements the BackendInstance interface
   // (getRevision via ETag, shouldSync via persisted ETag snapshot).
   return new RemoteStorageFileSystem({
