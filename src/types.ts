@@ -5,6 +5,7 @@
  */
 
 import type { SyncResult, SyncPairStatus, ConflictStrategy } from 'zen-fs-sync';
+import type { MtimePurgeResult } from './mtime-cleanup';
 
 // ---------------------------------------------------------------------------
 // Backend Topology
@@ -203,6 +204,18 @@ export interface ConfigRepoOptions {
    * Default: 1800000 (30 minutes).
    */
   syncPollIntervalMs?: number;
+
+  /**
+   * Delete leaked `.mtime` sidecars from the local primary on startup.
+   *
+   * Backends that keep a precise mtime out-of-band (RemoteStorage, Gitee…)
+   * write a `.mtime` file next to each data file. Older builds copied those
+   * backend-internal files into the local primary, where sync ignores them —
+   * so they linger forever and warn on every walk.
+   *
+   * Default: `true`. Pass `false` to skip the (local-only) startup sweep.
+   */
+  purgeMtimeSidecars?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +443,15 @@ export interface IConfigRepo {
    * Called automatically by createConfigRepo() after setupSync().
    */
   syncMetaToReplicas(): Promise<void>;
+
+  /**
+   * Delete leaked `.mtime` sidecars from the local primary backend.
+   *
+   * Runs automatically on `createConfigRepo()` unless
+   * `options.purgeMtimeSidecars === false`. Call it manually to clean a
+   * long-lived store, or with `{ dryRun: true }` to only list them.
+   */
+  purgeMtimeSidecars(options?: { root?: string; dryRun?: boolean }): Promise<MtimePurgeResult>;
 
   // --- App Data Storage (data-sync groups) ---
 

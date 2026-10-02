@@ -35,6 +35,7 @@ import { createBackend, mergeAccountFields, getAccountFields, type BackendInstan
 import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
+import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import type { VersionMeta } from './types';
 
 const log = createLogger('zen-fs-config:config-repo');
@@ -644,6 +645,37 @@ export class ConfigRepo implements IConfigRepo {
   /** Public wrapper for processTombstones — used by createConfigRepo. */
   async processTombstonesPublic(): Promise<void> {
     await this.processTombstones();
+  }
+
+  /**
+   * Delete leaked `.mtime` sidecar files from the local primary backend
+   * (IndexedDB on browser, Folder on Node).
+   *
+   * Sidecars are produced by backends that keep a precise mtime out-of-band
+   * (RemoteStorage, Gitee…). Once one is copied into the local primary it is
+   * never removed: zen-fs-sync skips `.mtime` paths on both sides, so it is
+   * invisible to sync, and every walk warns about the leak.
+   *
+   * Only the local primary is scanned — replica sidecars are live metadata of
+   * the backend that owns them and must be left alone.
+   *
+   * @param options.root Scan only this subtree (default `/`).
+   * @param options.dryRun List the sidecars without deleting them.
+   */
+  async purgeMtimeSidecars(options?: PurgeMtimeOptions): Promise<MtimePurgeResult> {
+    this.assertNotDisposed();
+    const result = await purgeMtimeSidecars(this.cachedFS, options);
+    if (result.removed.length > 0) {
+      log.log(
+        `[ConfigRepo] purged ${result.removed.length} .mtime sidecar(s) from local primary` +
+        (options?.dryRun ? ' (dry run)' : ''),
+        result.removed,
+      );
+    }
+    if (result.failed.length > 0) {
+      log.warn(`[ConfigRepo] failed to purge ${result.failed.length} .mtime sidecar(s):`, result.failed);
+    }
+    return result;
   }
 
   /**
@@ -1851,6 +1883,20 @@ class AppDataGroupImpl implements AppDataGroup {
       throw new Error(`Failed to create local primary for data group "${this.groupId}"`);
     }
 
+    // Purge leaked .mtime sidecars from this group's local store (they are
+    // skipped by sync, so they would otherwise stay there forever).
+    try {
+      const purged = await purgeMtimeSidecars(this.localFS);
+      if (purged.removed.length > 0) {
+        log.warn(
+          `[AppDataGroup:${this.groupId}] purged ${purged.removed.length} leaked .mtime sidecar(s):`,
+          purged.removed,
+        );
+      }
+    } catch (err: any) {
+      log.warn(`[AppDataGroup:${this.groupId}] .mtime purge failed:`, err?.message ?? err);
+    }
+
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
     this.fs = createChrootFS(this.localFS, '/');
 
@@ -2037,6 +2083,27 @@ export async function createConfigRepo(
   const primaryInstance = await createBackend(localPrimary);
 
   const cachedFS = primaryInstance;
+
+  // -------------------------------------------------------------------
+  // Step 1b: Purge leaked .mtime sidecars from the local primary
+  //
+  // Older builds copied backend-internal `.mtime` sidecars into the local
+  // store. Sync ignores them, so they would otherwise linger forever and
+  // warn on every walk. Local-only operation, safe to run on every start.
+  // -------------------------------------------------------------------
+  if (options.purgeMtimeSidecars !== false) {
+    try {
+      const purged = await purgeMtimeSidecars(cachedFS);
+      if (purged.removed.length > 0) {
+        log.warn(
+          `[createConfigRepo] purged ${purged.removed.length} leaked .mtime sidecar(s) from local primary:`,
+          purged.removed,
+        );
+      }
+    } catch (err: any) {
+      log.warn(`[createConfigRepo] .mtime purge failed:`, err?.message ?? err);
+    }
+  }
 
   // Cache is enabled by default for replica backends (Gitee, RemoteStorage,
   // etc.) using IdbCacheStore. The local IndexedDB primary is not cached.

@@ -27,6 +27,10 @@ export { createSerializerChain, configKeyToFilePath, getExtension } from './seri
 // Version management
 export { versionPathFor, sha256, readVersion, writeVersion, incrementVersion, verifyOrRepairVersion } from './version';
 
+// mtime sidecar cleanup (local primary only)
+export { purgeMtimeSidecars, isMtimeSidecar } from './mtime-cleanup';
+export type { PurgeableFS, PurgeMtimeOptions, MtimePurgeResult } from './mtime-cleanup';
+
 // All types
 export type {
   BackendDescriptor,
