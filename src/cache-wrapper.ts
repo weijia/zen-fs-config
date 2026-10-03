@@ -39,6 +39,20 @@ export function wrapWithCache(
     store = new MemoryCacheStore();
   }
 
+  // Best-effort: remove any cached `.keep` placeholder entries left over from a
+  // prior build that cached backend-internal `.keep` files. The cache store is
+  // created fresh on each sync setup (startup), so this runs once per replica
+  // and is a harmless no-op when there are none. Fire-and-forget: `wrapWithCache`
+  // is synchronous, and the deletes are best-effort anyway.
+  try {
+    const purge = (store as { purgeKeepFiles?: () => Promise<unknown> }).purgeKeepFiles?.();
+    if (purge && typeof (purge as Promise<unknown>).catch === 'function') {
+      (purge as Promise<unknown>).catch(() => {});
+    }
+  } catch {
+    // best-effort
+  }
+
   const wrapped = new CachedFileSystem(backend, store, {
     ttlMs: options.ttlMs ?? 0,
   });
