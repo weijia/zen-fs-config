@@ -64,5 +64,19 @@ export function wrapWithCache(
     (wrapped as any).shouldSync = (...args: any[]) => backend.shouldSync(...args);
   }
 
+  // Pass through writeFileWithMtime from the underlying backend.
+  // CachedFileSystem does not implement this itself; without it the sync
+  // engine silently falls back to plain writeFile (losing the atomic
+  // data+sidecar write and the mtimeCache refresh that e.g. GiteeFS
+  // .writeFileWithMtime provides). Forward it so mtime preservation uses
+  // the intended path instead of the eager-cache write() fallback.
+  if (typeof backend.writeFileWithMtime === 'function') {
+    (wrapped as any).writeFileWithMtime = (
+      path: string,
+      data: string | Uint8Array,
+      mtimeMs: number,
+    ) => backend.writeFileWithMtime(path, data, mtimeMs);
+  }
+
   return wrapped;
 }
