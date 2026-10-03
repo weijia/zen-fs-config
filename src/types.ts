@@ -6,6 +6,7 @@
 
 import type { SyncResult, SyncPairStatus, ConflictStrategy } from 'zen-fs-sync';
 import type { MtimePurgeResult } from './mtime-cleanup';
+import type { KeepPurgeResult } from './keep-cleanup';
 
 // ---------------------------------------------------------------------------
 // Backend Topology
@@ -216,6 +217,19 @@ export interface ConfigRepoOptions {
    * Default: `true`. Pass `false` to skip the (local-only) startup sweep.
    */
   purgeMtimeSidecars?: boolean;
+
+  /**
+   * Delete leaked `.keep` placeholders from the local primary on startup.
+   *
+   * Backends that cannot store empty directories (Gitee, RemoteStorage…) keep a
+   * directory alive with an internal `.keep` placeholder. Older builds copied
+   * those backend-internal files into the local primary, where sync ignores
+   * them — so they linger forever. The intentional `/.meta/backends/.keep` is
+   * always protected.
+   *
+   * Default: `true`. Pass `false` to skip the (local-only) startup sweep.
+   */
+  purgeKeepFiles?: boolean;
 
   /**
    * Migrate legacy `.x.version` sidecars to the new `<name>.version` naming on
@@ -465,6 +479,15 @@ export interface IConfigRepo {
    * long-lived store, or with `{ dryRun: true }` to only list them.
    */
   purgeMtimeSidecars(options?: { root?: string; dryRun?: boolean }): Promise<MtimePurgeResult>;
+
+  /**
+   * Delete leaked `.keep` placeholders from the local primary backend.
+   *
+   * Runs automatically on `createConfigRepo()` unless
+   * `options.purgeKeepFiles === false`. Call it manually to clean a
+   * long-lived store, or with `{ dryRun: true }` to only list them.
+   */
+  purgeKeepFiles(options?: { root?: string; dryRun?: boolean }): Promise<KeepPurgeResult>;
 
   // --- App Data Storage (data-sync groups) ---
 

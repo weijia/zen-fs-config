@@ -31,6 +31,10 @@ export { versionPathFor, legacyVersionPathFor, sha256, readVersion, writeVersion
 export { purgeMtimeSidecars, isMtimeSidecar } from './mtime-cleanup';
 export type { PurgeableFS, PurgeMtimeOptions, MtimePurgeResult } from './mtime-cleanup';
 
+// .keep placeholder cleanup (local primary only)
+export { purgeKeepFiles, isKeepFile } from './keep-cleanup';
+export type { PurgeKeepOptions, KeepPurgeResult } from './keep-cleanup';
+
 // Version sidecar migration (legacy `.x.version` → `<name>.version`)
 export { migrateVersionSidecars } from './version-migration';
 export type { MigrateLocalFS, MigrateReplicaFS, VersionMigrationOptions, VersionMigrationResult } from './version-migration';

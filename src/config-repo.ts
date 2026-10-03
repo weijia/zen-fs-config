@@ -36,6 +36,7 @@ import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
+import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
 import { migrateVersionSidecars, type VersionMigrationResult } from './version-migration';
 import type { VersionMeta } from './types';
 
@@ -675,6 +676,34 @@ export class ConfigRepo implements IConfigRepo {
     }
     if (result.failed.length > 0) {
       log.warn(`[ConfigRepo] failed to purge ${result.failed.length} .mtime sidecar(s):`, result.failed);
+    }
+    return result;
+  }
+
+  /**
+   * Delete leaked `.keep` placeholders from the local primary backend.
+   *
+   * Backends that cannot store empty directories (Gitee, RemoteStorage…) keep a
+   * directory alive with an internal `.keep` placeholder. Older builds copied
+   * those backend-internal files into the local primary, where sync ignores
+   * them — so they linger forever. `/.meta/backends/.keep` (intentional) is
+   * protected and never removed.
+   *
+   * @param options.root Scan only this subtree (default `/`).
+   * @param options.dryRun List the placeholders without deleting them.
+   */
+  async purgeKeepFiles(options?: PurgeKeepOptions): Promise<KeepPurgeResult> {
+    this.assertNotDisposed();
+    const result = await purgeKeepFiles(this.cachedFS, options);
+    if (result.removed.length > 0) {
+      log.log(
+        `[ConfigRepo] purged ${result.removed.length} .keep placeholder(s) from local primary` +
+        (options?.dryRun ? ' (dry run)' : ''),
+        result.removed,
+      );
+    }
+    if (result.failed.length > 0) {
+      log.warn(`[ConfigRepo] failed to purge ${result.failed.length} .keep placeholder(s):`, result.failed);
     }
     return result;
   }
@@ -1940,6 +1969,19 @@ class AppDataGroupImpl implements AppDataGroup {
       log.warn(`[AppDataGroup:${this.groupId}] .mtime purge failed:`, err?.message ?? err);
     }
 
+    // Purge leaked `.keep` placeholders from this group's local store too.
+    try {
+      const purgedKeep = await purgeKeepFiles(this.localFS);
+      if (purgedKeep.removed.length > 0) {
+        log.warn(
+          `[AppDataGroup:${this.groupId}] purged ${purgedKeep.removed.length} leaked .keep placeholder(s):`,
+          purgedKeep.removed,
+        );
+      }
+    } catch (err: any) {
+      log.warn(`[AppDataGroup:${this.groupId}] .keep purge failed:`, err?.message ?? err);
+    }
+
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
     this.fs = createChrootFS(this.localFS, '/');
 
@@ -2145,6 +2187,28 @@ export async function createConfigRepo(
       }
     } catch (err: any) {
       log.warn(`[createConfigRepo] .mtime purge failed:`, err?.message ?? err);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Step 1c: Purge leaked `.keep` placeholders from the local primary
+  //
+  // Older builds copied backend-internal `.keep` placeholders (used to keep
+  // empty directories alive on Git/RemoteStorage backends) into the local
+  // store. Sync ignores them now, so they would otherwise linger forever.
+  // `/.meta/backends/.keep` is protected. Local-only, safe every start.
+  // -------------------------------------------------------------------
+  if (options.purgeKeepFiles !== false) {
+    try {
+      const purged = await purgeKeepFiles(cachedFS);
+      if (purged.removed.length > 0) {
+        log.warn(
+          `[createConfigRepo] purged ${purged.removed.length} leaked .keep placeholder(s) from local primary:`,
+          purged.removed,
+        );
+      }
+    } catch (err: any) {
+      log.warn(`[createConfigRepo] .keep purge failed:`, err?.message ?? err);
     }
   }
 
