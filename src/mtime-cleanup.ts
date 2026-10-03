@@ -79,7 +79,7 @@ function joinPath(dir: string, entry: string): string {
  * Delete every `.mtime` sidecar stored in a local primary backend.
  *
  * Walks the whole tree from `options.root` — including dotfiles and `/.meta/`,
- * because sidecars live next to their data file and are themselves dotfiles.
+ * because sidecars live next to their data file as `<name>.mtime` files.
  * Unreadable entries are skipped; failures on individual files are collected
  * in `failed` instead of aborting the walk.
  */

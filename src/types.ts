@@ -216,6 +216,19 @@ export interface ConfigRepoOptions {
    * Default: `true`. Pass `false` to skip the (local-only) startup sweep.
    */
   purgeMtimeSidecars?: boolean;
+
+  /**
+   * Migrate legacy `.x.version` sidecars to the new `<name>.version` naming on
+   * startup (rename locally, delete the remote residual).
+   *
+   * Older builds stored version sidecars as hidden dotfiles (`.db.json.version`).
+   * They are now `<name>.version`. This one-time sweep renames existing legacy
+   * sidecars (preserving version history) and removes the old copy from every
+   * replica so sync does not pull it back.
+   *
+   * Default: `true`. Pass `false` to skip the startup sweep.
+   */
+  migrateVersionSidecars?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,11 +1,12 @@
 /**
  * zen-fs-config — Sidecar Version File Management
  *
- * Each config file has a companion .version file for version-based change
- * detection and conflict resolution.
+ * Each config file has a companion `.version` sidecar file for version-based
+ * change detection and conflict resolution. The sidecar is named `<name>.version`
+ * (NOT `.name.version`) so it is not a hidden dotfile.
  *
  * Config file:  /app-a/db.json
- * Version file: /app-a/.db.json.version
+ * Version file: /app-a/db.json.version
  */
 
 import type { VersionMeta } from './types';
@@ -18,12 +19,12 @@ import type { SyncableFS } from 'zen-fs-sync';
 /**
  * Compute the sidecar version file path from a config file path.
  *
- * /app-a/db.json        → /app-a/.db.json.version
- * /shared/flags.json    → /shared/.flags.json.version
- * /nodes/s1/env.json    → /nodes/s1/.env.json.version
+ * /app-a/db.json        → /app-a/db.json.version
+ * /shared/flags.json    → /shared/flags.json.version
+ * /nodes/s1/env.json    → /nodes/s1/env.json.version
  *
  * Returns null for files that are already version sidecars (.version files),
- * to prevent creating version-of-version files (e.g. ..db.json.version.version).
+ * to prevent creating version-of-version files (e.g. db.json.version.version).
  */
 export function versionPathFor(configFilePath: string): string | null {
   const lastSlash = configFilePath.lastIndexOf('/');
@@ -35,9 +36,54 @@ export function versionPathFor(configFilePath: string): string | null {
     return null;
   }
 
-  // Avoid double dot: if fileName already starts with '.', don't add another
-  const versionFileName = fileName.startsWith('.') ? `${fileName}.version` : `.${fileName}.version`;
+  // Sidecar is named `<name>.version` — no leading dot, so it is not a hidden
+  // dotfile. For files already starting with '.' (e.g. `.meta/...`) we still just
+  // append `.version` (e.g. `.user.json.version`); never add a second dot.
+  const versionFileName = `${fileName}.version`;
   return dir ? `${dir}/${versionFileName}` : versionFileName;
+}
+
+/**
+ * Compute the *legacy* (pre-dotfile-removal) version sidecar path for a config
+ * file. Returns the old `.${name}.version` form for non-dot configs, or `null`
+ * for dotfile configs (whose version path is unchanged) and for version files
+ * themselves.
+ *
+ * Used as a read fallback so existing history in `.db.json.version` is still
+ * found after the naming scheme changed to `db.json.version`.
+ */
+export function legacyVersionPathFor(configFilePath: string): string | null {
+  const lastSlash = configFilePath.lastIndexOf('/');
+  const dir = lastSlash >= 0 ? configFilePath.slice(0, lastSlash) : '';
+  const fileName = lastSlash >= 0 ? configFilePath.slice(lastSlash + 1) : configFilePath;
+
+  if (fileName.endsWith('.version')) return null;
+  // Dotfile configs already used `<name>.version` (no extra dot) — unchanged.
+  if (fileName.startsWith('.')) return null;
+
+  const legacyFileName = `.${fileName}.version`;
+  return dir ? `${dir}/${legacyFileName}` : legacyFileName;
+}
+
+/**
+ * Read a version sidecar for a config file, falling back to the legacy
+ * `.${name}.version` path when the new `<name>.version` path is absent. This
+ * keeps version history intact across the naming-scheme migration.
+ */
+async function readVersionForConfig(
+  fs: SyncableFS,
+  configFilePath: string,
+): Promise<VersionMeta | null> {
+  const newPath = versionPathFor(configFilePath);
+  if (newPath) {
+    const v = await readVersion(fs, newPath);
+    if (v) return v;
+  }
+  const legacyPath = legacyVersionPathFor(configFilePath);
+  if (legacyPath) {
+    return readVersion(fs, legacyPath);
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +236,7 @@ export async function incrementVersion(
   author: string,
 ): Promise<VersionMeta> {
   const vPath = versionPathFor(configFilePath);
-  const prev = vPath ? await readVersion(fs, vPath) : null;
+  const prev = vPath ? await readVersionForConfig(fs, configFilePath) : null;
   const hash = await sha256(newContent);
 
   // If the content hash is unchanged, keep the previous version record as-is.
@@ -225,7 +271,7 @@ export async function verifyOrRepairVersion(
 ): Promise<VersionMeta | null> {
   const vPath = versionPathFor(configFilePath);
   if (!vPath) return null;
-  const existing = await readVersion(fs, vPath);
+  const existing = await readVersionForConfig(fs, configFilePath);
   if (!existing) return null;
 
   try {

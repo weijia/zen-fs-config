@@ -25,11 +25,15 @@ export type { BackendFactory, BackendInstance, BackendMetadata, BackendParamDef 
 export { createSerializerChain, configKeyToFilePath, getExtension } from './serializer';
 
 // Version management
-export { versionPathFor, sha256, readVersion, writeVersion, incrementVersion, verifyOrRepairVersion } from './version';
+export { versionPathFor, legacyVersionPathFor, sha256, readVersion, writeVersion, incrementVersion, verifyOrRepairVersion } from './version';
 
 // mtime sidecar cleanup (local primary only)
 export { purgeMtimeSidecars, isMtimeSidecar } from './mtime-cleanup';
 export type { PurgeableFS, PurgeMtimeOptions, MtimePurgeResult } from './mtime-cleanup';
+
+// Version sidecar migration (legacy `.x.version` → `<name>.version`)
+export { migrateVersionSidecars } from './version-migration';
+export type { MigrateLocalFS, MigrateReplicaFS, VersionMigrationOptions, VersionMigrationResult } from './version-migration';
 
 // All types
 export type {

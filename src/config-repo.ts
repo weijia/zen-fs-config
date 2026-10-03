@@ -36,6 +36,7 @@ import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
+import { migrateVersionSidecars, type VersionMigrationResult } from './version-migration';
 import type { VersionMeta } from './types';
 
 const log = createLogger('zen-fs-config:config-repo');
@@ -679,6 +680,43 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * Migrate legacy `.x.version` sidecars (old dotfile naming) to the new
+   * `<name>.version` naming. Renames local sidecars (preserving content/history)
+   * and deletes the residual legacy copy from every replica backend so sync
+   * does not pull it back. Best-effort: failures are logged, never thrown.
+   *
+   * Runs once at startup (see createConfigRepo). Safe to call again.
+   */
+  async migrateLegacyVersionSidecars(): Promise<VersionMigrationResult> {
+    this.assertNotDisposed();
+    const replicas = [...this.replicaBackends.values()].map((r) => ({
+      unlink: (p: string) => r.syncable.unlink(p),
+    }));
+    const result = await migrateVersionSidecars(this.cachedFS, { replicas });
+    if (result.renamed.length > 0) {
+      log.log(
+        `[ConfigRepo] migrated ${result.renamed.length} legacy version sidecar(s) to new naming`,
+        result.renamed,
+      );
+    }
+    if (result.deleted.length > 0) {
+      log.log(
+        `[ConfigRepo] removed ${result.deleted.length} orphaned legacy version sidecar(s)`,
+        result.deleted,
+      );
+    }
+    if (result.remoteDeleted.length > 0) {
+      log.log(
+        `[ConfigRepo] removed ${result.remoteDeleted.length} remote residual legacy version sidecar(s)`,
+      );
+    }
+    if (result.failed.length > 0) {
+      log.warn(`[ConfigRepo] failed to migrate ${result.failed.length} legacy version sidecar(s):`, result.failed);
+    }
+    return result;
+  }
+
+  /**
    * Perform a full sync + dedup cycle without the watch snapshot cache.
    * Used by createConfigRepo to pull remote-only files (like duplicate
    * backend descriptors) that watch()'s initial snapshot would skip.
@@ -1212,7 +1250,12 @@ export class ConfigRepo implements IConfigRepo {
         // Parallelize stat calls — avoids serial await for each entry
         const statResults = await Promise.all(
           entries
-            .filter((entry: string) => !entry.startsWith('.'))
+            .filter(
+              (entry: string) =>
+                !entry.startsWith('.') &&
+                !entry.endsWith('.version') &&
+                !entry.endsWith('.mtime'),
+            )
             .map(async (entry: string) => {
               const fullPath = current === '/' ? `/${entry}` : `${current}/${entry}`;
               try {
@@ -2239,6 +2282,21 @@ export async function createConfigRepo(
   );
 
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
+
+  // Step 8a: Migrate legacy `.x.version` sidecars to the new `<name>.version`
+  // naming. Runs locally (rename) and on every replica (delete residual), so
+  // existing version history is preserved and the old dotfile copies disappear
+  // from both ends instead of being re-pulled by sync.
+  if (options.migrateVersionSidecars !== false) {
+    try {
+      const mig = await repo.migrateLegacyVersionSidecars();
+      if (mig.renamed.length === 0 && mig.deleted.length === 0 && mig.remoteDeleted.length === 0) {
+        log.log('[createConfigRepo] no legacy version sidecars to migrate');
+      }
+    } catch (err: any) {
+      log.warn(`[createConfigRepo] version sidecar migration failed:`, err?.message ?? err);
+    }
+  }
 
   // Load config cache from local IndexedDB (fast, no network)
   await repo.load();
