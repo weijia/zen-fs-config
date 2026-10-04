@@ -109,12 +109,17 @@ function sortKeysDeep(obj: unknown): unknown {
  * existing dedup semantics for unregistered/custom backends.
  */
 function identityOptions(type: string, options: Record<string, unknown> | undefined): Record<string, unknown> {
-  const fields = getBackendMetadata(type)?.identityFields;
-  if (!fields || fields.length === 0) return options ?? {};
+  const meta = getBackendMetadata(type);
+  const fields = meta?.identityFields;
+  if (!fields || fields.length === 0) {
+    log.warn(`[DEDUP-DIAG] identityOptions(${type}): NO identityFields -> falling back to FULL options (dedup will be key-sensitive to tuning fields)`);
+    return options ?? {};
+  }
   const subset: Record<string, unknown> = {};
   for (const f of fields) {
     if (options && options[f] !== undefined) subset[f] = options[f];
   }
+  log.log(`[DEDUP-DIAG] identityOptions(${type}): identityFields=${JSON.stringify(fields)} identitySubset=${JSON.stringify(subset)}`);
   return subset;
 }
 
@@ -1433,20 +1438,25 @@ export class ConfigRepo implements IConfigRepo {
 
       for (const item of items) {
         const key = backendDedupKey(item.desc);
+        log.log(`[DEDUP-DIAG] item id=${item.desc.id} type=${item.desc.type} dedupKey=${key} mtime=${item.mtime} rawOptions=${JSON.stringify(item.desc.options)}`);
         const existing = seen.get(key);
         if (existing) {
           if (item.mtime < existing.mtime) {
             // New one is older — keep it, mark the existing as duplicate
+            log.log(`[DEDUP-DIAG] DUPLICATE: new id=${item.desc.id} (older) keeps key, dropping existing=${existing.desc.id}`);
             duplicates.push(existing.desc.id);
             seen.set(key, item);
           } else {
             // Existing is older (or same time) — keep existing, mark new as duplicate
+            log.log(`[DEDUP-DIAG] DUPLICATE: new id=${item.desc.id} dropped, kept=${existing.desc.id}`);
             duplicates.push(item.desc.id);
           }
         } else {
           seen.set(key, item);
         }
       }
+
+      log.log(`[DEDUP-DIAG] dedup summary: keptKeys=${[...seen.keys()].length} duplicates=${JSON.stringify(duplicates)}`);
 
       if (duplicates.length > 0) {
         log.log(
@@ -1463,9 +1473,11 @@ export class ConfigRepo implements IConfigRepo {
           for (const [replicaId, replica] of this.replicaBackends) {
             try {
               await replica.instance.unlink(descPath);
-            } catch { /* not on this replica */ }
+              log.log(`[DEDUP-DIAG] removed dup ${dupId} from replica ${replicaId}`);
+            } catch (e) { /* not on this replica */ log.log(`[DEDUP-DIAG] remove dup ${dupId} from replica ${replicaId} failed/skipped: ${String(e)}`); }
             await this.unlinkVersionSidecar(replica.instance, descPath);
           }
+          log.log(`[DEDUP-DIAG] replicaBackends available during removal: ${[...this.replicaBackends.keys()].join(',') || '(none)'}`);
 
           // 2. Create a tombstone + delete the local file.
           //    The tombstone ensures late-joining replicas also delete the file.
@@ -1480,7 +1492,8 @@ export class ConfigRepo implements IConfigRepo {
       }
 
       return Array.from(seen.values()).map(i => i.desc);
-    } catch {
+    } catch (e) {
+      log.error(`[DEDUP-DIAG] readAllBackendDescriptors threw, returning []:`, e);
       return []; // Directory doesn't exist yet
     }
   }
@@ -2307,6 +2320,7 @@ export async function createConfigRepo(
   // Step 5: Read all backends ONCE (used for both duplicate check and setupSync)
   // -------------------------------------------------------------------
   let allBackends = await tempRepo.readAllBackendDescriptors();
+  log.log(`[DEDUP-DIAG] createConfigRepo after readAllBackendDescriptors: allBackends=${allBackends.map(b => b.id).join(',')}`);
 
   // -------------------------------------------------------------------
   // Step 5b: If backendInfo is provided, add as replica (if not present)
