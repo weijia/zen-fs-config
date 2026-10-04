@@ -112,7 +112,15 @@ const metadataRegistry = new Map<string, BackendMetadata>();
 export function registerBackend(type: string, factory: BackendFactory, metadata?: BackendMetadata): void {
   registry.set(type, factory);
   if (metadata) {
-    metadataRegistry.set(type, metadata);
+    // Merge onto any existing metadata instead of replacing it, so a
+    // re-registration (e.g. an app re-registering a built-in backend to supply
+    // its own factory / UI metadata) cannot silently drop core fields such as
+    // `identityFields` that the original registration declared. Losing
+    // `identityFields` made backend deduplication fall back to a full-options
+    // comparison and miss duplicates that differ only in client tuning fields
+    // (the reported `remotestorage-1784761846529` duplicate-replica bug).
+    const existing = metadataRegistry.get(type);
+    metadataRegistry.set(type, { ...existing, ...metadata });
   }
 }
 

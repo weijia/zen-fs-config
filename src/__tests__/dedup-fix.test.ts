@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
-import { registerBackend, createBackend, type BackendInstance } from '../backend-registry';
+import { registerBackend, createBackend, getBackendMetadata, type BackendInstance } from '../backend-registry';
 import { createConfigRepo, ConfigRepo } from '../config-repo';
 import type { BackendDescriptor } from '../types';
 
@@ -688,9 +688,9 @@ describe('removeBackend — tombstone-based deletion', () => {
 // both kept. The result is two sync pairs to the same remote -> redundant/
 // looping PUTs.
 //
-// These tests assert the INTENDED behaviour (only one replica survives). They
-// currently FAIL, reproducing the bug, and should pass once dedup becomes
-// connection-identity aware (e.g. keying only on endpoint-identifying fields).
+// These tests assert the INTENDED behaviour (only one replica survives) and act
+// as regression guards now that dedup is connection-identity aware (keying only
+// on endpoint-identifying `identityFields`).
 // ---------------------------------------------------------------------------
 
 describe('config-sync replica dedup — same endpoint, different option serialization', () => {
@@ -770,5 +770,113 @@ describe('config-sync replica dedup — same endpoint, different option serializ
     expect(repo3.replicaCount).toBe(1);
 
     await repo3.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: re-registering a backend type must not clobber identityFields
+//
+// Root cause of the `remotestorage-1784761846529` duplicate-replica bug: the
+// admin app (register-backends.ts) re-registers built-in backends (RemoteStorage,
+// Gitee, ...) passing metadata WITHOUT `identityFields`, which used to REPLACE the
+// built-in metadata and drop `identityFields`. With no `identityFields`, dedup
+// falls back to a full-options comparison, so two descriptors for the same
+// endpoint that differ only in client tuning fields (syncRootPath/timeout) are
+// NOT deduplicated. `registerBackend` now MERGES metadata so the core
+// `identityFields` survive re-registration.
+// ---------------------------------------------------------------------------
+
+const rsFactory = async () => createBackend({ type: 'InMemory', options: { label: 'rs' } } as any);
+
+describe('registerBackend — re-registration must not drop identityFields', () => {
+  it('preserves identityFields declared by the built-in registration when re-registered with partial metadata', () => {
+    // Built-in registration (as in backend-registry.ts) declares identityFields.
+    registerBackend('RsMerge', rsFactory, {
+      type: 'RsMerge',
+      label: 'RemoteStorage',
+      identityFields: ['href', 'token', 'basePath'],
+    });
+    expect(getBackendMetadata('RsMerge')?.identityFields).toEqual(['href', 'token', 'basePath']);
+
+    // App re-registration (as in admin register-backends.ts) passes metadata
+    // WITHOUT identityFields — this used to clobber it.
+    registerBackend('RsMerge', rsFactory, {
+      type: 'RsMerge',
+      label: 'RemoteStorage',
+      icon: '\u{1F4E1}',
+      fields: [
+        { key: 'href', label: 'User Address', type: 'text' },
+        { key: 'token', label: 'Token', type: 'password' },
+        { key: 'basePath', label: 'Base Path', type: 'text' },
+      ],
+      defaultOptions: { href: '', token: '', basePath: '/' },
+    });
+
+    // identityFields must survive the re-registration (merge semantics).
+    expect(getBackendMetadata('RsMerge')?.identityFields).toEqual(['href', 'token', 'basePath']);
+  });
+
+  it('still allows an explicit re-registration to override identityFields', () => {
+    registerBackend('RsOverride', rsFactory, {
+      type: 'RsOverride',
+      label: 'X',
+      identityFields: ['a', 'b'],
+    });
+    registerBackend('RsOverride', rsFactory, {
+      type: 'RsOverride',
+      label: 'X',
+      identityFields: ['c'],
+    });
+    expect(getBackendMetadata('RsOverride')?.identityFields).toEqual(['c']);
+  });
+});
+
+describe('dedup — same endpoint, differing client tuning fields (remotestorage-1784761846529 bug)', () => {
+  it('deduplicates two descriptors that differ only in syncRootPath/timeout after re-registration', async () => {
+    const appId = 'test-rs-clobber-dedup';
+    const idbStore = `persistent-${appId}`;
+
+    // Built-in registration with identityFields...
+    registerBackend('RsMerge', rsFactory, {
+      type: 'RsMerge',
+      label: 'RemoteStorage',
+      identityFields: ['href', 'token', 'basePath'],
+    });
+    // ...immediately followed by the app's re-registration WITHOUT identityFields
+    // (the exact pattern that caused the bug). Merge must keep identityFields.
+    registerBackend('RsMerge', rsFactory, {
+      type: 'RsMerge',
+      label: 'RemoteStorage',
+      fields: [{ key: 'href', label: 'href', type: 'text' }],
+      defaultOptions: { href: '', token: '', basePath: '/' },
+    });
+
+    const repo = await createConfigRepo(appId, { folderPath: idbStore, nodeId: 'node-1' }) as ConfigRepo;
+
+    // First descriptor: minimal options (the "primary" connection).
+    await repo.writeBackendDescriptor({
+      id: 'RemoteStorage-primary',
+      type: 'RsMerge',
+      options: { href: 'https://storage.5apps.com/weijia/', token: 't0k', basePath: '/app_data/configs' },
+    } as unknown as BackendDescriptor);
+    await new Promise(r => setTimeout(r, 10));
+    // Second descriptor: same endpoint, extra client tuning fields added by the UI.
+    await repo.writeBackendDescriptor({
+      id: 'remotestorage-1784761846529',
+      type: 'RsMerge',
+      options: {
+        href: 'https://storage.5apps.com/weijia/',
+        token: 't0k',
+        basePath: '/app_data/configs',
+        syncRootPath: '',
+        timeout: '30000',
+      },
+    } as unknown as BackendDescriptor);
+
+    const backends = await repo.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
+    expect(backends[0].id).toBe('RemoteStorage-primary');
+
+    await repo.dispose();
   });
 });
