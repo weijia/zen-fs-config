@@ -16,8 +16,10 @@
  * metadata that keep real (empty) directories alive, and deleting them would
  * lose directory structure.
  *
- * The intentional `.keep` under `/.meta/` (used to keep the backends directory
- * alive) is protected and never deleted — see `protectedDirs`.
+ * The intentional `.keep` placeholder at `/.meta/backends/.keep` (used to keep
+ * the backends directory alive) is protected and never deleted — see
+ * `protectedDirs`. Any other `.keep` (including `/.meta/.keep`, which some older
+ * builds leaked into the local primary) is treated as a leak and purged.
  */
 
 // ---------------------------------------------------------------------------
@@ -37,9 +39,10 @@ export interface PurgeKeepOptions {
   /** Report what would be deleted without unlinking anything. */
   dryRun?: boolean;
   /**
-   * Directories (and their subtrees) whose `.keep` files are NEVER deleted.
-   * Defaults to `['/.meta']` to protect the intentional backends placeholder
-   * that keeps `/.meta/backends` alive.
+   * Exact paths (or directories and their subtrees) whose `.keep` files are
+   * NEVER deleted. Defaults to `['/.meta/backends/.keep']` to protect the
+   * single intentional placeholder that keeps `/.meta/backends` alive. A leaked
+   * `.keep` elsewhere (e.g. `/.meta/.keep`, `/docs/.keep`) is still purged.
    */
   protectedDirs?: string[];
 }
@@ -72,7 +75,10 @@ export function isKeepFile(fileName: string): boolean {
 // ---------------------------------------------------------------------------
 
 const S_IFDIR = 0o40000;
-const DEFAULT_PROTECTED_DIRS = ['/.meta'];
+// Only the single intentional placeholder that keeps `/.meta/backends` alive is
+// protected. Older builds leaked `.keep` files into `/.meta/.keep` (and other
+// locations) on the local primary; those must be purged, not shielded.
+const DEFAULT_PROTECTED_DIRS = ['/.meta/backends/.keep'];
 
 function isDirectory(stat: { mode?: number }): boolean {
   return typeof stat.mode === 'number' && (stat.mode & S_IFDIR) === S_IFDIR;

@@ -31,7 +31,7 @@ import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
 import type { PathAwareSerializer } from './serializer';
 import { backendToSyncableFS } from './adapters';
-import { createBackend, mergeAccountFields, getAccountFields, type BackendInstance } from './backend-registry';
+import { createBackend, mergeAccountFields, getAccountFields, getBackendMetadata, type BackendInstance } from './backend-registry';
 import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
@@ -100,11 +100,31 @@ function sortKeysDeep(obj: unknown): unknown {
 }
 
 /**
+ * Extract only the endpoint-identity options for a backend descriptor.
+ *
+ * If the backend type declares `identityFields` metadata, only those keys are
+ * kept (so client-side tuning options — `basePath`, `persistCache`, `maxSize`,
+ * `cacheFile`, etc. — do NOT break dedup). Types without `identityFields`
+ * metadata fall back to the full options blob (legacy behavior), preserving
+ * existing dedup semantics for unregistered/custom backends.
+ */
+function identityOptions(type: string, options: Record<string, unknown> | undefined): Record<string, unknown> {
+  const fields = getBackendMetadata(type)?.identityFields;
+  if (!fields || fields.length === 0) return options ?? {};
+  const subset: Record<string, unknown> = {};
+  for (const f of fields) {
+    if (options && options[f] !== undefined) subset[f] = options[f];
+  }
+  return subset;
+}
+
+/**
  * Generate a dedup key for a backend descriptor.
- * Two backends with the same type + options (regardless of key ordering) produce the same key.
+ * Two backends with the same type + endpoint-identity options (regardless of
+ * key ordering or extra client-side tuning options) produce the same key.
  */
 function backendDedupKey(desc: BackendDescriptor): string {
-  return `${desc.type}:${stableOptionsKey(desc.options)}`;
+  return `${desc.type}:${stableOptionsKey(identityOptions(desc.type, desc.options))}`;
 }
 
 /**

@@ -152,6 +152,15 @@ function createSharedMockBackend(storeKey: string): BackendInstance {
 beforeAll(() => {
   registerBackend('MockShared', async (options) => {
     return createSharedMockBackend(options.storeKey as string);
+  }, {
+    type: 'MockShared',
+    label: 'MockShared',
+    icon: '🗄️',
+    fields: [{ key: 'storeKey', label: 'Store Key', type: 'text' }],
+    defaultOptions: { storeKey: '' },
+    // storeKey uniquely identifies the shared remote — extra tuning options
+    // (e.g. basePath/persistCache added by a UI form) must NOT break dedup.
+    identityFields: ['storeKey'],
   });
 });
 
@@ -660,5 +669,106 @@ describe('removeBackend — tombstone-based deletion', () => {
     expect(backends.length).toBe(0);
 
     await repo2.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: config-sync replica dedup misses same-endpoint / different-options
+// backends
+//
+// Reported case: `Replica backends: RemoteStorage-primary, gitee,
+// remotestorage-1784761846529` — two RemoteStorage replicas pointing at the
+// SAME endpoint, but NOT deduplicated.
+//
+// Root cause: `backendDedupKey` (config-repo.ts) hashes the ENTIRE `options`
+// blob via `stableOptionsKey`, so two descriptors that connect to the very same
+// remote (same baseUrl/token, i.e. same `storeKey` here) but differ in
+// irrelevant fields (e.g. the admin Backends UI adds `basePath` / `persistCache`
+// defaults, or key ordering with extra fields) produce DIFFERENT keys and are
+// both kept. The result is two sync pairs to the same remote -> redundant/
+// looping PUTs.
+//
+// These tests assert the INTENDED behaviour (only one replica survives). They
+// currently FAIL, reproducing the bug, and should pass once dedup becomes
+// connection-identity aware (e.g. keying only on endpoint-identifying fields).
+// ---------------------------------------------------------------------------
+
+describe('config-sync replica dedup — same endpoint, different option serialization', () => {
+  it('readAllBackendDescriptors keeps only one of two same-endpoint descriptors with differing extra options', async () => {
+    const appId = 'test-cfg-dedup-same-endpoint';
+    const sharedStoreKey = `shared-${appId}-${Date.now()}`;
+    const idbStore = `persistent-${appId}`;
+
+    // First "connect": explicit primaryBackendId, minimal options.
+    const repo = await createConfigRepo(appId, {
+      folderPath: idbStore,
+      backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
+      primaryBackendId: 'RemoteStorage-primary',
+      nodeId: 'node-1',
+    }) as ConfigRepo;
+
+    // Simulate the second replica that the admin Backends UI created with an
+    // auto-generated id (`remotestorage-<timestamp>`) and its default options.
+    // `storeKey` is identical (same endpoint) but extra fields are present —
+    // exactly the divergence that defeats the current strict key.
+    await repo.writeBackendDescriptor({
+      id: 'remotestorage-1784761846529',
+      type: 'MockShared',
+      options: { storeKey: sharedStoreKey, basePath: '/', persistCache: true },
+    } as unknown as BackendDescriptor);
+
+    const backends = await repo.readAllBackendDescriptors();
+
+    // BUG: both survive (length === 2) because backendDedupKey compares the
+    // whole options object.
+    expect(backends.length).toBe(1);
+
+    await repo.dispose();
+  });
+
+  it('createConfigRepo creates only ONE sync pair for two same-endpoint replicas', async () => {
+    const appId = 'test-cfg-dedup-single-pair';
+    const sharedStoreKey = `shared-${appId}-${Date.now()}`;
+    const idbStore = `persistent-${appId}`;
+
+    // Phase 1: connect with explicit id, push descriptor to the shared remote.
+    const repo1 = await createConfigRepo(appId, {
+      folderPath: idbStore,
+      backendInfo: { type: 'MockShared', options: { storeKey: sharedStoreKey } },
+      primaryBackendId: 'RemoteStorage-primary',
+      nodeId: 'node-1',
+    }) as ConfigRepo;
+    await new Promise(r => setTimeout(r, 50));
+    await repo1.flush();
+    await repo1.dispose();
+
+    // Phase 2: a second descriptor for the SAME endpoint, written via the
+    // admin UI path with extra default options + auto-generated timestamp id.
+    const repo2 = await createConfigRepo(appId, {
+      folderPath: idbStore,
+      nodeId: 'node-2',
+    }) as ConfigRepo;
+    await repo2.writeBackendDescriptor({
+      id: 'remotestorage-1784761846529',
+      type: 'MockShared',
+      options: { storeKey: sharedStoreKey, basePath: '/', persistCache: true },
+    } as unknown as BackendDescriptor);
+    await repo2.flush();
+    await repo2.dispose();
+
+    // Phase 3: reconnect. The two descriptors share the same endpoint, so only
+    // ONE replica (and ONE sync pair) should be created.
+    const repo3 = await createConfigRepo(appId, {
+      folderPath: idbStore,
+      nodeId: 'node-3',
+    }) as ConfigRepo;
+
+    const backends = await repo3.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
+
+    // Only one sync pair should exist — not two to the same remote.
+    expect(repo3.replicaCount).toBe(1);
+
+    await repo3.dispose();
   });
 });

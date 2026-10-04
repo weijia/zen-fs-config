@@ -38,21 +38,24 @@ describe('keep placeholder cleanup', () => {
     await repo.dispose();
   });
 
-  it('protects the intentional /.meta/backends/.keep', async () => {
+  it('protects the intentional /.meta/backends/.keep but purges leaked /.meta/.keep', async () => {
     const repo = await createConfigRepo('test-app-keep2', {
       nodeId: 'node-keep2',
       purgeKeepFiles: false,
     });
     const p = (repo as any).rootFS.promises;
 
-    // intentional meta placeholder
+    // intentional meta placeholder (kept alive by zen-fs-config)
     await p.writeFile('/.meta/backends/.keep', '\n');
+    // leaked placeholder directly under /.meta — must be removed, NOT shielded
+    await p.writeFile('/.meta/.keep', '\n');
     // leaked placeholder elsewhere
     await p.writeFile('/retire/.keep', '\n');
 
     const res = await repo.purgeKeepFiles();
-    expect(res.removed).toEqual(['/retire/.keep']);
+    expect(res.removed.sort()).toEqual(['/.meta/.keep', '/retire/.keep']);
     expect(await p.exists('/.meta/backends/.keep')).toBe(true);
+    expect(await p.exists('/.meta/.keep')).toBe(false);
 
     await repo.dispose();
   });

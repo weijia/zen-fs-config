@@ -85,6 +85,21 @@ export interface BackendMetadata {
    * Fields not listed here are considered "storage location" fields.
    */
   accountFields?: string[];
+  /**
+   * Option keys that uniquely identify the backend's STORAGE ENDPOINT.
+   * Two descriptors of the same `type` whose `identityFields` values match are
+   * considered the SAME replica (e.g. same RemoteStorage `href`+`token`, or
+   * same Gitee `owner`+`repo`+`branch`) and are deduplicated — even if they
+   * differ in client-side tuning options such as `basePath`, `persistCache`,
+   * `maxSize`, etc.
+   *
+   * When omitted, dedup falls back to the FULL options blob (legacy behavior),
+   * so only types that declare `identityFields` gain the connection-aware
+   * dedup. At minimum include the endpoint-identifying fields; auth/credential
+   * fields may be included or omitted depending on whether same-location
+   * different-credential backends should be treated as distinct.
+   */
+  identityFields?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +319,8 @@ registerBackend('InMemory', async (options) => {
     { key: 'label', label: 'Label', type: 'text', placeholder: 'zen-fs-config-1' },
   ],
   defaultOptions: { maxSize: '', label: '' },
+  // identity = store label (maxSize is just client-side capacity tuning)
+  identityFields: ['label'],
 });
 
 // ---------------------------------------------------------------------------
@@ -330,6 +347,8 @@ registerBackend('IndexedDB', async (options) => {
     { key: 'storeName', label: 'Store Name', type: 'text', placeholder: 'zen-fs-config' },
   ],
   defaultOptions: { storeName: '' },
+  // identity = IndexedDB store name
+  identityFields: ['storeName'],
 });
 
 // ---------------------------------------------------------------------------
@@ -485,6 +504,9 @@ registerBackend('GitHub', async (options) => {
   ],
   defaultOptions: { owner: '', repo: '', branch: 'main', token: '', baseUrl: '' },
   accountFields: ['token', 'owner', 'baseUrl'],
+  // identity = the Git repo location (token is auth, but included so that
+  // same-repo different-credential backends are still treated as distinct)
+  identityFields: ['owner', 'repo', 'branch', 'baseUrl'],
 });
 
 registerBackend('Gitee', async (options) => {
@@ -519,6 +541,8 @@ registerBackend('Gitee', async (options) => {
   ],
   defaultOptions: { owner: '', repo: '', branch: 'master', token: '', baseUrl: '' },
   accountFields: ['token', 'owner', 'baseUrl'],
+  // identity = the Git repo location
+  identityFields: ['owner', 'repo', 'branch', 'baseUrl'],
 });
 
 registerBackend('RemoteStorage', async (options) => {
@@ -555,4 +579,8 @@ registerBackend('RemoteStorage', async (options) => {
   ],
   defaultOptions: { href: '', token: '', basePath: '/' },
   accountFields: ['href', 'token'],
+  // identity = the RemoteStorage account + subtree. Client tuning (persistCache,
+  // cacheFile, preciseMtime, headers, timeout) is intentionally excluded so two
+  // connections to the same endpoint with different tuning are deduplicated.
+  identityFields: ['href', 'token', 'basePath'],
 });
