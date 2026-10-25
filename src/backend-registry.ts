@@ -401,6 +401,7 @@ const OPTIONAL_BACKEND_GLOBALS: Record<string, string[]> = {
   // with "Invalid mount configuration".
   'zen-fs-gitee': ['ZenFSGitee'],
   'zen-fs-remotestoragejs': ['ZenFSRemoteStorage', 'RemoteStorageFileSystem'],
+  'zen-fs-webdav': ['ZenFSWebDAV'],
 };
 
 /**
@@ -591,4 +592,62 @@ registerBackend('RemoteStorage', async (options) => {
   // cacheFile, preciseMtime, headers, timeout) is intentionally excluded so two
   // connections to the same endpoint with different tuning are deduplicated.
   identityFields: ['href', 'token', 'basePath'],
+});
+
+registerBackend('WebDAV', async (options) => {
+  const _dav = await importOptionalBackend('zen-fs-webdav');
+  const SyncableWebDAVFS =
+    _dav?.SyncableWebDAVFS ??
+    _dav?.default?.SyncableWebDAVFS ??
+    (globalThis as any).ZenFSWebDAV?.SyncableWebDAVFS;
+  if (typeof SyncableWebDAVFS !== 'function') {
+    throw new Error(
+      `Backend package "zen-fs-webdav" loaded, but its SyncableWebDAVFS export is not a ` +
+      `constructor (typeof=${typeof SyncableWebDAVFS}). ` +
+      `Run: npm install zen-fs-webdav, or load its UMD bundle via ` +
+      `<script src=".../zen-fs-webdav.global.js"> so it exposes the global "ZenFSWebDAV".`,
+    );
+  }
+  // SyncableWebDAVFS implements SyncableFS, which is a superset of what
+  // BackendInstance needs.
+  const instance = new SyncableWebDAVFS({
+    baseUrl: options.baseUrl,
+    username: options.username,
+    password: options.password,
+    token: options.token,
+    headers: options.headers,
+    timeout: options.timeout,
+    preciseMtime: true,
+  });
+  // 旧「每文件 .mtime sidecar」的清理是 **opt-in**：它会递归扫描整棵树，
+  // 默认在每次连接时跑太贵。只有显式传 `purgeLegacyMtime: true` 才执行
+  // （其值会被迁移进新的每目录清单，不丢失已有的精确 mtime）。
+  if (options.purgeLegacyMtime === true) {
+    try {
+      await (instance as any).purgeLegacyMtimeSidecars({ root: options.basePath ?? '/' });
+    } catch { /* best effort — never block connecting */ }
+  }
+  return instance as unknown as BackendInstance;
+}, {
+  type: 'WebDAV',
+  label: 'WebDAV',
+  icon: '☁️',
+  fields: [
+    { key: 'baseUrl', label: 'Base URL', type: 'text', placeholder: 'https://dav.example.com/remote.php/dav/files/user/', required: true },
+    { key: 'username', label: 'Username', type: 'text', placeholder: 'admin' },
+    { key: 'password', label: 'Password', type: 'password' },
+    { key: 'token', label: 'Token', type: 'password', placeholder: 'Bearer token (optional)' },
+    { key: 'basePath', label: 'Base Path', type: 'text', placeholder: '/zen-fs-config/' },
+    { key: 'purgeLegacyMtime', label: 'Purge legacy .mtime sidecars', type: 'select', options: [
+      { value: 'false', label: 'no (default)' },
+      { value: 'true', label: 'yes (one-time migration)' },
+    ]},
+  ],
+  defaultOptions: { baseUrl: '', username: '', password: '', token: '', basePath: '/', purgeLegacyMtime: 'false' },
+  // accountFields: credentials live on the endpoint, so a data-sync group can
+  // reuse them from an already-connected config-sync WebDAV backend.
+  accountFields: ['username', 'password', 'token'],
+  // identity = the WebDAV endpoint. Credentials are auth, not location, so two
+  // connections to the same URL are deduplicated as one replica.
+  identityFields: ['baseUrl'],
 });

@@ -52,7 +52,8 @@
     "zen-fs-sync": ">=0.4.7",
     "zen-fs-github": "*",
     "zen-fs-gitee": "*",
-    "zen-fs-remotestoragejs": "*"
+    "zen-fs-remotestoragejs": "*",
+    "zen-fs-webdav": "*"
   },
   "dependencies": {
     "@richard432/localstorage-logger": "^0.1.0"
@@ -71,6 +72,9 @@
       "optional": true
     },
     "zen-fs-remotestoragejs": {
+      "optional": true
+    },
+    "zen-fs-webdav": {
       "optional": true
     }
   },
