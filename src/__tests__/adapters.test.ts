@@ -233,4 +233,59 @@ describe('wrapZenFSFileSystem passthrough', () => {
     expect((backend as any).createSnapshot).toBeUndefined();
     expect((backend as any).writeFileWithMtime).toBeUndefined();
   });
+
+  it('passes through shouldSync when isolated FS has it (regression: Gitee/RemoteStorage remote-change polling)', async () => {
+    const isolatedFS = createMockIsolatedFS({
+      shouldSync: vi.fn().mockResolvedValue(false),
+    });
+    vi.mocked(resolveMountConfig).mockResolvedValue(isolatedFS);
+
+    const backend = await wrapZenFSFileSystem({});
+
+    // 契约：底层实现了 shouldSync，包装后的 BackendInstance 必须仍然具备，
+    // 否则 backendToSyncableFS / wrapWithCache 的 typeof 探测摸不到，
+    // zen-fs-sync 的远端变更轮询通道会静默失效。
+    expect(typeof (backend as any).shouldSync).toBe('function');
+
+    await (backend as any).shouldSync();
+    expect(isolatedFS.shouldSync).toHaveBeenCalled();
+
+    // 转发结果必须保留（true / false 语义不能被吞掉）
+    await expect((backend as any).shouldSync()).resolves.toBe(false);
+    isolatedFS.shouldSync = vi.fn().mockResolvedValue(true);
+    await expect((backend as any).shouldSync()).resolves.toBe(true);
+  });
+
+  it('does not add shouldSync when isolated FS lacks it', async () => {
+    const isolatedFS = createMockIsolatedFS();
+    vi.mocked(resolveMountConfig).mockResolvedValue(isolatedFS);
+
+    const backend = await wrapZenFSFileSystem({});
+
+    expect((backend as any).shouldSync).toBeUndefined();
+  });
+
+  it('contract: every optional capability present on the isolated FS survives wrapping', async () => {
+    // 白名单抄写式包装的历史 bug：漏抄一个可选能力 → 下游 typeof 探测
+    // 永远摸不到 → 同步引擎静默降级。此测试对全部可选能力做整体断言，
+    // 新增能力时请同步加进 OPTIONAL_CAPABILITIES。
+    const OPTIONAL_CAPABILITIES = [
+      'shouldSync',
+      'createSnapshot',
+      'writeFileWithMtime',
+    ] as const;
+
+    const overrides: Record<string, any> = {};
+    for (const cap of OPTIONAL_CAPABILITIES) {
+      overrides[cap] = vi.fn().mockResolvedValue(undefined);
+    }
+    const isolatedFS = createMockIsolatedFS(overrides);
+    vi.mocked(resolveMountConfig).mockResolvedValue(isolatedFS);
+
+    const backend = await wrapZenFSFileSystem({});
+
+    for (const cap of OPTIONAL_CAPABILITIES) {
+      expect(typeof (backend as any)[cap], `capability "${cap}" must survive wrapping`).toBe('function');
+    }
+  });
 });

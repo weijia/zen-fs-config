@@ -300,6 +300,15 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
       (isolatedFS as any).writeFileWithMtime(path, data, mtimeMs);
   }
 
+  // 透传 shouldSync（如底层 ZenFS FS 实现了此方法）。
+  // 远程后端（GiteeFS / RemoteStorageFileSystem 等）自带 shouldSync 用于检测
+  // 远端外部变更；此前该能力在此处被丢弃，导致 zen-fs-sync 的远端轮询通道
+  // 对这些后端失效（仅 GitHub 因注册工厂手工回挂而幸免）。详见契约测试。
+  if (typeof (isolatedFS as any).shouldSync === 'function') {
+    (backend as any).shouldSync = (...args: any[]) =>
+      (isolatedFS as any).shouldSync(...args);
+  }
+
   return backend;
 }
 
