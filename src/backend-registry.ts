@@ -530,9 +530,12 @@ registerBackend('GitHub', async (options) => {
 registerBackend('Gitee', async (options) => {
   const _gt = await importOptionalBackend('zen-fs-gitee');
   const Gitee = _gt?.Gitee ?? _gt?.default;
-  if (typeof Gitee !== 'function') {
+  // zen-fs-gitee 的 Gitee 导出是「后端描述符对象」(含 name/options/isAvailable/create)，
+  // 不是类构造器；@zenfs/core 的 resolveMountConfig 直接接受描述符，故 backend 传描述符本身。
+  // 兼容两种形态：描述符(object 且含 .create) 或 旧式构造器(function)。
+  if (!Gitee || (typeof Gitee !== 'function' && typeof Gitee.create !== 'function')) {
     throw new Error(
-      `Backend package "zen-fs-gitee" loaded, but its Gitee export is not a constructor ` +
+      `Backend package "zen-fs-gitee" loaded, but its Gitee export is not a usable backend ` +
       `(typeof=${typeof Gitee}). Load its UMD bundle so it exposes the global "ZenFSGitee".`,
     );
   }
