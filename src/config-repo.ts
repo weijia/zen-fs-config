@@ -115,6 +115,14 @@ function identityOptions(type: string, options: Record<string, unknown> | undefi
   for (const f of fields) {
     if (options && options[f] !== undefined) subset[f] = options[f];
   }
+  // 归一化 Gitee/GitHub 的 baseUrl：空/未设置 → 默认端点，并去掉尾部斜杠，
+  // 使「未设/空 baseUrl」与「显式默认端点」的同一仓库判为同一后端（此前该差异会误判为不同）。
+  if (type === 'Gitee' || type === 'GitHub') {
+    const defaultEndpoint = type === 'Gitee' ? 'https://gitee.com/api/v5' : 'https://api.github.com';
+    const raw = options && options.baseUrl;
+    const value = typeof raw === 'string' && raw.trim() !== '' ? raw : defaultEndpoint;
+    subset['baseUrl'] = value.replace(/\/+$/, '');
+  }
   return subset;
 }
 
@@ -1898,8 +1906,16 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     const descPath = this.appDataGroupFilePath(id);
-    try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
-    await this.unlinkVersionSidecar(this.cachedFS, descPath);
+    // Use deleteFile (tombstone) so the deletion propagates to remote
+    // replicas (e.g. the config-sync repo on Gitee) and is NOT resurrected
+    // by sync pulling the still-existing remote descriptor back.
+    try {
+      await this.deleteFile(descPath);
+    } catch (err) {
+      log.log(`[ConfigRepo] removeAppDataGroup: deleteFile failed for "${id}":`, err);
+      try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
+      await this.unlinkVersionSidecar(this.cachedFS, descPath);
+    }
     log.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
   }
 

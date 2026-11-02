@@ -794,6 +794,9 @@ describe('registerBackend — re-registration must not drop identityFields', () 
     registerBackend('RsMerge', rsFactory, {
       type: 'RsMerge',
       label: 'RemoteStorage',
+      icon: '',
+      fields: [],
+      defaultOptions: {},
       identityFields: ['href', 'token', 'basePath'],
     });
     expect(getBackendMetadata('RsMerge')?.identityFields).toEqual(['href', 'token', 'basePath']);
@@ -820,11 +823,17 @@ describe('registerBackend — re-registration must not drop identityFields', () 
     registerBackend('RsOverride', rsFactory, {
       type: 'RsOverride',
       label: 'X',
+      icon: '',
+      fields: [],
+      defaultOptions: {},
       identityFields: ['a', 'b'],
     });
     registerBackend('RsOverride', rsFactory, {
       type: 'RsOverride',
       label: 'X',
+      icon: '',
+      fields: [],
+      defaultOptions: {},
       identityFields: ['c'],
     });
     expect(getBackendMetadata('RsOverride')?.identityFields).toEqual(['c']);
@@ -840,6 +849,9 @@ describe('dedup — same endpoint, differing client tuning fields (remotestorage
     registerBackend('RsMerge', rsFactory, {
       type: 'RsMerge',
       label: 'RemoteStorage',
+      icon: '',
+      fields: [],
+      defaultOptions: {},
       identityFields: ['href', 'token', 'basePath'],
     });
     // ...immediately followed by the app's re-registration WITHOUT identityFields
@@ -847,6 +859,7 @@ describe('dedup — same endpoint, differing client tuning fields (remotestorage
     registerBackend('RsMerge', rsFactory, {
       type: 'RsMerge',
       label: 'RemoteStorage',
+      icon: '',
       fields: [{ key: 'href', label: 'href', type: 'text' }],
       defaultOptions: { href: '', token: '', basePath: '/' },
     });
@@ -877,6 +890,44 @@ describe('dedup — same endpoint, differing client tuning fields (remotestorage
     expect(backends.length).toBe(1);
     expect(backends[0].id).toBe('RemoteStorage-primary');
 
+    await repo.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gitee/GitHub baseUrl normalization in identityOptions: an empty/absent
+// baseUrl must be treated as the SAME endpoint as the explicit default, and a
+// trailing slash must not split the identity. Before the fix, a Gitee backend
+// saved with `baseUrl:''` and one saved with `baseUrl:'https://gitee.com/api/v5'`
+// produced different dedup keys and were both kept (the reported
+// "two Gitee config backends not deduped" bug).
+// ---------------------------------------------------------------------------
+
+describe('identityOptions — Gitee/GitHub baseUrl normalization', () => {
+  it('treats empty baseUrl and explicit default baseUrl as the same backend', async () => {
+    const repo = await createConfigRepo('test-gitee-baseurl-norm', { nodeId: 'test-node' }) as ConfigRepo;
+    await repo.writeBackendDescriptor({ id: 'g-empty', type: 'Gitee', options: { owner: 'weijia432', repo: 'configs', branch: 'master', baseUrl: '' } });
+    await repo.writeBackendDescriptor({ id: 'g-default', type: 'Gitee', options: { owner: 'weijia432', repo: 'configs', branch: 'master', baseUrl: 'https://gitee.com/api/v5' } });
+    const backends = await repo.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
+    await repo.dispose();
+  });
+
+  it('treats absent baseUrl and explicit default baseUrl as the same backend', async () => {
+    const repo = await createConfigRepo('test-gitee-baseurl-absent', { nodeId: 'test-node' }) as ConfigRepo;
+    await repo.writeBackendDescriptor({ id: 'g-absent', type: 'Gitee', options: { owner: 'a', repo: 'b', branch: 'master' } });
+    await repo.writeBackendDescriptor({ id: 'g-default', type: 'Gitee', options: { owner: 'a', repo: 'b', branch: 'master', baseUrl: 'https://gitee.com/api/v5' } });
+    const backends = await repo.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
+    await repo.dispose();
+  });
+
+  it('treats trailing-slash default baseUrl as the same backend', async () => {
+    const repo = await createConfigRepo('test-gitee-baseurl-slash', { nodeId: 'test-node' }) as ConfigRepo;
+    await repo.writeBackendDescriptor({ id: 'g1', type: 'Gitee', options: { owner: 'a', repo: 'b', branch: 'master', baseUrl: '' } });
+    await repo.writeBackendDescriptor({ id: 'g2', type: 'Gitee', options: { owner: 'a', repo: 'b', branch: 'master', baseUrl: 'https://gitee.com/api/v5/' } });
+    const backends = await repo.readAllBackendDescriptors();
+    expect(backends.length).toBe(1);
     await repo.dispose();
   });
 });

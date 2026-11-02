@@ -118,6 +118,26 @@ describe('AppDataGroup within ConfigRepo', () => {
     await repo.dispose();
   });
 
+  it('removeAppDataGroup writes a tombstone so the deletion propagates to remote', async () => {
+    const repo = await createConfigRepo('test-adg-app6b', { nodeId: 'test-node' });
+    await repo.createAppDataGroup('to-remove', [
+      { id: 'b', type: 'InMemory', options: { label: 'r' } },
+    ]);
+    await repo.removeAppDataGroup('to-remove');
+    // A tombstone must exist under /.meta/.deleted so sync propagates the
+    // deletion to remote replicas (and does not resurrect the group).
+    const cachedFS = (repo as any).cachedFS;
+    const tombFileName =
+      '++meta__app-data-groups__test-adg-app6b__to-remove++json.json';
+    const entries = await cachedFS.readdir('/.meta/.deleted');
+    if (!entries.includes(tombFileName)) {
+      throw new Error('MISSING tombstone, entries=' + JSON.stringify(entries));
+    }
+    const list = await repo.listAppDataGroups();
+    expect(list.length).toBe(0);
+    await repo.dispose();
+  });
+
   it('createAppDataGroup throws for duplicate id', async () => {
     const repo = await createConfigRepo('test-adg-app7', { nodeId: 'test-node' });
     await repo.createAppDataGroup('dup-group', [
