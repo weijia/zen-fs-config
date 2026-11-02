@@ -566,6 +566,46 @@ registerBackend('Gitee', async (options) => {
   identityFields: ['owner', 'repo', 'branch', 'baseUrl'],
 });
 
+/**
+ * RemoteStorage 的 href 既可能是完整存储 URL（https://storage.5apps.com/user），
+ * 也可能是 user@domain 形式的用户地址。后者必须先走 WebFinger 发现真实端点，
+ * 否则会被当作相对路径拼到页面源（例如 http://localhost:8000/weijia@5apps.com/...）。
+ */
+async function resolveRemoteStorageHref(href: unknown): Promise<string> {
+  const raw = String(href ?? '').trim();
+  if (!raw) throw new Error('RemoteStorage href is required.');
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw.replace(/\/+$/, '');
+  const match = raw.match(/^(?:acct:)?([^@/]+)@([^@/]+)$/);
+  if (!match) {
+    throw new Error(
+      `RemoteStorage href "${raw}" is neither an absolute URL nor a user address (user@domain).`,
+    );
+  }
+  const user = match[1];
+  const domain = match[2];
+  const webfingerUrl = `https://${domain}/.well-known/webfinger?resource=acct:${encodeURIComponent(user)}@${encodeURIComponent(domain)}`;
+  let response: any;
+  try {
+    response = await (globalThis as any).fetch(webfingerUrl, {
+      headers: { Accept: 'application/jrd+json, application/json' },
+    });
+  } catch (err) {
+    throw new Error(
+      `RemoteStorage WebFinger request failed (${webfingerUrl}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(`RemoteStorage WebFinger lookup failed (HTTP ${response.status}): ${webfingerUrl}`);
+  }
+  const jrd: any = await response.json();
+  const link = (jrd?.links ?? []).find(
+    (item: any) =>
+      item && item.rel === 'http://tools.ietf.org/id/draft-dejong-remotestorage' && item.href,
+  );
+  if (!link) throw new Error(`WebFinger response has no RemoteStorage link: ${webfingerUrl}`);
+  return String(link.href).replace(/\/+$/, '');
+}
+
 registerBackend('RemoteStorage', async (options) => {
   const _rs = await importOptionalBackend('zen-fs-remotestoragejs');
   const RemoteStorageFileSystem =
@@ -583,7 +623,7 @@ registerBackend('RemoteStorage', async (options) => {
   // RemoteStorageFileSystem already implements the BackendInstance interface
   // (getRevision via ETag, shouldSync via persisted ETag snapshot).
   return new RemoteStorageFileSystem({
-    href: options.href,
+    href: await resolveRemoteStorageHref(options.href),
     token: options.token,
     basePath: options.basePath || undefined,
     preciseMtime: true,
@@ -594,7 +634,7 @@ registerBackend('RemoteStorage', async (options) => {
   label: 'RemoteStorage',
   icon: '📡',
   fields: [
-    { key: 'href', label: 'User Address (href)', type: 'text', placeholder: 'user@5apps.com', required: true },
+    { key: 'href', label: 'User Address / Storage URL (href)', type: 'text', placeholder: 'user@5apps.com 或 https://storage.5apps.com/user', required: true },
     { key: 'token', label: 'Bearer Token', type: 'password', placeholder: 'rs-xxxxxxxx', required: true },
     { key: 'basePath', label: 'Base Path', type: 'text', placeholder: '/zen-fs-config/' },
   ],
