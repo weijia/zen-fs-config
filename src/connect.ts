@@ -97,12 +97,28 @@ export async function connect(
       onConflict: options.onConflict,
       syncPollIntervalMs: options.syncPollIntervalMs,
     });
-    const dataGroup = await repo.createAppDataGroup('default', []);
+    // Recover any locally-cached data groups (persisted in the local primary
+    // store) instead of blindly recreating an empty default on every connect.
+    // Only create the default placeholder when no data group exists yet.
+    const appDataGroups: AppDataGroup[] = [];
+    const descriptors = await repo.listAppDataGroups();
+    for (const d of descriptors) {
+      try {
+        appDataGroups.push(await repo.getAppDataGroup(d.id));
+      } catch (err) {
+        log(`connect: failed to load app data group "${d.id}":`, err);
+      }
+    }
+    let dataGroup = appDataGroups[0];
+    if (!dataGroup) {
+      dataGroup = await repo.createAppDataGroup('default', []);
+      appDataGroups.push(dataGroup);
+    }
     return {
       groupType: options.groupType ?? 'config-sync',
       repo,
       dataGroup,
-      appDataGroups: [dataGroup],
+      appDataGroups,
     };
   }
 

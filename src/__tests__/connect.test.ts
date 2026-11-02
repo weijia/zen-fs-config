@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
 import { registerBackend, createBackend, type BackendInstance } from '../backend-registry';
+import { createConfigRepo } from '../config-repo';
 import { connect } from '../connect';
 import type { ConnectResult } from '../types';
 
@@ -194,5 +197,34 @@ describe('connect() — unified entry point', () => {
     });
     expect(dataResult.groupType).toBe('data-sync');
     await dataResult.dataGroup!.dispose();
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 11: no backendInfo recovers persisted data groups instead of
+  // recreating default. dir-struct connects without backendInfo, so the
+  // default group must NOT be reset back to empty on every connect.
+  // -------------------------------------------------------------------------
+  it('connect with no backendInfo recovers persisted data groups instead of recreating default', async () => {
+    const appId = 'test-conn-recover';
+    const dir = path.join(os.tmpdir(), `zfct-recover-${Date.now()}`);
+    // Pre-create a persisted default data group WITH a backend in a separate
+    // repo (persistent Folder primary). If connect() blindly recreated default
+    // with [], the backend below would be lost.
+    const prep = await createConfigRepo(appId, { nodeId: 'prep', folderPath: dir });
+    await prep.createAppDataGroup('default', [
+      { id: 'g1', type: 'InMemory', options: { label: 'keep' } },
+    ]);
+    await prep.dispose();
+
+    // Connect without backendInfo: must RECOVER the persisted default (backend
+    // g1 kept), NOT recreate it as an empty group.
+    const second = await connect(appId, { nodeId: 'n2', folderPath: dir });
+    const ids = (await second.repo!.listAppDataGroups()).map((g) => g.id);
+    expect(ids).toContain('default');
+    const dg = await second.repo!.getAppDataGroup('default');
+    expect(dg.listBackends().map((b) => b.id)).toEqual(['g1']);
+    expect(second.dataGroup).toBeDefined();
+    await second.dataGroup!.dispose();
+    await second.repo!.dispose();
   });
 });
