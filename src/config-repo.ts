@@ -1991,9 +1991,21 @@ class AppDataGroupImpl implements AppDataGroup {
   private _pollIntervalMs?: number;
 
   async init(): Promise<void> {
-    // Create local primary backend (Folder on Node, IndexedDB on browser)
+    // Create local primary backend (Folder on Node, IndexedDB on browser).
+    //
+    // Each data group gets its own IndexedDB store, except the legacy/default
+    // group which keeps using `zen-fs-config-data-{appId}` so existing user
+    // data stays untouched (lazy migration: no copy, no delete, no move).
+    // New groups start empty and get backfilled from their remote backends by
+    // the initial sync below.
     try {
-      const localPrimary = await resolveLocalPrimary(this.appId, 'data');
+      const localPrimary = await resolveLocalPrimary(
+        this.appId,
+        'data',
+        this.groupId === 'default'
+          ? {}
+          : { idbStoreName: `zen-fs-config-data-${this.appId}-${this.groupId}` },
+      );
       this.localFS = await createBackend(localPrimary);
     } catch {
       throw new Error(`Failed to create local primary for data group "${this.groupId}"`);

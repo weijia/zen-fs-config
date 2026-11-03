@@ -11,6 +11,8 @@ import { createConfigRepo } from '../config-repo';
 // ---------------------------------------------------------------------------
 
 let remote: BackendInstance;
+let memA: BackendInstance;
+let memB: BackendInstance;
 
 beforeAll(async () => {
   // config repo 的本地 primary 固定使用 IndexedDB；Node 下用 InMemory 顶替
@@ -34,6 +36,41 @@ beforeAll(async () => {
     defaultOptions: {},
     identityFields: ['label'],
   });
+
+  // 两个独立后端：每次 createBackend 都新建实例，用于验证「本地 ↔ 各后端」
+  const meta = (type: string) => ({
+    type,
+    label: type,
+    icon: '\u{1F9EA}',
+    fields: [],
+    defaultOptions: {},
+    identityFields: ['label'],
+  });
+  registerBackend('MemA', async () => {
+    memA = await createBackend({ type: 'InMemory', options: { label: `memA-${Date.now()}-${Math.random()}` } });
+    return memA;
+  }, meta('MemA'));
+  registerBackend('MemB', async () => {
+    memB = await createBackend({ type: 'InMemory', options: { label: `memB-${Date.now()}-${Math.random()}` } });
+    return memB;
+  }, meta('MemB'));
+
+  // 写入必定失败的后端：读/列目录正常，writeFile 抛错（模拟远端不可写）
+  registerBackend('MemBroken', async () => {
+    const inner = await createBackend({ type: 'InMemory', options: { label: `broken-${Date.now()}` } });
+    return {
+      readFile: inner.readFile.bind(inner),
+      readdir: inner.readdir.bind(inner),
+      stat: inner.stat.bind(inner),
+      exists: inner.exists.bind(inner),
+      mkdir: inner.mkdir.bind(inner),
+      unlink: inner.unlink.bind(inner),
+      rmdir: inner.rmdir.bind(inner),
+      writeFile: async () => {
+        throw new Error('backend offline');
+      },
+    } satisfies BackendInstance;
+  }, meta('MemBroken'));
 });
 
 // 不同后端的 fs 形态不完全一致：可能是 node:fs 风格（顶层 stat），也可能是
@@ -96,6 +133,66 @@ describe('data group sync isolation', () => {
     expect(await exists(group.fs, '/struct/remote-data.txt')).toBe(true);
     // 配置内容不得进入数据组
     expect(await exists(group.fs, '/.meta/config-marker.txt')).toBe(false);
+
+    await repo.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 一个 data-sync 组里的多个后端：本地是唯一 source，每个后端各一条 pair，
+// 后端之间没有直接 pair。语义 = 本地内容镜像到所有后端；某后端失败不影响其它。
+// ---------------------------------------------------------------------------
+describe('multiple backends in one data group', () => {
+  it('mirrors local writes to every backend with one pair per backend', async () => {
+    const repo = await createConfigRepo('multi-backend-app', { nodeId: 'test-node' });
+    const group = await repo.createAppDataGroup('mirror-group', [
+      { id: 'a', type: 'MemA', options: { label: 'a' } },
+      { id: 'b', type: 'MemB', options: { label: 'b' } },
+    ]);
+
+    await group.fs.promises.mkdir('/struct', { recursive: true });
+    await group.fs.promises.writeFile('/struct/shared.txt', 'hello');
+    await group.flush();
+
+    // 两个后端都收到同一份内容
+    expect(await exists(memA, '/struct/shared.txt')).toBe(true);
+    expect(await exists(memB, '/struct/shared.txt')).toBe(true);
+    // 只有两条 pair（本地↔A、本地↔B），不存在 A↔B 的直接 pair
+    expect(group.getSyncStatuses().size).toBe(2);
+
+    await repo.dispose();
+  });
+
+  it('propagates a backend-only file to the other backend via the local tree', async () => {
+    const repo = await createConfigRepo('multi-backend-propagate', { nodeId: 'test-node' });
+    const group = await repo.createAppDataGroup('propagate-group', [
+      { id: 'a', type: 'MemA', options: { label: 'a' } },
+      { id: 'b', type: 'MemB', options: { label: 'b' } },
+    ]);
+
+    // 只写后端 A，本地与 B 都没有
+    await memA.writeFile('/struct/only-a.txt', 'from-a');
+    await group.flush(); // A → 本地
+    expect(await exists(group.fs, '/struct/only-a.txt')).toBe(true);
+
+    await group.flush(); // 本地 → B（下一轮同步）
+    expect(await exists(memB, '/struct/only-a.txt')).toBe(true);
+
+    await repo.dispose();
+  });
+
+  it('keeps syncing other backends when one backend write fails', async () => {
+    const repo = await createConfigRepo('multi-backend-failure', { nodeId: 'test-node' });
+    const group = await repo.createAppDataGroup('failure-group', [
+      { id: 'ok', type: 'MemA', options: { label: 'ok' } },
+      { id: 'bad', type: 'MemBroken', options: { label: 'bad' } },
+    ]);
+
+    await group.fs.promises.mkdir('/struct', { recursive: true });
+    await group.fs.promises.writeFile('/struct/ok.txt', 'ok');
+    await group.flush(); // 不应抛错
+
+    expect(await exists(memA, '/struct/ok.txt')).toBe(true);
 
     await repo.dispose();
   });
