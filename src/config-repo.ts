@@ -56,6 +56,14 @@ const DELETIONS_DIR = `${META_DIR}/.deleted`;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
 
+/**
+ * 配置同步组专用的顶层路径。
+ * 数据同步组与配置同步组可能共用同一个远端账号/根目录，因此数据组的两向同步
+ * 必须跳过这些路径：既不能把配置内容（`.meta/`、`nodes/`、`shared/`）推送到
+ * 数据组远端，也不能从数据组远端把它们拉进数据组。
+ */
+const CONFIG_ONLY_PREFIXES = [META_DIR, NODES_DIR, SHARED_DIR];
+
 /** Fixed ID for the local IndexedDB primary backend. */
 export const LOCAL_IDB_BACKEND_ID = 'local-idb';
 
@@ -2047,6 +2055,7 @@ class AppDataGroupImpl implements AppDataGroup {
             direction: SyncDirection.BiDirectional,
             conflictStrategy: 'source-wins' as any,
             pollIntervalMs: this._pollIntervalMs,
+            filter: { excludePrefixes: CONFIG_ONLY_PREFIXES },
           },
           '/',
         );
@@ -2111,6 +2120,7 @@ class AppDataGroupImpl implements AppDataGroup {
         direction: SyncDirection.BiDirectional,
         conflictStrategy: 'source-wins' as any,
         pollIntervalMs: this._pollIntervalMs,
+        filter: { excludePrefixes: CONFIG_ONLY_PREFIXES },
       },
       '/',
     );
