@@ -1623,7 +1623,21 @@ export class ConfigRepo implements IConfigRepo {
       );
     }
 
-    // Create backend instance
+    // Create backend instance, write descriptor, pair and initial sync.
+    await this.setupReplica(id, type, options, description);
+  }
+
+  /**
+   * Instantiate a config-sync replica, persist its descriptor, create its
+   * sync pair, register lifecycle hooks and run the initial sync/watch.
+   * Shared by addBackend() and replaceBackend().
+   */
+  private async setupReplica(
+    id: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<string> {
     log.log(`[ConfigRepo] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
@@ -1675,6 +1689,7 @@ export class ConfigRepo implements IConfigRepo {
     // caches a merged snapshot without copying, causing syncAll() to skip.
     await this.syncMetaToReplicas();
     this.syncEngine.watch(pair.pairId);
+    return pair.pairId;
   }
 
   async removeBackend(id: string): Promise<void> {
@@ -1744,6 +1759,67 @@ export class ConfigRepo implements IConfigRepo {
     this.schedulePostDeleteSync();
 
     log.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
+  }
+
+  /**
+   * Replace a config-sync backend's parameters in place (same id).
+   *
+   * Probe the new parameters first: if the backend cannot even be created
+   * (e.g. missing token), nothing is touched and the error is rethrown.
+   * Otherwise the old pair is removed, the descriptor rewritten, and a new
+   * pair created against the new target with an initial sync. If that fails,
+   * the old descriptor and pair are restored. The descriptor file is never
+   * tombstoned, so this never delete-then-recreates it.
+   */
+  async replaceBackend(
+    id: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<void> {
+    this.assertNotDisposed();
+    if (id === LOCAL_IDB_BACKEND_ID) {
+      throw new Error('Cannot edit the local IndexedDB primary backend');
+    }
+    const all = await this.readAllBackendDescriptors();
+    const before = all.find((b) => b.id === id);
+    if (!before) {
+      throw new Error(`Backend "${id}" not found`);
+    }
+
+    // Fail before touching the live pair when the new options are invalid.
+    const probe = await createBackend({ type, options });
+    try { await probe.dispose?.(); } catch { /* best effort */ }
+
+    const newKey = backendDedupKey({ id, type, options });
+    const dup = all.find((b) => b.id !== id && backendDedupKey(b) === newKey);
+    if (dup) {
+      throw new Error(
+        `新参数与已有后端「${dup.id}」指向同一远端（类型与参数完全相同），` +
+        `请先删除重复后端「${dup.id}」或改用不同参数`,
+      );
+    }
+
+    // Tear down the old pair (descriptor stays; it is overwritten below).
+    const oldReplica = this.replicaBackends.get(id);
+    if (oldReplica) {
+      this.syncEngine.removePair(oldReplica.pairId);
+      this.replicaBackends.delete(id);
+      try { await oldReplica.instance?.dispose?.(); } catch { /* best effort */ }
+    }
+
+    try {
+      await this.setupReplica(id, type, options, description ?? before.description);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log.warn(`[ConfigRepo] replaceBackend: "${id}" failed, rolling back old options:`, err);
+      try {
+        await this.setupReplica(id, before.type, before.options, before.description);
+      } catch (rollbackErr) {
+        log.error(`[ConfigRepo] replaceBackend: rollback for "${id}" ALSO failed:`, rollbackErr);
+      }
+      throw new Error(`更新后端参数失败：${reason}（已尝试回滚旧参数）`);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -1906,6 +1982,83 @@ export class ConfigRepo implements IConfigRepo {
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, descPath, bytes, author);
     await this.writeVersionSidecar(descPath, version);
+  }
+
+  /**
+   * Replace a data-sync backend's parameters in place (same backend id).
+   *
+   * Changing parameters means switching to a different remote target: the live
+   * group is disposed (old pairs torn down), the descriptor is rewritten, and a
+   * fresh group instance creates pairs + performs the initial sync. Old remote
+   * data is NOT migrated. If the new options cannot be instantiated, nothing is
+   * touched; if re-initialisation fails, the old descriptor is restored.
+   */
+  async replaceAppDataGroupBackend(
+    groupId: string,
+    backendId: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<AppDataGroup> {
+    this.assertNotDisposed();
+    const descriptor = await this.readAppDataGroupDescriptor(groupId);
+    if (!descriptor) {
+      throw new Error(`App data group "${groupId}" not found`);
+    }
+    const index = descriptor.backends.findIndex((b) => b.id === backendId);
+    if (index < 0) {
+      throw new Error(`Backend "${backendId}" not found in data group "${groupId}"`);
+    }
+
+    // Validate the new parameters before disposing the existing pair. The
+    // group's own init also resolves account fields, so do that first.
+    const candidate = { ...descriptor.backends[index], type, options, description: description ?? descriptor.backends[index].description };
+    const mergedOptions = await this.resolveAppDataBackendOptions(candidate);
+    const probe = await createBackend({ type, options: mergedOptions });
+    try { await probe.dispose?.(); } catch { /* best effort */ }
+
+    const oldBackends = descriptor.backends.map((b) => ({ ...b }));
+    const nextBackends = descriptor.backends.map((b, i) =>
+      i === index ? { ...candidate, options: mergedOptions } : b,
+    );
+
+    const live = this.appDataGroups.get(groupId);
+    if (live) {
+      await live.dispose();
+      this.appDataGroups.delete(groupId);
+    }
+    await this.updateAppDataGroupDescriptor(groupId, nextBackends);
+
+    try {
+      const group = new AppDataGroupImpl(
+        groupId,
+        this.appId,
+        nextBackends,
+        this.pollIntervalMs,
+        this,
+      );
+      await group.init();
+      this.appDataGroups.set(groupId, group);
+      return group;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log.warn(`[ConfigRepo] replaceAppDataGroupBackend: "${backendId}" failed, rolling back:`, err);
+      try {
+        await this.updateAppDataGroupDescriptor(groupId, oldBackends);
+        const restored = new AppDataGroupImpl(
+          groupId,
+          this.appId,
+          oldBackends,
+          this.pollIntervalMs,
+          this,
+        );
+        await restored.init();
+        this.appDataGroups.set(groupId, restored);
+      } catch (rollbackErr) {
+        log.error('[ConfigRepo] replaceAppDataGroupBackend: rollback ALSO failed:', rollbackErr);
+      }
+      throw new Error(`更新后端参数失败：${reason}（已尝试回滚旧参数）`);
+    }
   }
 
   async getConfigSyncGroupDescriptor(): Promise<ConfigSyncGroupDescriptor | null> {

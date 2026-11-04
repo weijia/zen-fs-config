@@ -548,6 +548,34 @@ export interface IConfigRepo {
    */
   updateConfigSyncGroupDescriptor(patch: { name: string }): Promise<ConfigSyncGroupDescriptor>;
 
+  /**
+   * Replace a backend's parameters while keeping its id.
+   *
+   * Changing parameters means switching to a different remote target:
+   * the old sync pair is torn down, the new backend is instantiated, paired
+   * and initially synced. Old remote data is NOT migrated. If the new
+   * parameters cannot be instantiated, the old backend/pair is left intact
+   * and the error is rethrown.
+   */
+  replaceBackend(
+    id: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<void>;
+
+  /**
+   * Replace a data-sync backend's parameters (same semantics as
+   * replaceBackend: old pair is rebuilt against the new target).
+   */
+  replaceAppDataGroupBackend(
+    groupId: string,
+    backendId: string,
+    type: string,
+    options: Record<string, unknown>,
+    description?: string,
+  ): Promise<AppDataGroup>;
+
   /** Remove a data-sync group (stops sync, removes descriptor). */
   removeAppDataGroup(id: string): Promise<void>;
 
