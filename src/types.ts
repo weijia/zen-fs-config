@@ -272,7 +272,16 @@ export interface AppDataBackendDescriptor {
 export interface AppDataGroupDescriptor {
   id: string;
   groupType: 'data-sync';
+  /** User-editable display name. `id` is the stable identifier. */
+  name?: string;
   backends: AppDataBackendDescriptor[];
+}
+
+/** Descriptor for the config-sync group itself (display metadata only). */
+export interface ConfigSyncGroupDescriptor {
+  groupType: 'config-sync';
+  /** User-editable display name. The group has no separate id. */
+  name?: string;
 }
 
 /** Per-backend sync state of a data group. */
@@ -523,6 +532,21 @@ export interface IConfigRepo {
 
   /** List all data-sync group descriptors for this app. */
   listAppDataGroups(): Promise<AppDataGroupDescriptor[]>;
+
+  /**
+   * Update a data-sync group's display name (descriptor-only; id, backends,
+   * local and remote data are untouched). Empty/oversized names are rejected.
+   */
+  updateAppDataGroupName(id: string, name: string): Promise<void>;
+
+  /** Read the config-sync group's display descriptor (may be absent). */
+  getConfigSyncGroupDescriptor(): Promise<ConfigSyncGroupDescriptor | null>;
+
+  /**
+   * Update the config-sync group's display name (descriptor-only; backends,
+   * local store and remote data are untouched).
+   */
+  updateConfigSyncGroupDescriptor(patch: { name: string }): Promise<ConfigSyncGroupDescriptor>;
 
   /** Remove a data-sync group (stops sync, removes descriptor). */
   removeAppDataGroup(id: string): Promise<void>;

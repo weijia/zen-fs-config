@@ -25,6 +25,7 @@ import type {
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
+  ConfigSyncGroupDescriptor,
   BackendSyncState,
   CacheOptions,
 } from './types';
@@ -52,10 +53,32 @@ const GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 const BACKENDS_FILE = `${META_DIR}/backends.json`; // Legacy single-file format (pre-0.4.0)
 const BACKENDS_DIR = `${META_DIR}/backends`;       // New: one JSON file per backend
 const APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`; // Per-app data-sync group references
+// Display metadata (name) for the config-sync group itself. Separate file so
+// renaming never touches backend/sync configuration.
+const CONFIG_SYNC_GROUP_FILE = `${META_DIR}/config-sync-group.json`;
+const GROUP_NAME_MAX_LENGTH = 40;
 const CONFLICTS_DIR = `${META_DIR}/.conflicts`;
 const DELETIONS_DIR = `${META_DIR}/.deleted`;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
+
+/**
+ * Validate and normalize a group display name. Ids are never edited, so this
+ * only guards the human-readable label.
+ */
+function normalizeGroupName(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new Error('Group name must be a string');
+  }
+  const name = value.trim();
+  if (!name) {
+    throw new Error('Group name must not be empty');
+  }
+  if (name.length > GROUP_NAME_MAX_LENGTH) {
+    throw new Error(`Group name must be at most ${GROUP_NAME_MAX_LENGTH} characters`);
+  }
+  return name;
+}
 
 /**
  * 配置同步组专用的顶层路径。
@@ -1842,9 +1865,12 @@ export class ConfigRepo implements IConfigRepo {
    */
   async updateAppDataGroupDescriptor(id: string, backends: AppDataBackendDescriptor[]): Promise<void> {
     this.assertNotDisposed();
+    // Preserve the display name: adding/removing backends must not wipe it.
+    const existing = await this.readAppDataGroupDescriptor(id);
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
+      ...(existing?.name ? { name: existing.name } : {}),
       backends,
     };
     const descPath = this.appDataGroupFilePath(id);
@@ -1854,6 +1880,75 @@ export class ConfigRepo implements IConfigRepo {
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, descPath, bytes, author);
     await this.writeVersionSidecar(descPath, version);
+  }
+
+  /**
+   * Change a data-sync group's display name only. `id`, backends, local stores
+   * and remote data are untouched, so existing sync pairs keep working.
+   */
+  async updateAppDataGroupName(id: string, name: string): Promise<void> {
+    this.assertNotDisposed();
+    const normalized = normalizeGroupName(name);
+    const existing = await this.readAppDataGroupDescriptor(id);
+    if (!existing) {
+      throw new Error(`App data group "${id}" not found`);
+    }
+    const descriptor: AppDataGroupDescriptor = {
+      ...existing,
+      id,
+      groupType: 'data-sync',
+      name: normalized,
+    };
+    const descPath = this.appDataGroupFilePath(id);
+    await this.ensureDir(descPath);
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    await this.cachedFS.writeFile(descPath, bytes);
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
+    await this.writeVersionSidecar(descPath, version);
+  }
+
+  async getConfigSyncGroupDescriptor(): Promise<ConfigSyncGroupDescriptor | null> {
+    this.assertNotDisposed();
+    try {
+      const raw = await this.cachedFS.readFile(CONFIG_SYNC_GROUP_FILE);
+      const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+      if (parsed && parsed.groupType === 'config-sync') {
+        return parsed as ConfigSyncGroupDescriptor;
+      }
+    } catch { /* absent — treated as default */ }
+    return null;
+  }
+
+  /**
+   * Change the config-sync group's display name only. Backends, the local
+   * store and remote data are untouched.
+   */
+  async updateConfigSyncGroupDescriptor(patch: { name: string }): Promise<ConfigSyncGroupDescriptor> {
+    this.assertNotDisposed();
+    const normalized = normalizeGroupName(patch?.name);
+    const descriptor: ConfigSyncGroupDescriptor = {
+      groupType: 'config-sync',
+      name: normalized,
+    };
+    await this.ensureDir(CONFIG_SYNC_GROUP_FILE);
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    await this.cachedFS.writeFile(CONFIG_SYNC_GROUP_FILE, bytes);
+    const author = `${this.appId}/${this.nodeId}`;
+    const version = await incrementVersion(this.fullFS, CONFIG_SYNC_GROUP_FILE, bytes, author);
+    await this.writeVersionSidecar(CONFIG_SYNC_GROUP_FILE, version);
+    return descriptor;
+  }
+
+  private async readAppDataGroupDescriptor(id: string): Promise<AppDataGroupDescriptor | null> {
+    try {
+      const raw = await this.cachedFS.readFile(this.appDataGroupFilePath(id));
+      const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+      if (parsed && parsed.id === id && parsed.groupType === 'data-sync') {
+        return parsed as AppDataGroupDescriptor;
+      }
+    } catch { /* absent */ }
+    return null;
   }
 
   async getAppDataGroup(id: string): Promise<AppDataGroup> {

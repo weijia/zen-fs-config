@@ -202,3 +202,88 @@ describe('AppDataGroup within ConfigRepo', () => {
     await repo.dispose();
   });
 });
+
+describe('group display name editing', () => {
+  it('renames a data group, keeps its id and does not disturb sync pairs', async () => {
+    const repo = await createConfigRepo('test-adg-rename1', { nodeId: 'test-node' });
+    const group = await repo.createAppDataGroup('data-group-r1', [
+      { id: 'b-r1', type: 'InMemory', options: { label: 'rename-b1' } },
+    ]);
+    expect(group.getSyncStatuses().size).toBe(1);
+
+    await repo.updateAppDataGroupName('data-group-r1', '  云端文件  ');
+
+    const list = await repo.listAppDataGroups();
+    expect(list).toHaveLength(1);
+    expect(list[0].id).toBe('data-group-r1');
+    expect(list[0].name).toBe('云端文件');
+    expect(list[0].backends).toHaveLength(1);
+    // The live group (and its pair) is untouched.
+    expect(group.getSyncStatuses().size).toBe(1);
+    await repo.dispose();
+  });
+
+  it('keeps the name when the descriptor is rewritten for backend changes', async () => {
+    const repo = await createConfigRepo('test-adg-rename2', { nodeId: 'test-node' });
+    await repo.createAppDataGroup('data-group-r2', [
+      { id: 'b-r2', type: 'InMemory', options: { label: 'rename-b2' } },
+    ]);
+    await repo.updateAppDataGroupName('data-group-r2', '重命名组');
+
+    // Simulates addBackend/removeBackend rewriting the descriptor.
+    const before = (await repo.listAppDataGroups())[0];
+    await (repo as any).updateAppDataGroupDescriptor('data-group-r2', before.backends);
+    const after = (await repo.listAppDataGroups())[0];
+    expect(after.name).toBe('重命名组');
+    expect(after.id).toBe('data-group-r2');
+    expect(after.backends).toHaveLength(1);
+    await repo.dispose();
+  });
+
+  it('rejects empty and overlong names without touching the descriptor', async () => {
+    const repo = await createConfigRepo('test-adg-rename3', { nodeId: 'test-node' });
+    await repo.createAppDataGroup('data-group-r3', [
+      { id: 'b-r3', type: 'InMemory', options: { label: 'rename-b3' } },
+    ]);
+
+    await expect(repo.updateAppDataGroupName('data-group-r3', '   ')).rejects.toThrow('must not be empty');
+    await expect(repo.updateAppDataGroupName('data-group-r3', 'x'.repeat(41))).rejects.toThrow('at most 40');
+    await expect(repo.updateAppDataGroupName('missing-group', 'ok')).rejects.toThrow('not found');
+
+    const list = await repo.listAppDataGroups();
+    expect(list[0].name).toBeUndefined();
+    expect(list[0].backends).toHaveLength(1);
+    await repo.dispose();
+  });
+
+  it('persists the renamed value for subsequent reads (refresh)', async () => {
+    const repo = await createConfigRepo('test-adg-rename4', { nodeId: 'test-node' });
+    await repo.createAppDataGroup('data-group-r4', [
+      { id: 'b-r4', type: 'InMemory', options: { label: 'rename-b4' } },
+    ]);
+    await repo.updateAppDataGroupName('data-group-r4', '第一次改名');
+
+    // Every refresh re-reads the descriptor from disk.
+    expect((await repo.listAppDataGroups())[0].name).toBe('第一次改名');
+    await repo.updateAppDataGroupName('data-group-r4', '第二次改名');
+    const refreshed = await repo.listAppDataGroups();
+    expect(refreshed[0].name).toBe('第二次改名');
+    expect(refreshed[0].id).toBe('data-group-r4');
+    await repo.dispose();
+  });
+
+  it('cfg-sync group name round-trips and rejects blank names', async () => {
+    const repo = await createConfigRepo('test-adg-rename5', { nodeId: 'test-node' });
+    expect(await repo.getConfigSyncGroupDescriptor()).toBeNull();
+
+    const saved = await repo.updateConfigSyncGroupDescriptor({ name: '  我的配置组  ' });
+    expect(saved.groupType).toBe('config-sync');
+    expect(saved.name).toBe('我的配置组');
+
+    const reloaded = await repo.getConfigSyncGroupDescriptor();
+    expect(reloaded?.name).toBe('我的配置组');
+
+    await expect(repo.updateConfigSyncGroupDescriptor({ name: '  ' })).rejects.toThrow('must not be empty');
+    await repo.dispose();
+  });
+});
