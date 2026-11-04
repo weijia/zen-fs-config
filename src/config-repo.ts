@@ -25,6 +25,7 @@ import type {
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
+  BackendSyncState,
   CacheOptions,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
@@ -1967,6 +1968,7 @@ class AppDataGroupImpl implements AppDataGroup {
   private syncEngine: ZenFSSync;
   private localFS: BackendInstance;
   private dataBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string; desc: AppDataBackendDescriptor }> = new Map();
+  private backendStates: Map<string, BackendSyncState> = new Map();
   private disposed = false;
 
   constructor(
@@ -2072,9 +2074,18 @@ class AppDataGroupImpl implements AppDataGroup {
           '/',
         );
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
+        this.backendStates.set(desc.id, { backendId: desc.id, pairId: pair.pairId });
         // NOTE: Don't watch yet — sync first, then watch (same pattern as ConfigRepo)
         log.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err: any) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Keep the descriptor (it is still in _backends), but record that no
+        // pair exists for it so callers can surface it instead of silently
+        // showing fewer pairs than backends.
+        this.backendStates.set(desc.id, {
+          backendId: desc.id,
+          error: { message, timestamp: Date.now() },
+        });
         log.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
       }
     }
@@ -2109,6 +2120,10 @@ class AppDataGroupImpl implements AppDataGroup {
     return Array.from(results.values());
   }
 
+  getBackendSyncStates(): Map<string, BackendSyncState> {
+    return new Map(this.backendStates);
+  }
+
   async addBackend(
     id: string,
     type: string,
@@ -2139,6 +2154,8 @@ class AppDataGroupImpl implements AppDataGroup {
 
     const desc: AppDataBackendDescriptor = { id, type, options, description, createdAt: Date.now() };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
+    this.backendStates.set(id, { backendId: id, pairId: pair.pairId });
+    this._backends = [...this._backends.filter(b => b.id !== id), desc];
     log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 
     // Initial sync FIRST, then watch (same pattern as ConfigRepo.addBackend)
@@ -2150,23 +2167,30 @@ class AppDataGroupImpl implements AppDataGroup {
     this.syncEngine.watch(pair.pairId);
 
     // Write the updated backend list back into config-sync's app-data-groups (FR2.3).
-    await this.parent.updateAppDataGroupDescriptor(this.groupId, this.listBackends());
+    // Use _backends (not listBackends()) so descriptors that failed to connect
+    // stay listed (and can be fixed/removed) instead of being silently dropped.
+    await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends);
   }
 
   async removeBackend(id: string): Promise<void> {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
     const backend = this.dataBackends.get(id);
-    if (!backend) {
+    const desc = this._backends.find(b => b.id === id);
+    if (!backend && !desc) {
       throw new Error(`Backend "${id}" not found in data group "${this.groupId}"`);
     }
 
-    this.syncEngine.removePair(backend.pairId);
-    this.dataBackends.delete(id);
+    if (backend) {
+      this.syncEngine.removePair(backend.pairId);
+      this.dataBackends.delete(id);
+    }
+    this.backendStates.delete(id);
+    this._backends = this._backends.filter(b => b.id !== id);
 
     // Write the updated backend list back into config-sync's app-data-groups (FR2.3).
-    await this.parent.updateAppDataGroupDescriptor(this.groupId, this.listBackends());
+    await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends);
 
-    if (backend.instance?.dispose) {
+    if (backend?.instance?.dispose) {
       await backend.instance.dispose();
     }
 

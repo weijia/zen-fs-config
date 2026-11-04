@@ -55,6 +55,7 @@ export type {
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
+  BackendSyncState,
   ConnectOptions,
   ConnectResult,
 } from './types';

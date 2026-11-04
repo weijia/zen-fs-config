@@ -13,7 +13,7 @@ import {
   type SyncPairStatus,
   type SyncResult,
 } from 'zen-fs-sync';
-import type { AppDataGroup, BackendDescriptor } from './types';
+import type { AppDataGroup, BackendDescriptor, BackendSyncState } from './types';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, type BackendInstance } from './backend-registry';
 import { resolveLocalPrimary } from './folder-backend';
@@ -130,6 +130,14 @@ export class DataSyncGroup implements AppDataGroup {
 
   getSyncStatuses(): Map<string, SyncPairStatus> {
     return this.syncEngine.getStatusAll();
+  }
+
+  getBackendSyncStates(): Map<string, BackendSyncState> {
+    const out = new Map<string, BackendSyncState>();
+    for (const [id, b] of this.dataBackends) {
+      out.set(id, { backendId: id, pairId: b.pairId });
+    }
+    return out;
   }
 
   async flush(): Promise<SyncResult[]> {

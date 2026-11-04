@@ -275,6 +275,18 @@ export interface AppDataGroupDescriptor {
   backends: AppDataBackendDescriptor[];
 }
 
+/** Per-backend sync state of a data group. */
+export interface BackendSyncState {
+  backendId: string;
+  /** Pair id when the backend instance was created and paired successfully. */
+  pairId?: string;
+  /**
+   * Present when this descriptor could not be connected (e.g. a required
+   * option is missing), so no sync pair exists for it.
+   */
+  error?: { message: string; timestamp: number };
+}
+
 /** Handle to a data-sync group, providing direct fs access. */
 export interface AppDataGroup {
   readonly groupId: string;
@@ -283,6 +295,11 @@ export interface AppDataGroup {
   readonly fs: typeof import('node:fs');
   /** Get sync status for this data group's sync pairs. */
   getSyncStatuses(): Map<string, SyncPairStatus>;
+  /**
+   * Per-backend sync state, including descriptors that failed to connect and
+   * therefore have no pair (they do not appear in getSyncStatuses()).
+   */
+  getBackendSyncStates(): Map<string, BackendSyncState>;
   /** Manually flush pending sync. */
   flush(): Promise<SyncResult[]>;
   /** Stop sync and release resources. */
