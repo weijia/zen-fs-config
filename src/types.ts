@@ -274,6 +274,8 @@ export interface AppDataGroupDescriptor {
   groupType: 'data-sync';
   /** User-editable display name. `id` is the stable identifier. */
   name?: string;
+  /** Capability overrides (versions/conflicts are opt-in for data groups). */
+  features?: Partial<SyncGroupFeatures>;
   backends: AppDataBackendDescriptor[];
 }
 
@@ -284,7 +286,7 @@ export interface ConfigSyncGroupDescriptor {
   name?: string;
 }
 
-/** Per-backend sync state of a data group. */
+/** Per-backend sync state of a group. */
 export interface BackendSyncState {
   backendId: string;
   /** Pair id when the backend instance was created and paired successfully. */
@@ -296,49 +298,84 @@ export interface BackendSyncState {
   error?: { message: string; timestamp: number };
 }
 
-/** Handle to a data-sync group, providing direct fs access. */
-export interface AppDataGroup {
+// ---------------------------------------------------------------------------
+// Sync Group (unified config-sync / data-sync model)
+// ---------------------------------------------------------------------------
+
+/** Structural discriminator for a sync group. */
+export type SyncGroupKind = 'config' | 'data';
+
+/** Capability switches, derived from `kind` + the group descriptor. */
+export interface SyncGroupFeatures {
+  tombstones: boolean;
+  versions: boolean;
+  conflicts: boolean;
+  /** Config payload: app config, node config, group descriptors. */
+  configHost: boolean;
+  /** Whether the product layer may read/write the group root directly. */
+  appData: boolean;
+}
+
+/** Content of `.meta/group.json` — the unified group descriptor. */
+export interface GroupDescriptor {
+  schemaVersion: 1;
+  kind: SyncGroupKind;
+  /** Group id (`config` for the config-sync group, the descriptor id otherwise). */
+  id?: string;
+  /** User-editable display name. */
+  name?: string;
+  features?: Partial<SyncGroupFeatures>;
+  updatedAt?: number;
+}
+
+/**
+ * Common handle shared by config-sync and data-sync groups.
+ * The config group is the capability superset (see ConfigSyncGroupHandle).
+ */
+export interface SyncGroupHandle {
   readonly groupId: string;
   readonly appId: string;
-  /** Direct fs for reading/writing data files (chroot to this group's root). */
+  readonly kind: SyncGroupKind;
+  /** Derived, never persisted separately from the descriptor. */
+  readonly features: SyncGroupFeatures;
+  readonly name?: string;
+
+  /** Direct fs view; metadata paths (`.meta`, `.config`) are hidden. */
   readonly fs: typeof import('node:fs');
-  /** Get sync status for this data group's sync pairs. */
+
+  // --- sync lifecycle ---
   getSyncStatuses(): Map<string, SyncPairStatus>;
-  /**
-   * Per-backend sync state, including descriptors that failed to connect and
-   * therefore have no pair (they do not appear in getSyncStatuses()).
-   */
   getBackendSyncStates(): Map<string, BackendSyncState>;
-  /** Manually flush pending sync. */
   flush(): Promise<SyncResult[]>;
-  /** Stop sync and release resources. */
   dispose(): Promise<void>;
 
-  /**
-   * Dynamically add a data backend to this group.
-   * Creates the backend instance, sets up bi-directional sync, and triggers initial sync.
-   * @param id Unique backend ID within this group
-   * @param type Backend type name (must be registered)
-   * @param options Backend options (storage location fields; account fields can be resolved via accountBackendId in the descriptor)
-   * @param description Optional human-readable description
-   */
+  // --- backend management ---
   addBackend(
     id: string,
     type: string,
     options: Record<string, unknown>,
     description?: string,
   ): Promise<void>;
-
-  /**
-   * Dynamically remove a data backend from this group.
-   * Tears down the sync pair and disposes the backend instance.
-   * @param id Backend ID to remove
-   */
   removeBackend(id: string): Promise<void>;
-
-  /** List all backend descriptors in this group. */
   listBackends(): AppDataBackendDescriptor[];
+  /** Update the display name only (descriptor-only). */
+  rename(name: string): Promise<void>;
+
+  // --- deletion & metadata (common to both kinds) ---
+  /** Write a tombstone, delete the file + version record, trigger sync. */
+  deleteFile(path: string): Promise<void>;
+  listConflicts(): Promise<ConflictArchive[]>;
+  resolveConflict(conflictId: string, mergedContent: unknown): Promise<void>;
+  readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string>;
+  purgeMtimeSidecars(options?: { root?: string; dryRun?: boolean }): Promise<MtimePurgeResult>;
+  purgeKeepFiles(options?: { root?: string; dryRun?: boolean }): Promise<KeepPurgeResult>;
 }
+
+/** Handle to a data-sync group, providing direct fs access. */
+export interface AppDataGroup extends SyncGroupHandle {
+  readonly kind: 'data';
+}
+
 
 // ---------------------------------------------------------------------------
 // Connect (unified entry point)
@@ -392,6 +429,10 @@ export interface ConnectResult {
    * model this is always present — it hosts the data groups' topology.
    */
   repo?: IConfigRepo;
+  /** The config-sync group as a unified handle (same object as `repo`). */
+  configGroup?: ConfigSyncGroupHandle;
+  /** All groups for this app: config group first, then data groups. */
+  groups?: SyncGroupHandle[];
   /**
    * Handle to the default (`default`) app data group. Always owned by `repo`;
    * present on first launch and when a data-sync backend was connected.
@@ -411,6 +452,14 @@ export interface IConfigRepo {
   readonly appId: string;
   /** Node ID. */
   readonly nodeId: string;
+  /** Fixed group id of the config-sync group (`config`). */
+  readonly groupId: string;
+  /** Structural discriminator — always `'config'`. */
+  readonly kind: 'config';
+  /** Capability switches (config group is the superset: all true). */
+  readonly features: SyncGroupFeatures;
+  /** User-editable display name (from `.config/config-sync-group.json`). */
+  readonly name?: string;
   /** ZenFS-compatible fs object, context-isolated to this app's directories. */
   readonly fs: typeof import('node:fs');
 
@@ -445,6 +494,16 @@ export interface IConfigRepo {
 
   /** Get sync status for all registered sync pairs. */
   getSyncStatuses(): Map<string, SyncPairStatus>;
+
+  /**
+   * Per-backend sync state, including replica descriptors that failed to
+   * connect and therefore have no pair (they do not appear in
+   * getSyncStatuses()).
+   */
+  getBackendSyncStates(): Map<string, BackendSyncState>;
+
+  /** Update the config-sync group's display name only. */
+  rename(name: string): Promise<void>;
 
   /** Resolve a conflict with custom merged content. */
   resolveConflict(conflictId: string, mergedContent: unknown): Promise<void>;
@@ -525,6 +584,7 @@ export interface IConfigRepo {
   createAppDataGroup(
     id: string,
     backends: AppDataBackendDescriptor[],
+    options?: { name?: string; features?: Partial<SyncGroupFeatures> },
   ): Promise<AppDataGroup>;
 
   /** Get an existing data-sync group handle. */
@@ -587,6 +647,12 @@ export interface IConfigRepo {
    */
   listAccountBackends(): Promise<BackendDescriptor[]>;
 
+  /**
+   * List registered replica backend descriptors (excludes the implicit local
+   * primary). Unified handle method shared with data groups.
+   */
+  listBackends(): AppDataBackendDescriptor[];
+
   // --- Group Type ---
 
   /** Write the group-type marker file if it doesn't exist. */
@@ -597,4 +663,12 @@ export interface IConfigRepo {
 
   /** Dispose: stop all sync, release cache FS and resources. */
   dispose(): Promise<void>;
+}
+
+/**
+ * The config-sync group as a unified handle. It is the capability superset:
+ * `SyncGroupHandle` + config payload / node config / topology management.
+ */
+export interface ConfigSyncGroupHandle extends IConfigRepo, SyncGroupHandle {
+  readonly kind: 'config';
 }

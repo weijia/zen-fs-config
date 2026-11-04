@@ -21,6 +21,23 @@ type AsyncFS = {
   rename?(oldPath: string, newPath: string): Promise<void>;
 };
 
+/** Options for the chroot proxy. */
+export interface ChrootOptions {
+  /**
+   * Absolute paths (relative to the inner FS) that the view must hide and
+   * refuse to write. Used to keep `.meta` / `.config` out of app-facing views
+   * without excluding them from sync (hiding ≠ not syncing).
+   */
+  hiddenPrefixes?: string[];
+  /** Called after a successful writeFile, e.g. to record a version entry. */
+  onWrite?: (path: string, data: any) => Promise<void> | void;
+  /**
+   * When provided, `unlink` delegates entirely to this hook (used for
+   * tombstone-aware deletion). The hook is responsible for removing the file.
+   */
+  onUnlink?: (path: string) => Promise<void>;
+}
+
 /**
  * Resolve a path within the chroot. Prevents escaping.
  */
@@ -44,17 +61,39 @@ function resolveChroot(root: string, userPath: string): string {
   return root === '/' ? `/${joined}` : `${root}/${joined}`;
 }
 
+function makeEnoent(userPath: string): any {
+  const err = new Error(`ENOENT: no such file or directory, '${userPath}'`) as any;
+  err.code = 'ENOENT';
+  return err;
+}
+
 /**
  * Create a chroot-isolated fs-like object.
  *
  * @param inner   The underlying async file system (e.g., CachedFileSystem)
  * @param root    The chroot root path (e.g., '/app-a/')
+ * @param options Hiding / write hooks (see ChrootOptions)
  */
-export function createChrootFS(inner: AsyncFS, root: string) {
+export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOptions = {}) {
   const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+  const hiddenPrefixes = (options.hiddenPrefixes ?? []).map((p) =>
+    p.startsWith('/') ? p.replace(/\/+$/, '') : `/${p}`.replace(/\/+$/, ''),
+  );
 
   function rp(path: string): string {
     return resolveChroot(normalizedRoot, path);
+  }
+
+  function isHidden(absolutePath: string): boolean {
+    return hiddenPrefixes.some(
+      (prefix) => absolutePath === prefix || absolutePath.startsWith(`${prefix}/`),
+    );
+  }
+
+  function visible(path: string): string {
+    const absolute = rp(path);
+    if (isHidden(absolute)) throw makeEnoent(path);
+    return absolute;
   }
 
   // -----------------------------------------------------------------------
@@ -63,20 +102,28 @@ export function createChrootFS(inner: AsyncFS, root: string) {
 
   const promises = {
     async readFile(path: string, encoding?: string): Promise<any> {
-      return inner.readFile(rp(path), encoding);
+      return inner.readFile(visible(path), encoding);
     },
 
-    async writeFile(path: string, data: string | Uint8Array, options?: any): Promise<void> {
-      await ensureParentDir(rp(path));
-      return inner.writeFile(rp(path), data, options);
+    async writeFile(path: string, data: string | Uint8Array, writeOptions?: any): Promise<void> {
+      const target = visible(path);
+      await ensureParentDir(target);
+      await inner.writeFile(target, data, writeOptions);
+      if (options.onWrite) await options.onWrite(path, data);
     },
 
     async readdir(path: string): Promise<string[]> {
-      return inner.readdir(rp(path));
+      const entries = await inner.readdir(visible(path));
+      if (hiddenPrefixes.length === 0) return entries;
+      const dirPath = rp(path);
+      return entries.filter((entry) => {
+        const child = dirPath === '/' ? `/${entry}` : `${dirPath}/${entry}`;
+        return !isHidden(child);
+      });
     },
 
     async stat(path: string): Promise<any> {
-      const s = await inner.stat(rp(path));
+      const s = await inner.stat(visible(path));
       // Pass through mode/size/mtimeMs directly — consumers use mode to detect type
       return {
         mode: typeof s.mode === 'number' ? s.mode : undefined,
@@ -86,31 +133,30 @@ export function createChrootFS(inner: AsyncFS, root: string) {
     },
 
     async access(path: string): Promise<void> {
-      const exists = await inner.exists(rp(path));
-      if (!exists) {
-        const err = new Error(`ENOENT: no such file or directory, access '${path}'`) as any;
-        err.code = 'ENOENT';
-        throw err;
-      }
+      const exists = await inner.exists(visible(path));
+      if (!exists) throw makeEnoent(path);
     },
 
-    async mkdir(path: string, options?: any): Promise<void> {
-      return inner.mkdir(rp(path), options);
+    async mkdir(path: string, mkdirOptions?: any): Promise<void> {
+      return inner.mkdir(visible(path), mkdirOptions);
     },
 
     async unlink(path: string): Promise<void> {
-      return inner.unlink(rp(path));
+      const target = visible(path);
+      if (options.onUnlink) return options.onUnlink(target);
+      return inner.unlink(target);
     },
 
     async rmdir(path: string): Promise<void> {
-      return inner.rmdir?.(rp(path));
+      return inner.rmdir?.(visible(path));
     },
 
     async rename(oldPath: string, newPath: string): Promise<void> {
-      return inner.rename?.(rp(oldPath), rp(newPath));
+      return inner.rename?.(visible(oldPath), visible(newPath));
     },
 
     async exists(path: string): Promise<boolean> {
+      if (isHidden(rp(path))) return false;
       return inner.exists(rp(path));
     },
   };
@@ -128,22 +174,21 @@ export function createChrootFS(inner: AsyncFS, root: string) {
       );
     },
 
-    writeFileSync(path: string, data: string | Uint8Array, options?: any): void {
+    writeFileSync(path: string, data: string | Uint8Array, writeOptions?: any): void {
       // Sync write fires and forgets — acceptable for cached writes
-      promises.writeFile(path, data, options).catch(() => {});
+      promises.writeFile(path, data, writeOptions).catch(() => {});
     },
 
     existsSync(path: string): boolean {
       // Sync exists is best-effort via a synchronous check
-      // This will not work in most async backends, but is provided as a convenience
       throw new Error(
         'zen-fs-config: existsSync is not supported. ' +
-        'Use repo.fs.promises.exists() instead.',
+        'Use repo.fs.promises.exists() or repo.getConfig() instead.',
       );
     },
 
-    mkdirSync(path: string, options?: any): void {
-      promises.mkdir(path, options).catch(() => {});
+    mkdirSync(path: string, mkdirOptions?: any): void {
+      promises.mkdir(path, mkdirOptions).catch(() => {});
     },
 
     readdirSync(path: string): string[] {

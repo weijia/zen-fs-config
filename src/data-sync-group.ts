@@ -13,16 +13,32 @@ import {
   type SyncPairStatus,
   type SyncResult,
 } from 'zen-fs-sync';
-import type { AppDataGroup, BackendDescriptor, BackendSyncState } from './types';
+import type {
+  AppDataGroup,
+  BackendDescriptor,
+  BackendSyncState,
+  ConflictArchive,
+  SyncGroupFeatures,
+  TombstoneMeta,
+} from './types';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, type BackendInstance } from './backend-registry';
 import { resolveLocalPrimary } from './folder-backend';
 import { createChrootFS } from './context-fs';
 import { createLogger } from './logger';
+import {
+  CONFIG_DIR,
+  DATA_GROUP_DEFAULT_FEATURES,
+  META_DIR,
+  TombstoneStore,
+  VersionStore,
+  ConflictStore,
+} from './group-meta';
+import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
+import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
 
 const log = createLogger('data-sync-group');
 
-const META_DIR = '/.meta';
 const GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 const BACKENDS_DIR = `${META_DIR}/backends`;
 
@@ -40,12 +56,20 @@ const BACKENDS_DIR = `${META_DIR}/backends`;
 export class DataSyncGroup implements AppDataGroup {
   readonly groupId: string;
   readonly appId: string;
+  readonly kind = 'data' as const;
+  readonly features: SyncGroupFeatures = DATA_GROUP_DEFAULT_FEATURES;
+  name?: string;
   fs: any;
 
   private syncEngine: ZenFSSync;
   private localFS: BackendInstance;
   private dataBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string; desc: BackendDescriptor }> = new Map();
   private disposed = false;
+
+  /** `.meta/` stores (deprecated standalone path keeps the same layout). */
+  private tombstones: TombstoneStore;
+  private versions: VersionStore;
+  private conflicts: ConflictStore;
 
   constructor(
     appId: string,
@@ -57,6 +81,65 @@ export class DataSyncGroup implements AppDataGroup {
     this.syncEngine = new ZenFSSync();
     this.localFS = localFS;
     this.fs = createChrootFS(localFS, '/');
+    this.tombstones = new TombstoneStore(localFS, `local:${groupId}`);
+    this.versions = new VersionStore(localFS, `${appId}/${groupId}`);
+    this.conflicts = new ConflictStore(localFS, appId, groupId, this.versions);
+  }
+
+  // -----------------------------------------------------------------------
+  // Unified SyncGroupHandle — common capabilities
+  // -----------------------------------------------------------------------
+
+  async rename(name: string): Promise<void> {
+    this.name = name.trim();
+  }
+
+  /**
+   * Delete with a tombstone. Standalone groups have no sync hooks, so the
+   * tombstoned path is also removed directly on every connected backend.
+   */
+  async deleteFile(path: string): Promise<void> {
+    if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    const normalized = path.startsWith('/') ? path : `/${path}`;
+    if (normalized.startsWith(`${META_DIR}/`) || normalized.startsWith(`${CONFIG_DIR}/`)) {
+      throw new Error(`Cannot delete metadata path "${normalized}"`);
+    }
+
+    const tombstone: TombstoneMeta = {
+      path: normalized,
+      deletedAt: Date.now(),
+      deletedBy: `local:${this.groupId}`,
+      confirmedBy: [`local:${this.groupId}`],
+    };
+    await this.tombstones.write(tombstone);
+
+    for (const target of [this.localFS, ...Array.from(this.dataBackends.values()).map(b => b.instance)]) {
+      try { await target.unlink(normalized); } catch { /* already gone */ }
+    }
+    await this.versions.remove(normalized);
+  }
+
+  listConflicts(): Promise<ConflictArchive[]> {
+    return this.conflicts.list();
+  }
+
+  async resolveConflict(conflictId: string, mergedContent: unknown): Promise<void> {
+    const content = typeof mergedContent === 'string'
+      ? mergedContent
+      : JSON.stringify(mergedContent, null, 2);
+    await this.conflicts.resolve(conflictId, content);
+  }
+
+  readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string> {
+    return this.conflicts.readBackup(conflictId, fileType);
+  }
+
+  purgeMtimeSidecars(options: { root?: string; dryRun?: boolean } = {}): Promise<MtimePurgeResult> {
+    return purgeMtimeSidecars(this.localFS, options as PurgeMtimeOptions);
+  }
+
+  purgeKeepFiles(options: { root?: string; dryRun?: boolean } = {}): Promise<KeepPurgeResult> {
+    return purgeKeepFiles(this.localFS, options as PurgeKeepOptions);
   }
 
   /**

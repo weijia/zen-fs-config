@@ -11,6 +11,8 @@ import type {
   ConnectResult,
   SyncGroupType,
   AppDataGroup,
+  ConfigSyncGroupHandle,
+  SyncGroupHandle,
 } from './types';
 import { createConfigRepo } from './config-repo';
 import { createBackend } from './backend-registry';
@@ -18,11 +20,12 @@ import { createLogger } from './logger';
 
 const log = createLogger('connect');
 
-const META_DIR = '/.meta';
-const GROUP_TYPE_FILE = `${META_DIR}/group-type`;
+const GROUP_TYPE_FILE = '/.config/group-type';
+const LEGACY_GROUP_TYPE_FILE = '/.meta/group-type';
 
 /**
- * Detect the group type of a remote backend by reading /.meta/group-type.
+ * Detect the group type of a remote backend by reading `.config/group-type`
+ * (new layout), falling back to the legacy `.meta/group-type`.
  *
  * @returns The detected SyncGroupType, or null if the file doesn't exist.
  */
@@ -36,15 +39,20 @@ async function detectGroupType(
   const tempBackend = await createBackend({ type, options });
 
   try {
-    const raw = await tempBackend.readFile(GROUP_TYPE_FILE, 'utf-8');
-    const groupType = (raw as string).trim() as SyncGroupType;
-    if (groupType === 'config-sync' || groupType === 'data-sync') {
-      log(`detectGroupType: detected "${groupType}"`);
-      return groupType;
+    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
+      try {
+        const raw = await tempBackend.readFile(path, 'utf-8');
+        const groupType = (raw as string).trim() as SyncGroupType;
+        if (groupType === 'config-sync' || groupType === 'data-sync') {
+          log(`detectGroupType: detected "${groupType}" at ${path}`);
+          return groupType;
+        }
+        log(`detectGroupType: unknown group-type value "${groupType}" at ${path}, treating as null`);
+        return null;
+      } catch {
+        // Try the next layout.
+      }
     }
-    log(`detectGroupType: unknown group-type value "${groupType}", treating as null`);
-    return null;
-  } catch {
     log(`detectGroupType: no group-type file found (new backend)`);
     return null;
   } finally {
@@ -117,6 +125,8 @@ export async function connect(
     return {
       groupType: options.groupType ?? 'config-sync',
       repo,
+      configGroup: repo as ConfigSyncGroupHandle,
+      groups: [repo as unknown as SyncGroupHandle, ...appDataGroups],
       dataGroup,
       appDataGroups,
     };
@@ -197,5 +207,12 @@ export async function connect(
     }
   }
 
-  return { groupType, repo, dataGroup, appDataGroups };
+  return {
+    groupType,
+    repo,
+    configGroup: repo as ConfigSyncGroupHandle,
+    groups: [repo as unknown as SyncGroupHandle, ...appDataGroups],
+    dataGroup,
+    appDataGroups,
+  };
 }

@@ -40,7 +40,27 @@ import { versionPathFor, incrementVersion, writeVersion, readVersion } from './v
 import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
 import { migrateVersionSidecars, type VersionMigrationResult } from './version-migration';
-import type { VersionMeta } from './types';
+import {
+  META_DIR,
+  CONFIG_DIR,
+  CONFLICTS_DIR,
+  LEGACY_CONFLICTS_DIR,
+  TOMBSTONES_DIR,
+  LEGACY_TOMBSTONES_DIR,
+  encodeMetaPath,
+  ensureParentDir,
+  readGroupDescriptor,
+  writeGroupDescriptor,
+  DATA_GROUP_DEFAULT_FEATURES,
+  TombstoneStore,
+  VersionStore,
+  ConflictStore,
+} from './group-meta';
+import type {
+  VersionMeta,
+  SyncGroupFeatures,
+  SyncGroupHandle,
+} from './types';
 
 const log = createLogger('zen-fs-config:config-repo');
 
@@ -48,19 +68,34 @@ const log = createLogger('zen-fs-config:config-repo');
 // Constants
 // ---------------------------------------------------------------------------
 
-const META_DIR = '/.meta';
-const GROUP_TYPE_FILE = `${META_DIR}/group-type`;
+const GROUP_DESCRIPTOR_FILE = `${META_DIR}/group.json`;
+// Config-sync group metadata lives in `.config/` (never synced by data groups).
+const GROUP_TYPE_FILE = `${CONFIG_DIR}/group-type`;
+const LEGACY_GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 const BACKENDS_FILE = `${META_DIR}/backends.json`; // Legacy single-file format (pre-0.4.0)
-const BACKENDS_DIR = `${META_DIR}/backends`;       // New: one JSON file per backend
-const APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`; // Per-app data-sync group references
+const BACKENDS_DIR = `${CONFIG_DIR}/backends`;
+const LEGACY_BACKENDS_DIR = `${META_DIR}/backends`;
+const APP_DATA_GROUPS_DIR = `${CONFIG_DIR}/app-data-groups`;
+const LEGACY_APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`;
 // Display metadata (name) for the config-sync group itself. Separate file so
 // renaming never touches backend/sync configuration.
-const CONFIG_SYNC_GROUP_FILE = `${META_DIR}/config-sync-group.json`;
+const CONFIG_SYNC_GROUP_FILE = `${CONFIG_DIR}/config-sync-group.json`;
+const LEGACY_CONFIG_SYNC_GROUP_FILE = `${META_DIR}/config-sync-group.json`;
 const GROUP_NAME_MAX_LENGTH = 40;
-const CONFLICTS_DIR = `${META_DIR}/.conflicts`;
-const DELETIONS_DIR = `${META_DIR}/.deleted`;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
+
+/** Fixed group id of the config-sync group. */
+export const CONFIG_GROUP_ID = 'config';
+
+/** All capabilities are on for the config-sync group. */
+const CONFIG_GROUP_FEATURES: SyncGroupFeatures = {
+  tombstones: true,
+  versions: true,
+  conflicts: true,
+  configHost: true,
+  appData: false,
+};
 
 /**
  * Validate and normalize a group display name. Ids are never edited, so this
@@ -83,20 +118,26 @@ function normalizeGroupName(value: unknown): string {
 /**
  * 配置同步组专用的顶层路径。
  * 数据同步组与配置同步组可能共用同一个远端账号/根目录，因此数据组的两向同步
- * 必须跳过这些路径：既不能把配置内容（`.meta/`、`nodes/`、`shared/`）推送到
+ * 必须跳过这些路径：既不能把配置内容（`.config/`、`.meta/backends` 等）推送到
  * 数据组远端，也不能从数据组远端把它们拉进数据组。
+ *
+ * 注意：`.meta/` 不再整体排除。`.meta/tombstones`、`.meta/versions`、
+ * `.meta/conflicts` 属于通用同步元数据，必须允许跨设备同步，否则删除会在
+ * 其他设备复活。数据组视图通过 `hiddenPrefixes` 隐藏这些目录（隐藏 ≠ 不同步）。
  */
-const CONFIG_ONLY_PREFIXES = [META_DIR, NODES_DIR, SHARED_DIR];
+const CONFIG_ONLY_PREFIXES = [CONFIG_DIR, NODES_DIR, SHARED_DIR];
 
 /** Fixed ID for the local IndexedDB primary backend. */
 export const LOCAL_IDB_BACKEND_ID = 'local-idb';
 
 /** Encode a file path into a tombstone filename (no slashes, no dots issue). */
 function tombstoneFileName(filePath: string): string {
-  return filePath
-    .replace(/^\//, '')
-    .replace(/\//g, '__')
-    .replace(/\./g, '++') + '.json';
+  return `${encodeMetaPath(filePath)}.json`;
+}
+
+/** Tombstone path in the new (canonical) or legacy layout. */
+function tombstonePathFor(filePath: string, dir = TOMBSTONES_DIR): string {
+  return `${dir}/${tombstoneFileName(filePath)}`;
 }
 
 /** Decode a tombstone filename back to the original file path. */
@@ -226,6 +267,13 @@ interface MinimalAsyncFS extends BackendInstance {}
 export class ConfigRepo implements IConfigRepo {
   readonly appId: string;
   readonly nodeId: string;
+  /** Fixed id for the unified sync-group model. */
+  readonly groupId = CONFIG_GROUP_ID;
+  readonly kind = 'config' as const;
+  /** Capability switches — the config group is the superset. */
+  readonly features: SyncGroupFeatures = CONFIG_GROUP_FEATURES;
+  /** Display name, hydrated from `.config/config-sync-group.json`. */
+  name?: string;
   /** Chroot-isolated fs for app-facing API. Typed as `any` to match `typeof import('node:fs')` duck-typically. */
   readonly fs: any;
   /** Un-chrooted fs for low-level browsing. */
@@ -245,6 +293,10 @@ export class ConfigRepo implements IConfigRepo {
   private readonly pollIntervalMs?: number;
   /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
   private tombstoneCache: TombstoneMeta[] | null = null;
+  /** Per-backend sync state (successful pairs + connect failures). */
+  private backendStates = new Map<string, BackendSyncState>();
+  /** Last known backend descriptors, for the synchronous unified handle API. */
+  private backendDescriptorCache: AppDataBackendDescriptor[] = [];
   /**
    * Tracks the background initial sync started by createConfigRepo().
    * `flush()` and `dispose()` will await this if it hasn't completed yet,
@@ -489,19 +541,19 @@ export class ConfigRepo implements IConfigRepo {
     this.assertNotDisposed();
     const normalizedPath = path.startsWith('/') ? path : '/' + path;
 
-    // 1. Write tombstone
-    const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(normalizedPath)}`;
+    // 1. Write tombstone (new `.meta/tombstones` + legacy mirror for one cycle)
     const tombstone: TombstoneMeta = {
       path: normalizedPath,
       deletedAt: Date.now(),
       deletedBy: this.primaryBackendId,
       confirmedBy: [this.primaryBackendId],
     };
-    await this.ensureDir(tombstonePath);
-    await this.cachedFS.writeFile(
-      tombstonePath,
-      new TextEncoder().encode(JSON.stringify(tombstone, null, 2)),
-    );
+    const tombstoneBytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+      const tombstonePath = tombstonePathFor(normalizedPath, dir);
+      await this.ensureDir(tombstonePath);
+      await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
+    }
 
     // 2. Delete the actual file on primary
     try {
@@ -518,7 +570,7 @@ export class ConfigRepo implements IConfigRepo {
       } catch { /* no version file */ }
     }
 
-    log.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePath})`);
+    log.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePathFor(normalizedPath)})`);
     // Invalidate cache — a new tombstone was written
     this.invalidateTombstoneCache();
 
@@ -561,23 +613,32 @@ export class ConfigRepo implements IConfigRepo {
     if (this.tombstoneCache !== null) {
       return this.tombstoneCache;
     }
-    try {
-      const entries = await this.cachedFS.readdir(DELETIONS_DIR);
-      const tombstones: TombstoneMeta[] = [];
+    const byPath = new Map<string, TombstoneMeta>();
+    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+      let entries: string[];
+      try {
+        entries = await this.cachedFS.readdir(dir);
+      } catch {
+        continue; // directory doesn't exist in this layout
+      }
       for (const entry of entries) {
         if (!entry.endsWith('.json')) continue;
         try {
-          const raw = await this.cachedFS.readFile(`${DELETIONS_DIR}/${entry}`);
-          const data = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-          tombstones.push(data as TombstoneMeta);
+          const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
+          const data = JSON.parse(new TextDecoder().decode(toUint8Array(raw))) as TombstoneMeta;
+          const prev = byPath.get(data.path);
+          if (prev) {
+            for (const id of data.confirmedBy ?? []) {
+              if (!prev.confirmedBy.includes(id)) prev.confirmedBy.push(id);
+            }
+          } else {
+            byPath.set(data.path, data);
+          }
         } catch { /* skip corrupt tombstone */ }
       }
-      this.tombstoneCache = tombstones;
-      return tombstones;
-    } catch {
-      this.tombstoneCache = [];
-      return []; // DELETIONS_DIR doesn't exist yet
     }
+    this.tombstoneCache = Array.from(byPath.values());
+    return this.tombstoneCache;
   }
 
   /** Invalidate the tombstone cache — call after tombstones are modified. */
@@ -845,7 +906,6 @@ export class ConfigRepo implements IConfigRepo {
 
     let modified = 0;
     for (const tombstone of tombstones) {
-      const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
       // Add all replica IDs that we just synced with
       let changed = false;
       for (const replicaId of this.replicaBackends.keys()) {
@@ -860,10 +920,13 @@ export class ConfigRepo implements IConfigRepo {
       // until the tombstone is eventually GC'd.
       if (changed) {
         try {
-          await this.cachedFS.writeFile(
-            tombstonePath,
-            new TextEncoder().encode(JSON.stringify(tombstone, null, 2)),
-          );
+          const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+          for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+            const tombstonePath = tombstonePathFor(tombstone.path, dir);
+            if (await this.safeExists(this.cachedFS, tombstonePath)) {
+              await this.cachedFS.writeFile(tombstonePath, bytes);
+            }
+          }
           modified++;
         } catch { /* ignore write error */ }
       }
@@ -897,24 +960,26 @@ export class ConfigRepo implements IConfigRepo {
     for (const tombstone of tombstones) {
       const allConfirmed = allBackendIds.every(id => tombstone.confirmedBy.includes(id));
       if (allConfirmed) {
-        const tombstonePath = `${DELETIONS_DIR}/${tombstoneFileName(tombstone.path)}`;
+        for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+          const tombstonePath = tombstonePathFor(tombstone.path, dir);
 
-        // Delete tombstone on local primary
-        try {
-          await this.cachedFS.unlink(tombstonePath);
-        } catch { /* already gone */ }
+          // Delete tombstone on local primary
+          try {
+            await this.cachedFS.unlink(tombstonePath);
+          } catch { /* already gone */ }
 
-        // Delete tombstone on all replicas — prevents the sync engine
-        // from re-copying them back on the next cycle.
-        for (const [replicaId, replica] of this.replicaBackends) {
-          if (await this.safeExists(replica.instance, tombstonePath)) {
-            try {
-              await replica.instance.unlink(tombstonePath);
-            } catch { /* race */ }
+          // Delete tombstone on all replicas — prevents the sync engine
+          // from re-copying them back on the next cycle.
+          for (const [, replica] of this.replicaBackends) {
+            if (await this.safeExists(replica.instance, tombstonePath)) {
+              try {
+                await replica.instance.unlink(tombstonePath);
+              } catch { /* race */ }
+            }
           }
-        }
 
-        log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
+          log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
+        }
       }
     }
   }
@@ -948,6 +1013,28 @@ export class ConfigRepo implements IConfigRepo {
     return this.syncEngine.getStatusAll();
   }
 
+  /**
+   * Per-backend sync state. Includes replica descriptors that failed to connect
+   * (they have no sync pair, so they never show up in getSyncStatuses()).
+   */
+  getBackendSyncStates(): Map<string, BackendSyncState> {
+    this.assertNotDisposed();
+    return new Map(this.backendStates);
+  }
+
+  /** Registered replica backend descriptors (excludes the implicit local primary). */
+  listBackends(): AppDataBackendDescriptor[] {
+    this.assertNotDisposed();
+    return [...this.backendDescriptorCache];
+  }
+
+  /** Update the config-sync group's display name only. */
+  async rename(name: string): Promise<void> {
+    this.assertNotDisposed();
+    const descriptor = await this.updateConfigSyncGroupDescriptor({ name });
+    this.name = descriptor.name;
+  }
+
   // -----------------------------------------------------------------------
   // IConfigRepo — Conflict Management
   // -----------------------------------------------------------------------
@@ -955,13 +1042,23 @@ export class ConfigRepo implements IConfigRepo {
   async resolveConflict(conflictId: string, mergedContent: unknown): Promise<void> {
     this.assertNotDisposed();
 
-    const metaPath = `${CONFLICTS_DIR}/${conflictId}`;
-    try {
-      const raw = await this.cachedFS.readFile(metaPath);
-      const archive: ConflictArchive = JSON.parse(
-        new TextDecoder().decode(toUint8Array(raw)),
-      );
+    // New layout first, legacy `.meta/.conflicts` as a one-cycle fallback.
+    let metaPath: string | null = null;
+    let archive: ConflictArchive | null = null;
+    for (const dir of [CONFLICTS_DIR, LEGACY_CONFLICTS_DIR]) {
+      const candidate = `${dir}/${conflictId}`;
+      try {
+        const raw = await this.cachedFS.readFile(candidate);
+        archive = JSON.parse(new TextDecoder().decode(toUint8Array(raw)) as string) as ConflictArchive;
+        metaPath = candidate;
+        break;
+      } catch { /* try next layout */ }
+    }
+    if (!metaPath || !archive) {
+      throw new Error(`Failed to resolve conflict ${conflictId}: archive not found`);
+    }
 
+    try {
       const configPath = archive.conflictPath;
       const bytes = this.serializer.serialize(mergedContent, configPath);
       await this.cachedFS.writeFile(configPath, bytes);
@@ -998,23 +1095,29 @@ export class ConfigRepo implements IConfigRepo {
     this.assertNotDisposed();
 
     const archives: ConflictArchive[] = [];
-    try {
-      const entries = await this.cachedFS.readdir(CONFLICTS_DIR);
+    const seen = new Set<string>();
+    for (const dir of [CONFLICTS_DIR, LEGACY_CONFLICTS_DIR]) {
+      let entries: string[];
+      try {
+        entries = await this.cachedFS.readdir(dir);
+      } catch {
+        continue; // directory doesn't exist yet
+      }
       for (const entry of entries) {
+        if (seen.has(entry)) continue;
         // Each conflict is a directory containing meta.json
-        const metaPath = `${CONFLICTS_DIR}/${entry}/meta.json`;
+        const metaPath = `${dir}/${entry}/meta.json`;
         try {
           const raw = await this.cachedFS.readFile(metaPath);
           const archive = JSON.parse(
             new TextDecoder().decode(toUint8Array(raw)),
           );
+          seen.add(entry);
           archives.push(archive);
         } catch {
           // Skip entries without valid meta.json
         }
       }
-    } catch {
-      // Directory doesn't exist yet
     }
     return archives.sort((a, b) => a.timestamp - b.timestamp);
   }
@@ -1022,10 +1125,14 @@ export class ConfigRepo implements IConfigRepo {
   async readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string> {
     this.assertNotDisposed();
 
-    const conflictDir = `${CONFLICTS_DIR}/${conflictId}`.replace(/\/meta\.json$/, '');
-    const filePath = `${conflictDir}/${fileType}`;
-    const raw = await this.cachedFS.readFile(filePath);
-    return new TextDecoder().decode(toUint8Array(raw));
+    for (const dir of [CONFLICTS_DIR, LEGACY_CONFLICTS_DIR]) {
+      const conflictDir = `${dir}/${conflictId}`.replace(/\/meta\.json$/, '');
+      try {
+        const raw = await this.cachedFS.readFile(`${conflictDir}/${fileType}`);
+        return new TextDecoder().decode(toUint8Array(raw));
+      } catch { /* try next layout */ }
+    }
+    throw new Error(`Conflict backup not found: ${conflictId}/${fileType}`);
   }
 
   // -----------------------------------------------------------------------
@@ -1136,6 +1243,7 @@ export class ConfigRepo implements IConfigRepo {
         );
 
         this.replicaBackends.set(desc.id, { instance: fsInstance, syncable, pairId: pair.pairId });
+        this.backendStates.set(desc.id, { backendId: desc.id, pairId: pair.pairId });
 
         // Register conflict handler
         const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
@@ -1153,6 +1261,13 @@ export class ConfigRepo implements IConfigRepo {
         log.log(`[ConfigRepo] Replica ${desc.id} created, sync pair=${pair.pairId}`);
       } catch (err: any) {
         log.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
+        this.backendStates.set(desc.id, {
+          backendId: desc.id,
+          error: {
+            message: err instanceof Error ? err.message : String(err),
+            timestamp: Date.now(),
+          },
+        });
       }
     }
 
@@ -1396,111 +1511,140 @@ export class ConfigRepo implements IConfigRepo {
   // Internal — Individual Backend Descriptor Files
   // -----------------------------------------------------------------------
 
-  /** Path for a single backend descriptor: .meta/backends/{id}.json */
+  /** Path for a single backend descriptor: .config/backends/{id}.json */
   backendFilePath(id: string): string {
     return `${BACKENDS_DIR}/${id}.json`;
   }
 
+  /** Legacy path: .meta/backends/{id}.json (read + dual-write for one cycle). */
+  legacyBackendFilePath(id: string): string {
+    return `${LEGACY_BACKENDS_DIR}/${id}.json`;
+  }
+
+  /** Read every parseable descriptor in one directory. */
+  private async readBackendDescriptorsFrom(dir: string): Promise<{
+    items: { desc: BackendDescriptor; mtime: number }[];
+    corruptFiles: string[];
+  }> {
+    let entries: string[];
+    try {
+      entries = await this.cachedFS.readdir(dir);
+    } catch {
+      return { items: [], corruptFiles: [] }; // Directory doesn't exist yet
+    }
+    const jsonEntries = entries.filter((e: string) => e.endsWith('.json'));
+
+    // Parallelize readFile + stat for all descriptor files
+    const readResults = await Promise.all(
+      jsonEntries.map(async (entry: string) => {
+        const filePath = `${dir}/${entry}`;
+        try {
+          const raw = await this.cachedFS.readFile(filePath);
+          const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          if (desc.id && desc.type) {
+            let mtime = 0;
+            try {
+              const stat = await this.cachedFS.stat(filePath);
+              mtime = stat.mtimeMs ?? 0;
+            } catch { /* mtime unknown */ }
+            return { kind: 'ok' as const, desc, mtime };
+          } else {
+            log.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
+            return { kind: 'corrupt' as const, filePath };
+          }
+        } catch (parseErr) {
+          log.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
+          return { kind: 'corrupt' as const, filePath };
+        }
+      }),
+    );
+
+    const items: { desc: BackendDescriptor; mtime: number }[] = [];
+    const corruptFiles: string[] = [];
+    for (const result of readResults) {
+      if (result.kind === 'ok') {
+        items.push({ desc: result.desc, mtime: result.mtime });
+      } else {
+        corruptFiles.push(result.filePath);
+      }
+    }
+    return { items, corruptFiles };
+  }
+
   /**
-   * Read all backend descriptors from .meta/backends/*.json.
+   * Read all backend descriptors from `.config/backends/*.json` with legacy
+   * `.meta/backends/*.json` as a one-cycle fallback (new layout wins by id).
    *
    * If duplicate backends are detected (same type + options but different id),
    * only the first one (sorted by id) is kept and the rest are removed
    * (including their version sidecar files).
    */
   async readAllBackendDescriptors(): Promise<BackendDescriptor[]> {
-    try {
-      const entries = await this.cachedFS.readdir(BACKENDS_DIR);
-      const jsonEntries = entries.filter((e: string) => e.endsWith('.json'));
+    const fresh = await this.readBackendDescriptorsFrom(BACKENDS_DIR);
+    const legacy = await this.readBackendDescriptorsFrom(LEGACY_BACKENDS_DIR);
 
-      // Parallelize readFile + stat for all descriptor files
-      const readResults = await Promise.all(
-        jsonEntries.map(async (entry: string) => {
-          const filePath = `${BACKENDS_DIR}/${entry}`;
-          try {
-            const raw = await this.cachedFS.readFile(filePath);
-            const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-            if (desc.id && desc.type) {
-              let mtime = 0;
-              try {
-                const stat = await this.cachedFS.stat(filePath);
-                mtime = stat.mtimeMs ?? 0;
-              } catch { /* mtime unknown */ }
-              return { kind: 'ok' as const, desc, mtime };
-            } else {
-              log.warn(`[ConfigRepo] Backend descriptor ${entry} is missing id/type fields, marking for cleanup`);
-              return { kind: 'corrupt' as const, filePath };
-            }
-          } catch (parseErr) {
-            log.warn(`[ConfigRepo] Backend descriptor ${entry} has corrupted JSON: ${parseErr}. Marking for cleanup.`);
-            return { kind: 'corrupt' as const, filePath };
-          }
-        }),
-      );
-
-      const items: { desc: BackendDescriptor; mtime: number }[] = [];
-      const corruptFiles: string[] = [];
-      for (const result of readResults) {
-        if (result.kind === 'ok') {
-          items.push({ desc: result.desc, mtime: result.mtime });
-        } else {
-          corruptFiles.push(result.filePath);
-        }
+    const items = [...fresh.items];
+    const seenIds = new Set(items.map((i) => i.desc.id));
+    for (const item of legacy.items) {
+      if (!seenIds.has(item.desc.id)) {
+        items.push(item);
+        seenIds.add(item.desc.id);
       }
+    }
+    const corruptFiles = [...fresh.corruptFiles, ...legacy.corruptFiles];
 
-      // Clean up corrupted descriptor files: delete on all replicas, tombstone, delete locally.
-      // This prevents corrupted files from persisting and being re-synced indefinitely.
-      for (const corruptPath of corruptFiles) {
-        // 1. Delete on all known replicas directly
-        for (const [, replica] of this.replicaBackends) {
-          try { await replica.instance.unlink(corruptPath); } catch { /* not on this replica */ }
-          await this.unlinkVersionSidecar(replica.instance, corruptPath);
-        }
-        // 2. Create a tombstone + delete locally
-        try {
-          await this.deleteFile(corruptPath);
-        } catch {
-          // deleteFile might fail if sync engine isn't set up yet — fall back to plain unlink
-          try { await this.cachedFS.unlink(corruptPath); } catch { /* already gone */ }
-          await this.unlinkVersionSidecar(this.cachedFS, corruptPath);
-        }
+    // Clean up corrupted descriptor files: delete on all replicas, tombstone, delete locally.
+    // This prevents corrupted files from persisting and being re-synced indefinitely.
+    for (const corruptPath of corruptFiles) {
+      // 1. Delete on all known replicas directly
+      for (const [, replica] of this.replicaBackends) {
+        try { await replica.instance.unlink(corruptPath); } catch { /* not on this replica */ }
+        await this.unlinkVersionSidecar(replica.instance, corruptPath);
       }
+      // 2. Create a tombstone + delete locally
+      try {
+        await this.deleteFile(corruptPath);
+      } catch {
+        // deleteFile might fail if sync engine isn't set up yet — fall back to plain unlink
+        try { await this.cachedFS.unlink(corruptPath); } catch { /* already gone */ }
+        await this.unlinkVersionSidecar(this.cachedFS, corruptPath);
+      }
+    }
 
-      // Deduplicate: same type + options (stable key) but different id.
-      // Keep the one with the earliest mtime (created first).
-      const seen = new Map<string, { desc: BackendDescriptor; mtime: number }>();
-      const duplicates: string[] = [];
+    // Deduplicate: same type + options (stable key) but different id.
+    // Keep the one with the earliest mtime (created first).
+    const seen = new Map<string, { desc: BackendDescriptor; mtime: number }>();
+    const duplicates: string[] = [];
 
-      for (const item of items) {
-        const key = backendDedupKey(item.desc);
-        const existing = seen.get(key);
-        if (existing) {
-          if (item.mtime < existing.mtime) {
-            // New one is older — keep it, mark the existing as duplicate
-            duplicates.push(existing.desc.id);
-            seen.set(key, item);
-          } else {
-            // Existing is older (or same time) — keep existing, mark new as duplicate
-            duplicates.push(item.desc.id);
-          }
-        } else {
+    for (const item of items) {
+      const key = backendDedupKey(item.desc);
+      const existing = seen.get(key);
+      if (existing) {
+        if (item.mtime < existing.mtime) {
+          // New one is older — keep it, mark the existing as duplicate
+          duplicates.push(existing.desc.id);
           seen.set(key, item);
+        } else {
+          // Existing is older (or same time) — keep existing, mark new as duplicate
+          duplicates.push(item.desc.id);
         }
+      } else {
+        seen.set(key, item);
       }
+    }
 
-      if (duplicates.length > 0) {
-        log.log(
-          `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
-        );
-        for (const dupId of duplicates) {
-          const descPath = this.backendFilePath(dupId);
-
+    if (duplicates.length > 0) {
+      log.log(
+        `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
+      );
+      for (const dupId of duplicates) {
+        for (const descPath of [this.backendFilePath(dupId), this.legacyBackendFilePath(dupId)]) {
           // 1. Delete the descriptor file on ALL known replicas directly.
           //    This is critical: if we only write a tombstone + delete locally,
           //    the sync engine will see "remote has file, local doesn't" and
           //    copy it back — re-creating the duplicate in an infinite loop.
           //    By deleting on all replicas NOW, both sides are clean.
-          for (const [replicaId, replica] of this.replicaBackends) {
+          for (const [, replica] of this.replicaBackends) {
             try {
               await replica.instance.unlink(descPath);
             } catch { /* not on this replica */ }
@@ -1514,34 +1658,45 @@ export class ConfigRepo implements IConfigRepo {
           } catch {
             // deleteFile might fail if called before sync engine is set up
             // (e.g. during createConfigRepo's tempRepo phase). Fall back to plain unlink.
-            await this.removeBackendDescriptor(dupId);
+            try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
+            await this.unlinkVersionSidecar(this.cachedFS, descPath);
           }
         }
       }
-
-      return Array.from(seen.values()).map(i => i.desc);
-    } catch {
-      return []; // Directory doesn't exist yet
     }
+
+    const result = Array.from(seen.values()).map(i => i.desc);
+    this.backendDescriptorCache = result;
+    return result;
   }
 
-  /** Write a single backend descriptor as .meta/backends/{id}.json */
+  /**
+   * Write a single backend descriptor to `.config/backends/{id}.json`,
+   * mirroring to the legacy `.meta/backends/{id}.json` for one release cycle
+   * so older clients still see the backend.
+   */
   async writeBackendDescriptor(desc: BackendDescriptor): Promise<void> {
-    const path = this.backendFilePath(desc.id);
-    await this.ensureDir(path);
-    const bytes = new TextEncoder().encode(JSON.stringify(desc, null, 2));
-    await this.cachedFS.writeFile(path, bytes);
-
     const author = `${this.appId}/${this.nodeId}`;
-    const version = await incrementVersion(this.fullFS, path, bytes, author);
-    await this.writeVersionSidecar(path, version);
+    const bytes = new TextEncoder().encode(JSON.stringify(desc, null, 2));
+    for (const path of [this.backendFilePath(desc.id), this.legacyBackendFilePath(desc.id)]) {
+      await this.ensureDir(path);
+      await this.cachedFS.writeFile(path, bytes);
+      const version = await incrementVersion(this.fullFS, path, bytes, author);
+      await this.writeVersionSidecar(path, version);
+    }
+    // Keep the synchronous unified-handle cache in sync.
+    const existing = this.backendDescriptorCache.findIndex((b) => b.id === desc.id);
+    if (existing >= 0) this.backendDescriptorCache[existing] = { ...desc };
+    else this.backendDescriptorCache.push({ ...desc });
   }
 
-  /** Remove a single backend descriptor file + its version sidecar */
+  /** Remove a single backend descriptor file + its version sidecar (both layouts) */
   async removeBackendDescriptor(id: string): Promise<void> {
-    const path = this.backendFilePath(id);
-    try { await this.cachedFS.unlink(path); } catch { /* already gone */ }
-    await this.unlinkVersionSidecar(this.cachedFS, path);
+    for (const path of [this.backendFilePath(id), this.legacyBackendFilePath(id)]) {
+      try { await this.cachedFS.unlink(path); } catch { /* already gone */ }
+      await this.unlinkVersionSidecar(this.cachedFS, path);
+    }
+    this.backendDescriptorCache = this.backendDescriptorCache.filter((b) => b.id !== id);
   }
 
   // -----------------------------------------------------------------------
@@ -1675,6 +1830,7 @@ export class ConfigRepo implements IConfigRepo {
     );
 
     this.replicaBackends.set(id, { instance, syncable, pairId: pair.pairId });
+    this.backendStates.set(id, { backendId: id, pairId: pair.pairId });
 
     // Register conflict handler
     const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
@@ -1700,7 +1856,9 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     const replica = this.replicaBackends.get(id);
-    const descPath = this.backendFilePath(id);
+    // Both layouts are written during the transition cycle, so both must be
+    // removed (otherwise the legacy mirror survives and re-appears via sync).
+    const descPaths = [this.backendFilePath(id), this.legacyBackendFilePath(id)];
 
     if (replica) {
       // Backend is actively registered — full cleanup path.
@@ -1709,19 +1867,21 @@ export class ConfigRepo implements IConfigRepo {
       //    sync pair is gone, we can no longer reach the remote through the
       //    normal sync flow. Without this, the remote keeps the file and
       //    another backend's sync pair would pull it back.
-      try {
-        await replica.instance.unlink(descPath);
-      } catch { /* not on remote */ }
-      await this.unlinkVersionSidecar(replica.instance, descPath);
+      for (const descPath of descPaths) {
+        try {
+          await replica.instance.unlink(descPath);
+        } catch { /* not on remote */ }
+        await this.unlinkVersionSidecar(replica.instance, descPath);
 
-      // 2. Create a tombstone + delete the local file.
-      //    The tombstone ensures that if another backend syncs to the same
-      //    remote, the deleted file won't be re-introduced.
-      try {
-        await this.deleteFile(descPath);
-      } catch {
-        // deleteFile might fail in edge cases — fall back to plain unlink
-        await this.removeBackendDescriptor(id);
+        // 2. Create a tombstone + delete the local file.
+        //    The tombstone ensures that if another backend syncs to the same
+        //    remote, the deleted file won't be re-introduced.
+        try {
+          await this.deleteFile(descPath);
+        } catch {
+          // deleteFile might fail in edge cases — fall back to plain unlink
+          await this.removeBackendDescriptor(id);
+        }
       }
 
       // 3. Stop watching and remove sync pair
@@ -1743,10 +1903,12 @@ export class ConfigRepo implements IConfigRepo {
       // We still need to write a tombstone and clean up the descriptor so the
       // deletion propagates to other replicas via sync.
       log.log(`[ConfigRepo] removeBackend: "${id}" not in replicaBackends, cleaning up descriptor only`);
-      try {
-        await this.deleteFile(descPath);
-      } catch {
-        await this.removeBackendDescriptor(id);
+      for (const descPath of descPaths) {
+        try {
+          await this.deleteFile(descPath);
+        } catch {
+          await this.removeBackendDescriptor(id);
+        }
       }
     }
 
@@ -1756,6 +1918,7 @@ export class ConfigRepo implements IConfigRepo {
     //    schedulePostDeleteSync() (called by deleteFile above) handles this,
     //    but we also trigger it here to ensure it runs even if deleteFile's
     //    timer hasn't fired yet.
+    this.backendStates.delete(id);
     this.schedulePostDeleteSync();
 
     log.log(`[ConfigRepo] removeBackend: ${id} removed (tombstone written, remote cleaned)`);
@@ -1829,41 +1992,81 @@ export class ConfigRepo implements IConfigRepo {
   /** Write the group-type marker file if it doesn't exist. */
   async ensureGroupType(type: SyncGroupType): Promise<void> {
     this.assertNotDisposed();
-    try {
-      const existing = await this.cachedFS.readFile(GROUP_TYPE_FILE, 'utf-8');
-      const current = (existing as string).trim();
-      if (current && current !== type) {
-        log.warn(`[ConfigRepo] group-type already set to "${current}", ignoring request to set "${type}"`);
-        return;
+    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
+      try {
+        const existing = await this.cachedFS.readFile(path, 'utf-8');
+        const current = (existing as string).trim();
+        if (current && current !== type) {
+          log.warn(`[ConfigRepo] group-type already set to "${current}" at ${path}, ignoring request to set "${type}"`);
+          return;
+        }
+      } catch {
+        // File doesn't exist — write it below
       }
-    } catch {
-      // File doesn't exist — write it
     }
-    await this.ensureDir(GROUP_TYPE_FILE);
-    await this.cachedFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode(type));
+    const bytes = new TextEncoder().encode(type);
+    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
+      if (await this.safeExists(this.cachedFS, path)) continue;
+      await this.ensureDir(path);
+      await this.cachedFS.writeFile(path, bytes);
+    }
+    // Unified group descriptor (`.meta/group.json`) — written once, for both
+    // kinds. Renames update it explicitly; launches must not rewrite it (that
+    // would produce needless sync churn).
+    if (!(await readGroupDescriptor(this.cachedFS))) {
+      await writeGroupDescriptor(this.cachedFS, {
+        schemaVersion: 1,
+        kind: 'config',
+        id: CONFIG_GROUP_ID,
+        ...(this.name ? { name: this.name } : {}),
+        features: CONFIG_GROUP_FEATURES,
+      });
+    }
     log.log(`[ConfigRepo] group-type set to "${type}"`);
   }
 
-  /** Read the group-type marker. Returns null if not set. */
+  /** Read the group-type marker. Returns null if not set (new path, then legacy). */
   async getGroupType(): Promise<SyncGroupType | null> {
     this.assertNotDisposed();
-    try {
-      const raw = await this.cachedFS.readFile(GROUP_TYPE_FILE, 'utf-8');
-      const type = (raw as string).trim() as SyncGroupType;
-      if (type === 'config-sync' || type === 'data-sync') return type;
-      return null;
-    } catch {
-      return null;
+    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
+      try {
+        const raw = await this.cachedFS.readFile(path, 'utf-8');
+        const type = (raw as string).trim() as SyncGroupType;
+        if (type === 'config-sync' || type === 'data-sync') return type;
+      } catch {
+        /* try legacy */
+      }
     }
+    return null;
   }
 
   // -----------------------------------------------------------------------
   // IConfigRepo — App Data Groups (data-sync groups)
   // -----------------------------------------------------------------------
 
-  /** Path for a single app data group descriptor: .meta/app-data-groups/{appId}/{id}.json */
+  /** Path for a single app data group descriptor: .config/app-data-groups/{appId}/{id}.json */
   private appDataGroupFilePath(id: string): string {
     return `${APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
+  }
+
+  /** Legacy descriptor path: .meta/app-data-groups/{appId}/{id}.json */
+  private legacyAppDataGroupFilePath(id: string): string {
+    return `${LEGACY_APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
+  }
+
+  /** Write a data-group descriptor to the new path, mirroring to the legacy one. */
+  private async writeAppDataGroupDescriptorFile(
+    id: string,
+    descriptor: AppDataGroupDescriptor,
+  ): Promise<void> {
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    const author = `${this.appId}/${this.nodeId}`;
+    for (const descPath of [this.appDataGroupFilePath(id), this.legacyAppDataGroupFilePath(id)]) {
+      await this.ensureDir(descPath);
+      await this.cachedFS.writeFile(descPath, bytes);
+      const version = await incrementVersion(this.fullFS, descPath, bytes, author);
+      await this.writeVersionSidecar(descPath, version);
+    }
   }
 
   /**
@@ -1884,9 +2087,44 @@ export class ConfigRepo implements IConfigRepo {
     return mergeAccountFields(desc.type, accountBackend.options, desc.options);
   }
 
+  /**
+   * Reject two groups pointing at the exact same remote endpoint. Two groups
+   * syncing the same files independently would fight over deletions and
+   * tombstones (see SYNC-GROUP-UNIFICATION §4.3).
+   */
+  private async assertNoSharedRemote(
+    backends: AppDataBackendDescriptor[],
+    ownerId: string,
+  ): Promise<void> {
+    const candidates = new Set(backends.map((b) => backendDedupKey(b)));
+    if (candidates.size === 0) return;
+
+    for (const backend of await this.readAllBackendDescriptors()) {
+      if (candidates.has(backendDedupKey(backend))) {
+        throw new Error(
+          `数据组「${ownerId}」的后端「${backend.id}」与配置同步组后端指向同一远端` +
+          `（类型与参数完全相同），两个组不能共用同一远端目录，请改用不同的 basePath/repo`,
+        );
+      }
+    }
+
+    for (const other of await this.listAppDataGroups()) {
+      if (other.id === ownerId) continue;
+      for (const backend of other.backends) {
+        if (candidates.has(backendDedupKey(backend))) {
+          throw new Error(
+            `数据组「${ownerId}」的后端「${backend.id}」与数据组「${other.id}」的后端` +
+            `「${backend.id}」指向同一远端（类型与参数完全相同），请为其中一个组更换 basePath`,
+          );
+        }
+      }
+    }
+  }
+
   async createAppDataGroup(
     id: string,
     backends: AppDataBackendDescriptor[],
+    options: { name?: string; features?: Partial<SyncGroupFeatures> } = {},
   ): Promise<AppDataGroup> {
     this.assertNotDisposed();
 
@@ -1903,6 +2141,9 @@ export class ConfigRepo implements IConfigRepo {
       resolvedBackends.push({ ...desc, options: mergedOptions });
     }
 
+    // Cross-group uniqueness: no two groups may share the same remote endpoint.
+    await this.assertNoSharedRemote(resolvedBackends, id);
+
     // Create the data-sync group implementation
     const group = new AppDataGroupImpl(
       id,
@@ -1910,23 +2151,19 @@ export class ConfigRepo implements IConfigRepo {
       resolvedBackends,
       this.pollIntervalMs,
       this,
+      { name: options.name, features: options.features },
     );
     await group.init();
 
-    // Save descriptor to .meta/app-data-groups/{appId}/{id}.json
+    // Save descriptor to .config/app-data-groups/{appId}/{id}.json (+ legacy mirror)
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
+      ...(options.name ? { name: options.name } : {}),
+      ...(options.features ? { features: options.features } : {}),
       backends: resolvedBackends,
     };
-    const descPath = this.appDataGroupFilePath(id);
-    await this.ensureDir(descPath);
-    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
-    await this.cachedFS.writeFile(descPath, bytes);
-
-    const author = `${this.appId}/${this.nodeId}`;
-    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
-    await this.writeVersionSidecar(descPath, version);
+    await this.writeAppDataGroupDescriptorFile(id, descriptor);
 
     this.appDataGroups.set(id, group);
     log.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
@@ -1941,21 +2178,17 @@ export class ConfigRepo implements IConfigRepo {
    */
   async updateAppDataGroupDescriptor(id: string, backends: AppDataBackendDescriptor[]): Promise<void> {
     this.assertNotDisposed();
-    // Preserve the display name: adding/removing backends must not wipe it.
+    // Preserve the display name and feature flags: adding/removing backends
+    // must not wipe them.
     const existing = await this.readAppDataGroupDescriptor(id);
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
       ...(existing?.name ? { name: existing.name } : {}),
+      ...(existing?.features ? { features: existing.features } : {}),
       backends,
     };
-    const descPath = this.appDataGroupFilePath(id);
-    await this.ensureDir(descPath);
-    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
-    await this.cachedFS.writeFile(descPath, bytes);
-    const author = `${this.appId}/${this.nodeId}`;
-    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
-    await this.writeVersionSidecar(descPath, version);
+    await this.writeAppDataGroupDescriptorFile(id, descriptor);
   }
 
   /**
@@ -1975,13 +2208,7 @@ export class ConfigRepo implements IConfigRepo {
       groupType: 'data-sync',
       name: normalized,
     };
-    const descPath = this.appDataGroupFilePath(id);
-    await this.ensureDir(descPath);
-    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
-    await this.cachedFS.writeFile(descPath, bytes);
-    const author = `${this.appId}/${this.nodeId}`;
-    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
-    await this.writeVersionSidecar(descPath, version);
+    await this.writeAppDataGroupDescriptorFile(id, descriptor);
   }
 
   /**
@@ -2063,13 +2290,15 @@ export class ConfigRepo implements IConfigRepo {
 
   async getConfigSyncGroupDescriptor(): Promise<ConfigSyncGroupDescriptor | null> {
     this.assertNotDisposed();
-    try {
-      const raw = await this.cachedFS.readFile(CONFIG_SYNC_GROUP_FILE);
-      const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-      if (parsed && parsed.groupType === 'config-sync') {
-        return parsed as ConfigSyncGroupDescriptor;
-      }
-    } catch { /* absent — treated as default */ }
+    for (const path of [CONFIG_SYNC_GROUP_FILE, LEGACY_CONFIG_SYNC_GROUP_FILE]) {
+      try {
+        const raw = await this.cachedFS.readFile(path);
+        const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+        if (parsed && parsed.groupType === 'config-sync') {
+          return parsed as ConfigSyncGroupDescriptor;
+        }
+      } catch { /* absent — treated as default */ }
+    }
     return null;
   }
 
@@ -2084,23 +2313,35 @@ export class ConfigRepo implements IConfigRepo {
       groupType: 'config-sync',
       name: normalized,
     };
-    await this.ensureDir(CONFIG_SYNC_GROUP_FILE);
     const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
-    await this.cachedFS.writeFile(CONFIG_SYNC_GROUP_FILE, bytes);
     const author = `${this.appId}/${this.nodeId}`;
-    const version = await incrementVersion(this.fullFS, CONFIG_SYNC_GROUP_FILE, bytes, author);
-    await this.writeVersionSidecar(CONFIG_SYNC_GROUP_FILE, version);
+    for (const path of [CONFIG_SYNC_GROUP_FILE, LEGACY_CONFIG_SYNC_GROUP_FILE]) {
+      await this.ensureDir(path);
+      await this.cachedFS.writeFile(path, bytes);
+      const version = await incrementVersion(this.fullFS, path, bytes, author);
+      await this.writeVersionSidecar(path, version);
+    }
+    // Keep `.meta/group.json` in sync with the display name.
+    await writeGroupDescriptor(this.cachedFS, {
+      schemaVersion: 1,
+      kind: 'config',
+      id: CONFIG_GROUP_ID,
+      name: normalized,
+      features: CONFIG_GROUP_FEATURES,
+    });
     return descriptor;
   }
 
   private async readAppDataGroupDescriptor(id: string): Promise<AppDataGroupDescriptor | null> {
-    try {
-      const raw = await this.cachedFS.readFile(this.appDataGroupFilePath(id));
-      const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-      if (parsed && parsed.id === id && parsed.groupType === 'data-sync') {
-        return parsed as AppDataGroupDescriptor;
-      }
-    } catch { /* absent */ }
+    for (const descPath of [this.appDataGroupFilePath(id), this.legacyAppDataGroupFilePath(id)]) {
+      try {
+        const raw = await this.cachedFS.readFile(descPath);
+        const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+        if (parsed && parsed.id === id && parsed.groupType === 'data-sync') {
+          return parsed as AppDataGroupDescriptor;
+        }
+      } catch { /* try next layout */ }
+    }
     return null;
   }
 
@@ -2111,46 +2352,49 @@ export class ConfigRepo implements IConfigRepo {
     const cached = this.appDataGroups.get(id);
     if (cached) return cached;
 
-    // Load from descriptor
-    const descPath = this.appDataGroupFilePath(id);
-    try {
-      const raw = await this.cachedFS.readFile(descPath);
-      const descriptor = JSON.parse(new TextDecoder().decode(toUint8Array(raw))) as AppDataGroupDescriptor;
-      const group = new AppDataGroupImpl(
-        id,
-        this.appId,
-        descriptor.backends,
-        this.pollIntervalMs,
-        this,
-      );
-      await group.init();
-      this.appDataGroups.set(id, group);
-      return group;
-    } catch {
+    // Load from descriptor (new layout first, then legacy)
+    const descriptor = await this.readAppDataGroupDescriptor(id);
+    if (!descriptor) {
       throw new Error(`App data group "${id}" not found`);
     }
+    const group = new AppDataGroupImpl(
+      id,
+      this.appId,
+      descriptor.backends,
+      this.pollIntervalMs,
+      this,
+      descriptor,
+    );
+    await group.init();
+    this.appDataGroups.set(id, group);
+    return group;
   }
 
   async listAppDataGroups(): Promise<AppDataGroupDescriptor[]> {
     this.assertNotDisposed();
-    const dir = `${APP_DATA_GROUPS_DIR}/${this.appId}`;
-    try {
-      const entries = await this.cachedFS.readdir(dir);
-      const descriptors: AppDataGroupDescriptor[] = [];
+    const byId = new Map<string, AppDataGroupDescriptor>();
+    for (const dir of [
+      `${APP_DATA_GROUPS_DIR}/${this.appId}`,
+      `${LEGACY_APP_DATA_GROUPS_DIR}/${this.appId}`,
+    ]) {
+      let entries: string[];
+      try {
+        entries = await this.cachedFS.readdir(dir);
+      } catch {
+        continue; // this layout has no descriptors yet
+      }
       for (const entry of entries) {
         if (!entry.endsWith('.json')) continue;
         try {
           const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
           const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
-          if (desc.id && desc.groupType === 'data-sync') {
-            descriptors.push(desc);
+          if (desc.id && desc.groupType === 'data-sync' && !byId.has(desc.id)) {
+            byId.set(desc.id, desc as AppDataGroupDescriptor);
           }
         } catch { /* skip corrupt */ }
       }
-      return descriptors;
-    } catch {
-      return [];
     }
+    return Array.from(byId.values());
   }
 
   async removeAppDataGroup(id: string): Promise<void> {
@@ -2162,16 +2406,17 @@ export class ConfigRepo implements IConfigRepo {
       this.appDataGroups.delete(id);
     }
 
-    const descPath = this.appDataGroupFilePath(id);
     // Use deleteFile (tombstone) so the deletion propagates to remote
     // replicas (e.g. the config-sync repo on Gitee) and is NOT resurrected
     // by sync pulling the still-existing remote descriptor back.
-    try {
-      await this.deleteFile(descPath);
-    } catch (err) {
-      log.log(`[ConfigRepo] removeAppDataGroup: deleteFile failed for "${id}":`, err);
-      try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
-      await this.unlinkVersionSidecar(this.cachedFS, descPath);
+    for (const descPath of [this.appDataGroupFilePath(id), this.legacyAppDataGroupFilePath(id)]) {
+      try {
+        await this.deleteFile(descPath);
+      } catch (err) {
+        log.log(`[ConfigRepo] removeAppDataGroup: deleteFile failed for "${id}" at ${descPath}:`, err);
+        try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
+        await this.unlinkVersionSidecar(this.cachedFS, descPath);
+      }
     }
     log.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
   }
@@ -2211,6 +2456,9 @@ export class ConfigRepo implements IConfigRepo {
 class AppDataGroupImpl implements AppDataGroup {
   readonly groupId: string;
   readonly appId: string;
+  readonly kind = 'data' as const;
+  readonly features: SyncGroupFeatures;
+  name?: string;
   fs: any;
 
   private syncEngine: ZenFSSync;
@@ -2219,15 +2467,29 @@ class AppDataGroupImpl implements AppDataGroup {
   private backendStates: Map<string, BackendSyncState> = new Map();
   private disposed = false;
 
+  /** `.meta/` stores shared with the config-sync group. */
+  private tombstones!: TombstoneStore;
+  private versions!: VersionStore;
+  private conflicts!: ConflictStore;
+  private postDeleteTimer?: ReturnType<typeof setTimeout>;
+
   constructor(
     groupId: string,
     appId: string,
     backends: AppDataBackendDescriptor[],
     pollIntervalMs: number | undefined,
     parent: ConfigRepo,
+    descriptor: Pick<AppDataGroupDescriptor, 'name' | 'features'> = {},
   ) {
     this.groupId = groupId;
     this.appId = appId;
+    this.name = descriptor.name;
+    this.features = {
+      ...DATA_GROUP_DEFAULT_FEATURES,
+      ...descriptor.features,
+      // Tombstones are the deletion-correctness primitive: always on.
+      tombstones: true,
+    };
     this.parent = parent;
     this.syncEngine = new ZenFSSync();
     this.localFS = null as any;
@@ -2239,6 +2501,23 @@ class AppDataGroupImpl implements AppDataGroup {
   private parent: ConfigRepo;
   private _backends: AppDataBackendDescriptor[];
   private _pollIntervalMs?: number;
+
+  /** Local "backend" id used in tombstone bookkeeping. */
+  private get localBackendId(): string {
+    return `local:${this.groupId}`;
+  }
+
+  /** All backend ids that must confirm a tombstone before GC. */
+  private allBackendIds(): string[] {
+    return [this.localBackendId, ...this.dataBackends.keys()];
+  }
+
+  private tombstoneTargets(): { id: string; fs: any }[] {
+    return [
+      { id: this.localBackendId, fs: this.localFS },
+      ...Array.from(this.dataBackends.entries()).map(([id, b]) => ({ id, fs: b.instance })),
+    ];
+  }
 
   async init(): Promise<void> {
     // Create local primary backend (Folder on Node, IndexedDB on browser).
@@ -2289,7 +2568,35 @@ class AppDataGroupImpl implements AppDataGroup {
     }
 
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
-    this.fs = createChrootFS(this.localFS, '/');
+
+    // Unified `.meta/` metadata area (tombstones / versions / conflicts).
+    // `/.config/` stays hidden: a data group never owns config payload.
+    this.tombstones = new TombstoneStore(this.localFS, this.localBackendId);
+    this.versions = new VersionStore(this.localFS, `${this.appId}/${this.groupId}`);
+    this.conflicts = new ConflictStore(this.localFS, this.appId, `${this.groupId}`, this.versions);
+
+    // Write the unified group descriptor so both kinds carry `.meta/group.json`.
+    try {
+      await writeGroupDescriptor(this.localFS, {
+        schemaVersion: 1,
+        kind: 'data',
+        id: this.groupId,
+        ...(this.name ? { name: this.name } : {}),
+        features: this.features,
+      });
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] failed to write .meta/group.json:`, err);
+    }
+
+    // The app-facing view hides metadata (hiding ≠ not syncing): `.meta/` is
+    // synced so tombstones/versions/conflicts reach other devices, but the app
+    // must not read or write it directly. Writes record versions when enabled;
+    // unlink goes through the tombstone-aware deleteFile.
+    this.fs = createChrootFS(this.localFS, '/', {
+      hiddenPrefixes: [META_DIR, CONFIG_DIR],
+      onWrite: (path, data) => this.recordVersion(path, data),
+      onUnlink: (path) => this.deleteFile(path),
+    });
 
     // Deduplicate backends pointing to the same endpoint — keep the oldest.
     // Fixes the case where a data-sync backend is registered twice (e.g. as a
@@ -2317,12 +2624,31 @@ class AppDataGroupImpl implements AppDataGroup {
             direction: SyncDirection.BiDirectional,
             conflictStrategy: 'source-wins' as any,
             pollIntervalMs: this._pollIntervalMs,
+            // `.meta/` is intentionally NOT excluded: tombstones, versions and
+            // conflicts must sync, otherwise deletions resurrect on other devices.
             filter: { excludePrefixes: CONFIG_ONLY_PREFIXES },
+            preSyncHook: async () => {
+              await this.runTombstonePass('preSync');
+            },
+            postSyncHook: async () => {
+              await this.runTombstonePass('postSync');
+              await this.confirmTombstones();
+            },
           },
           '/',
         );
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
         this.backendStates.set(desc.id, { backendId: desc.id, pairId: pair.pairId });
+
+        // Conflict archives land in `.meta/conflicts/` (syncable diagnostics).
+        if (this.features.conflicts) {
+          const conflictHandler: SyncEventHandler = (event) => {
+            this.archiveConflict(event).catch((err) => {
+              log.warn(`[AppDataGroup:${this.groupId}] conflict archive failed:`, err);
+            });
+          };
+          this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
+        }
         // NOTE: Don't watch yet — sync first, then watch (same pattern as ConfigRepo)
         log.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err: any) {
@@ -2364,12 +2690,147 @@ class AppDataGroupImpl implements AppDataGroup {
   }
 
   async flush(): Promise<SyncResult[]> {
+    // Delete tombstoned files everywhere BEFORE syncing, so a remote copy
+    // cannot be seen as "newer" and win.
+    await this.runTombstonePass('flush-pre');
     const results = await this.syncEngine.syncAll();
+    await this.runTombstonePass('flush-post');
+    await this.confirmTombstones();
+    try {
+      await this.tombstones.gc(this.allBackendIds(), this.tombstoneTargets());
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] tombstone GC failed:`, err);
+    }
     return Array.from(results.values());
   }
 
   getBackendSyncStates(): Map<string, BackendSyncState> {
     return new Map(this.backendStates);
+  }
+
+  // -----------------------------------------------------------------------
+  // Unified SyncGroupHandle — deletion & metadata (data groups)
+  // -----------------------------------------------------------------------
+
+  /** Record a version entry when `features.versions` is on. */
+  private async recordVersion(path: string, data: any): Promise<void> {
+    if (!this.features.versions) return;
+    try {
+      const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : toUint8Array(data);
+      await this.versions.record(path, bytes);
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] version record failed for ${path}:`, err);
+    }
+  }
+
+  /** Delete tombstoned files on local + every connected backend before/after sync. */
+  private async runTombstonePass(stage: string): Promise<void> {
+    try {
+      await this.tombstones.process(this.tombstoneTargets());
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] ${stage} tombstone pass failed:`, err);
+    }
+  }
+
+  private async confirmTombstones(): Promise<void> {
+    try {
+      await this.tombstones.confirm(this.allBackendIds());
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] tombstone confirmations failed:`, err);
+    }
+  }
+
+  /**
+   * Delete a data file with a tombstone in `.meta/tombstones/`.
+   * The tombstone is synced (`.meta/` is no longer excluded), so the deletion
+   * survives restarts and reaches other devices instead of being resurrected.
+   */
+  async deleteFile(path: string): Promise<void> {
+    if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    const normalized = path.startsWith('/') ? path : `/${path}`;
+    if (normalized.startsWith(`${META_DIR}/`) || normalized.startsWith(`${CONFIG_DIR}/`)) {
+      throw new Error(`Cannot delete metadata path "${normalized}"`);
+    }
+
+    const tombstone: TombstoneMeta = {
+      path: normalized,
+      deletedAt: Date.now(),
+      deletedBy: this.localBackendId,
+      confirmedBy: [this.localBackendId],
+    };
+    await this.tombstones.write(tombstone);
+
+    try {
+      await this.localFS.unlink(normalized);
+    } catch {
+      // Already gone — the tombstone is still valid.
+    }
+
+    const versionPath = this.versions.pathFor(normalized);
+    if (versionPath) {
+      try {
+        await this.localFS.unlink(versionPath);
+      } catch {
+        // No version record — fine.
+      }
+    }
+
+    this.schedulePostDeleteSync();
+  }
+
+  private schedulePostDeleteSync(): void {
+    if (this.postDeleteTimer) return;
+    this.postDeleteTimer = setTimeout(() => {
+      this.postDeleteTimer = undefined;
+      void this.runTombstonePass('postDelete');
+    }, 300);
+  }
+
+  async listConflicts(): Promise<ConflictArchive[]> {
+    return this.conflicts.list();
+  }
+
+  async resolveConflict(conflictId: string, mergedContent: unknown): Promise<void> {
+    const content = typeof mergedContent === 'string'
+      ? mergedContent
+      : JSON.stringify(mergedContent, null, 2);
+    await this.conflicts.resolve(conflictId, content);
+    try {
+      await this.syncEngine.syncAll();
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] sync after conflict resolve failed:`, err);
+    }
+  }
+
+  readConflictBackup(conflictId: string, fileType: 'source' | 'target' | 'resolved'): Promise<string> {
+    return this.conflicts.readBackup(conflictId, fileType);
+  }
+
+  purgeMtimeSidecars(options: { root?: string; dryRun?: boolean } = {}): Promise<MtimePurgeResult> {
+    return purgeMtimeSidecars(this.localFS, options as PurgeMtimeOptions);
+  }
+
+  purgeKeepFiles(options: { root?: string; dryRun?: boolean } = {}): Promise<KeepPurgeResult> {
+    return purgeKeepFiles(this.localFS, options as PurgeKeepOptions);
+  }
+
+  async rename(name: string): Promise<void> {
+    await this.parent.updateAppDataGroupName(this.groupId, name);
+    this.name = name.trim();
+  }
+
+  private async archiveConflict(event: SyncEvent): Promise<void> {
+    const conflict = event.conflict;
+    if (!conflict) return;
+    await this.conflicts.archive(
+      {
+        path: conflict.path,
+        sourceContent: conflict.sourceContent,
+        targetContent: conflict.targetContent,
+        ...(conflict.resolvedWith ? { resolvedWith: conflict.resolvedWith } : {}),
+      },
+      event.timestamp,
+    );
   }
 
   async addBackend(
@@ -2396,6 +2857,13 @@ class AppDataGroupImpl implements AppDataGroup {
         conflictStrategy: 'source-wins' as any,
         pollIntervalMs: this._pollIntervalMs,
         filter: { excludePrefixes: CONFIG_ONLY_PREFIXES },
+        preSyncHook: async () => {
+          await this.runTombstonePass('preSync');
+        },
+        postSyncHook: async () => {
+          await this.runTombstonePass('postSync');
+          await this.confirmTombstones();
+        },
       },
       '/',
     );
@@ -2403,6 +2871,13 @@ class AppDataGroupImpl implements AppDataGroup {
     const desc: AppDataBackendDescriptor = { id, type, options, description, createdAt: Date.now() };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
     this.backendStates.set(id, { backendId: id, pairId: pair.pairId });
+    if (this.features.conflicts) {
+      this.syncEngine.on(pair.pairId, 'conflict', (event) => {
+        this.archiveConflict(event).catch((err) => {
+          log.warn(`[AppDataGroup:${this.groupId}] conflict archive failed:`, err);
+        });
+      });
+    }
     this._backends = [...this._backends.filter(b => b.id !== id), desc];
     log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 
@@ -2452,6 +2927,10 @@ class AppDataGroupImpl implements AppDataGroup {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.postDeleteTimer) {
+      clearTimeout(this.postDeleteTimer);
+      this.postDeleteTimer = undefined;
+    }
     this.syncEngine.dispose();
     for (const [_id, backend] of this.dataBackends) {
       if (backend.instance?.dispose) {
@@ -2567,19 +3046,30 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 2b: Write group-type = "config-sync" (if not already set)
+  // Step 2b: Write group-type = "config-sync" (new `.config/` + legacy mirror)
   // -------------------------------------------------------------------
   try {
     const groupTypeBytes = new TextEncoder().encode('config-sync');
-    // Check if already exists
-    try {
-      await primaryInstance.readFile(`${META_DIR}/group-type`);
-    } catch {
-      await primaryInstance.writeFile(`${META_DIR}/group-type`, groupTypeBytes);
-      log.log(`[createConfigRepo] group-type set to "config-sync"`);
+    for (const path of [`${CONFIG_DIR}/group-type`, `${META_DIR}/group-type`]) {
+      try {
+        await primaryInstance.readFile(path);
+      } catch {
+        await ensureParentDir(primaryInstance, path);
+        await primaryInstance.writeFile(path, groupTypeBytes);
+        log.log(`[createConfigRepo] group-type set to "config-sync" at ${path}`);
+      }
+    }
+    // Unified descriptor (`.meta/group.json`) — shared by both group kinds.
+    if (!(await readGroupDescriptor(primaryInstance))) {
+      await writeGroupDescriptor(primaryInstance, {
+        schemaVersion: 1,
+        kind: 'config',
+        id: CONFIG_GROUP_ID,
+        features: CONFIG_GROUP_FEATURES,
+      });
     }
   } catch (err: any) {
-    log.warn(`[createConfigRepo] Failed to write group-type:`, err.message);
+    log.warn(`[createConfigRepo] Failed to write group metadata:`, err.message);
   }
 
   // -------------------------------------------------------------------
@@ -2674,6 +3164,12 @@ export async function createConfigRepo(
     options.syncPollIntervalMs,
     cacheOptions,
   );
+
+  // Hydrate the unified handle's display name from the descriptor.
+  try {
+    const nameDescriptor = await repo.getConfigSyncGroupDescriptor();
+    if (nameDescriptor?.name) repo.name = nameDescriptor.name;
+  } catch { /* name is optional */ }
 
   await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
 

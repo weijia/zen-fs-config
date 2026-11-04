@@ -5,9 +5,13 @@ import { createConfigRepo } from '../config-repo';
 // ---------------------------------------------------------------------------
 // 数据同步组 ↔ 配置同步组隔离
 //
-// 数据组与配置组可能共用同一个远端账号（甚至同一个根目录）。配置树
-// （`.meta/`、`nodes/`、`shared/`）属于配置同步组，数据组的双向同步必须
+// 数据组与配置组可能共用同一个远端账号（甚至同一个根目录）。配置专属目录
+// （`.config/`、`nodes/`、`shared/`）属于配置同步组，数据组的双向同步必须
 // 完全跳过这些路径：既不推送，也不拉取。
+//
+// `.meta/` 已改为通用同步元数据区（tombstones / versions / conflicts），会
+// 参与数据组同步；但数据组 fs 视图通过 hiddenPrefixes 隐藏 `.meta` 与
+// `.config`（隐藏 ≠ 不同步）。
 // ---------------------------------------------------------------------------
 
 let remote: BackendInstance;
@@ -86,15 +90,21 @@ async function exists(fs: any, path: string): Promise<boolean> {
 }
 
 describe('data group sync isolation', () => {
-  it('never pushes or pulls config-only paths (.meta / nodes / shared)', async () => {
+  it('hides metadata from the data-group fs and never pushes config-only paths', async () => {
     const repo = await createConfigRepo('isolation-app', { nodeId: 'test-node' });
     const group = await repo.createAppDataGroup('isolation-group', [
       { id: 'audit-1', type: 'AuditBackend', options: { label: 'shared-remote' } },
     ]);
 
-    // 模拟数据组本地树里混入了配置同步组的内容
-    await group.fs.promises.mkdir('/.meta', { recursive: true });
-    await group.fs.promises.writeFile('/.meta/config-marker.txt', 'config');
+    // `.meta/` 与 `.config/` 属于视图隐藏区域：应用不得直接读写
+    await expect(
+      group.fs.promises.writeFile('/.meta/config-marker.txt', 'config'),
+    ).rejects.toThrow();
+    await expect(
+      group.fs.promises.writeFile('/.config/config-marker.txt', 'config'),
+    ).rejects.toThrow();
+
+    // 配置专属（未隐藏但被 filter 排除）：可以写，但不会同步到数据组远端
     await group.fs.promises.mkdir('/nodes', { recursive: true });
     await group.fs.promises.writeFile('/nodes/n1.txt', 'node');
     await group.fs.promises.mkdir('/shared', { recursive: true });
@@ -109,6 +119,7 @@ describe('data group sync isolation', () => {
     expect(await exists(remote, '/struct/data.txt')).toBe(true);
     // 配置内容一个都不许出现在数据组远端
     expect(await exists(remote, '/.meta/config-marker.txt')).toBe(false);
+    expect(await exists(remote, '/.config/config-marker.txt')).toBe(false);
     expect(await exists(remote, '/nodes/n1.txt')).toBe(false);
     expect(await exists(remote, '/shared/s1.txt')).toBe(false);
 
@@ -121,9 +132,9 @@ describe('data group sync isolation', () => {
       { id: 'audit-2', type: 'AuditBackend', options: { label: 'shared-remote' } },
     ]);
 
-    // 远端根目录上放着配置同步组的内容
-    if (!(await remote.exists('/.meta'))) await remote.mkdir('/.meta');
-    await remote.writeFile('/.meta/config-marker.txt', 'config-from-remote');
+    // 远端根目录上放着配置同步组的专属内容
+    if (!(await remote.exists('/.config'))) await remote.mkdir('/.config');
+    await remote.writeFile('/.config/config-marker.txt', 'config-from-remote');
     if (!(await remote.exists('/struct'))) await remote.mkdir('/struct');
     await remote.writeFile('/struct/remote-data.txt', 'remote-data');
 
@@ -131,8 +142,8 @@ describe('data group sync isolation', () => {
 
     // 正常数据可被拉取
     expect(await exists(group.fs, '/struct/remote-data.txt')).toBe(true);
-    // 配置内容不得进入数据组
-    expect(await exists(group.fs, '/.meta/config-marker.txt')).toBe(false);
+    // 配置专属内容不进入数据组视图
+    expect(await exists(group.fs, '/.config/config-marker.txt')).toBe(false);
 
     await repo.dispose();
   });

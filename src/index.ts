@@ -39,6 +39,25 @@ export type { PurgeKeepOptions, KeepPurgeResult } from './keep-cleanup';
 export { migrateVersionSidecars } from './version-migration';
 export type { MigrateLocalFS, MigrateReplicaFS, VersionMigrationOptions, VersionMigrationResult } from './version-migration';
 
+// Unified sync-group metadata layout (`.meta/`, `.config/`)
+export {
+  META_DIR,
+  GROUP_DESCRIPTOR_FILE,
+  TOMBSTONES_DIR,
+  LEGACY_TOMBSTONES_DIR,
+  VERSIONS_DIR,
+  CONFLICTS_DIR,
+  LEGACY_CONFLICTS_DIR,
+  CONFIG_DIR,
+  DATA_GROUP_DEFAULT_FEATURES,
+  readGroupDescriptor,
+  writeGroupDescriptor,
+  encodeMetaPath,
+  TombstoneStore,
+  VersionStore,
+  ConflictStore,
+} from './group-meta';
+
 // All types
 export type {
   BackendDescriptor,
@@ -52,6 +71,11 @@ export type {
   ConfigRepoOptions,
   IConfigRepo,
   SyncGroupType,
+  SyncGroupKind,
+  SyncGroupFeatures,
+  SyncGroupHandle,
+  ConfigSyncGroupHandle,
+  GroupDescriptor,
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
