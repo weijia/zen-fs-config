@@ -135,6 +135,28 @@ async function collectFilesUnder(fs: TreeFS, dir: string, out: string[] = []): P
   return out;
 }
 
+/**
+ * Collect every directory path under `dir` (absolute, recursively), including
+ * `dir` itself. Used to record `.keep` tombstones when deleting a tree: Git /
+ * RemoteStorage keep otherwise-empty directories alive with an internal
+ * `.keep` placeholder that never reaches the local primary, so it needs an
+ * explicit tombstone to be removed from replicas.
+ */
+async function collectDirectoriesUnder(fs: TreeFS, dir: string, out: string[] = []): Promise<string[]> {
+  out.push(dir);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return out; // Already gone — nothing else to record
+  }
+  for (const entry of entries) {
+    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
+    if (await isDirectoryPath(fs, child)) await collectDirectoriesUnder(fs, child, out);
+  }
+  return out;
+}
+
 /** Remove a directory tree bottom-up; contained files must be gone already. */
 async function removeDirectoryTree(fs: TreeFS, dir: string): Promise<void> {
   let entries: string[];
@@ -596,6 +618,27 @@ export class ConfigRepo implements IConfigRepo {
   // -----------------------------------------------------------------------
 
   /**
+   * Write the tombstone record for `filePath` (new `.meta/tombstones` + legacy
+   * mirror for one release cycle). Records only metadata — it never creates
+   * the deleted file locally.
+   */
+  private async writeTombstoneFor(filePath: string): Promise<void> {
+    const normalizedPath = filePath.startsWith('/') ? filePath : '/' + filePath;
+    const tombstone: TombstoneMeta = {
+      path: normalizedPath,
+      deletedAt: Date.now(),
+      deletedBy: this.primaryBackendId,
+      confirmedBy: [this.primaryBackendId],
+    };
+    const tombstoneBytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+      const tombstonePath = tombstonePathFor(normalizedPath, dir);
+      await this.ensureDir(tombstonePath);
+      await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
+    }
+  }
+
+  /**
    * Delete a file and write a tombstone so the deletion propagates
    * to all backends instead of being treated as "missing file → re-create".
    */
@@ -610,6 +653,13 @@ export class ConfigRepo implements IConfigRepo {
     if (await isDirectoryPath(this.cachedFS, normalizedPath)) {
       const files = await collectFilesUnder(this.cachedFS, normalizedPath);
       for (const file of files) await this.deleteFile(file);
+      // Backends that cannot store empty directories keep them alive with an
+      // internal `.keep` placeholder, which readdir()/createSnapshot() hide and
+      // the local primary does not carry. Without an explicit tombstone it
+      // survives the delete and the directory reappears on the next pull.
+      for (const dir of await collectDirectoriesUnder(this.cachedFS, normalizedPath)) {
+        await this.writeTombstoneFor(dir === '/' ? '/.keep' : `${dir}/.keep`);
+      }
       await removeDirectoryTree(this.cachedFS, normalizedPath);
       this.invalidateTombstoneCache();
       this.schedulePostDeleteSync();
@@ -618,18 +668,7 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     // 1. Write tombstone (new `.meta/tombstones` + legacy mirror for one cycle)
-    const tombstone: TombstoneMeta = {
-      path: normalizedPath,
-      deletedAt: Date.now(),
-      deletedBy: this.primaryBackendId,
-      confirmedBy: [this.primaryBackendId],
-    };
-    const tombstoneBytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
-    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-      const tombstonePath = tombstonePathFor(normalizedPath, dir);
-      await this.ensureDir(tombstonePath);
-      await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
-    }
+    await this.writeTombstoneFor(normalizedPath);
 
     // 2. Delete the actual file on primary
     try {
@@ -2817,6 +2856,16 @@ class AppDataGroupImpl implements AppDataGroup {
     }
   }
 
+  /** Write a tombstone for `filePath`. Records metadata only — it never creates the file. */
+  private async writeTombstoneFor(filePath: string): Promise<void> {
+    await this.tombstones.write({
+      path: filePath.startsWith('/') ? filePath : `/${filePath}`,
+      deletedAt: Date.now(),
+      deletedBy: this.localBackendId,
+      confirmedBy: [this.localBackendId],
+    });
+  }
+
   /**
    * Delete a data file with a tombstone in `.meta/tombstones/`.
    * The tombstone is synced (`.meta/` is no longer excluded), so the deletion
@@ -2838,19 +2887,20 @@ class AppDataGroupImpl implements AppDataGroup {
     if (await isDirectoryPath(this.localFS, normalized)) {
       const files = await collectFilesUnder(this.localFS, normalized);
       for (const file of files) await this.deleteFile(file);
+      // Hidden `.keep` placeholders keep otherwise-empty directories alive on
+      // Git/RemoteStorage but never reach the local primary; tombstone them
+      // explicitly so a directory whose remote copy only has `.keep` cannot
+      // reappear on the next pull.
+      for (const dir of await collectDirectoriesUnder(this.localFS, normalized)) {
+        await this.writeTombstoneFor(dir === '/' ? '/.keep' : `${dir}/.keep`);
+      }
       await removeDirectoryTree(this.localFS, normalized);
       this.schedulePostDeleteSync();
       log.log(`[AppDataGroup:${this.groupId}] deleteFile(directory): ${normalized} (${files.length} file(s))`);
       return;
     }
 
-    const tombstone: TombstoneMeta = {
-      path: normalized,
-      deletedAt: Date.now(),
-      deletedBy: this.localBackendId,
-      confirmedBy: [this.localBackendId],
-    };
-    await this.tombstones.write(tombstone);
+    await this.writeTombstoneFor(normalized);
 
     try {
       await this.localFS.unlink(normalized);

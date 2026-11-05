@@ -102,6 +102,42 @@ describe('directory deletion', () => {
       expect(tombstone.path).toBe(file);
     }
 
+    // Every deleted directory gets a `.keep` tombstone so a hidden placeholder
+    // left on a Git backend cannot resurrect the (now empty) directory.
+    for (const dir of [`/${appId}/dir`, `/${appId}/dir/sub`]) {
+      expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
+    }
+
+    await repo.dispose();
+  });
+
+  it('config-sync group: deleting a directory that only has a remote .keep records a tombstone', async () => {
+    const appId = 'dir-del-keep';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-keep' });
+    await repo.addBackend('remote-keep', 'DirRemote', { label: 'dir-del-keep' });
+    const replica = (repo as any).replicaBackends.get('remote-keep').instance;
+
+    // Local primary has an empty directory (no `.keep` — it is a backend
+    // internal, hidden from readdir/snapshots), while the replica still holds
+    // the placeholder left by an older eager-mkdir build.
+    await mkdirp(repo.rootFS, `/${appId}/only-keep`);
+    try { await replica.mkdir(`/${appId}`); } catch { /* already exists */ }
+    try { await replica.mkdir(`/${appId}/only-keep`); } catch { /* already exists */ }
+    await replica.writeFile(`/${appId}/only-keep/.keep`, '\n');
+    expect(await exists(replica, `/${appId}/only-keep/.keep`)).toBe(true);
+
+    await repo.deleteFile(`/${appId}/only-keep`);
+
+    expect(await exists(repo.rootFS, `/${appId}/only-keep`)).toBe(false);
+    expect(
+      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/only-keep/.keep`)),
+    ).toBe(true);
+
+    // Processing the tombstone removes the remote placeholder, so the
+    // directory cannot be pulled back into existence.
+    await (repo as any).processTombstonesPublic();
+    expect(await exists(replica, `/${appId}/only-keep/.keep`)).toBe(false);
+
     await repo.dispose();
   });
 
@@ -139,6 +175,9 @@ describe('directory deletion', () => {
     for (const file of ['/unlinked/sub/a.txt', '/unlinked/b.txt']) {
       expect(await exists(localFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
       expect(await exists(localFS, tombstonePath('/.meta/.deleted', file))).toBe(true);
+    }
+    for (const dir of ['/unlinked', '/unlinked/sub']) {
+      expect(await exists(localFS, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
     }
 
     // `fs.rmdir` goes through the same tombstone-aware path.
