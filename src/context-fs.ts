@@ -36,6 +36,13 @@ export interface ChrootOptions {
    * tombstone-aware deletion). The hook is responsible for removing the file.
    */
   onUnlink?: (path: string) => Promise<void>;
+  /**
+   * When provided, `rmdir` delegates entirely to this hook (used for
+   * tombstone-aware directory deletion). The hook is responsible for removing
+   * the directory tree. Falls back to `onUnlink` when omitted, so a single
+   * tombstone-aware delete implementation can cover both files and dirs.
+   */
+  onRmdir?: (path: string) => Promise<void>;
 }
 
 /**
@@ -148,7 +155,13 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     },
 
     async rmdir(path: string): Promise<void> {
-      return inner.rmdir?.(visible(path));
+      const target = visible(path);
+      // A tombstone-aware view deletes the whole tree (per-file tombstones),
+      // otherwise falling back to the plain inner rmdir would bypass deletion
+      // bookkeeping and let replicas resurrect the children.
+      const hook = options.onRmdir ?? options.onUnlink;
+      if (hook) return hook(target);
+      return inner.rmdir?.(target);
     },
 
     async rename(oldPath: string, newPath: string): Promise<void> {

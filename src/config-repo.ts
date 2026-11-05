@@ -97,6 +97,63 @@ const CONFIG_GROUP_FEATURES: SyncGroupFeatures = {
   appData: false,
 };
 
+// ---------------------------------------------------------------------------
+// Directory deletion helpers
+// ---------------------------------------------------------------------------
+
+/** Minimal FS surface needed to walk a directory tree. */
+type TreeFS = {
+  readdir(path: string): Promise<string[]>;
+  stat(path: string): Promise<{ mode?: number }>;
+  rmdir?(path: string): Promise<void>;
+};
+
+function isDirectoryMode(mode?: number): boolean {
+  return typeof mode === 'number' && (mode & 0o40000) === 0o40000;
+}
+
+async function isDirectoryPath(fs: TreeFS, absolutePath: string): Promise<boolean> {
+  try {
+    const st = await fs.stat(absolutePath);
+    return isDirectoryMode(st?.mode);
+  } catch {
+    return false;
+  }
+}
+
+/** Collect every file path under `dir` (absolute, recursively). */
+async function collectFilesUnder(fs: TreeFS, dir: string, out: string[] = []): Promise<string[]> {
+  const entries = await fs.readdir(dir);
+  for (const entry of entries) {
+    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
+    if (await isDirectoryPath(fs, child)) {
+      await collectFilesUnder(fs, child, out);
+    } else {
+      out.push(child);
+    }
+  }
+  return out;
+}
+
+/** Remove a directory tree bottom-up; contained files must be gone already. */
+async function removeDirectoryTree(fs: TreeFS, dir: string): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return; // Already gone
+  }
+  for (const entry of entries) {
+    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
+    if (await isDirectoryPath(fs, child)) await removeDirectoryTree(fs, child);
+  }
+  try {
+    await fs.rmdir?.(dir);
+  } catch {
+    /* best effort — a leftover empty dir is harmless */
+  }
+}
+
 /**
  * Validate and normalize a group display name. Ids are never edited, so this
  * only guards the human-readable label.
@@ -326,7 +383,12 @@ export class ConfigRepo implements IConfigRepo {
     this.cacheOptions = cacheOptions;
 
     this.fullFS = backendToSyncableFS(cachedFS, primaryBackendId);
-    this.fs = createChrootFS(cachedFS, `/${appId}`);
+    // Deletes through the app-facing fs are tombstone-aware (files and dirs),
+    // so `repo.fs.promises.unlink/rmdir` never silently resurrects data.
+    this.fs = createChrootFS(cachedFS, `/${appId}`, {
+      onUnlink: (path) => this.deleteFile(path),
+      onRmdir: (path) => this.deleteFile(path),
+    });
     // rootFS = no chroot, so admin UI can browse /.meta/, /shared/, /nodes/, etc.
     this.rootFS = createChrootFS(cachedFS, '/');
   }
@@ -540,6 +602,20 @@ export class ConfigRepo implements IConfigRepo {
   async deleteFile(path: string): Promise<void> {
     this.assertNotDisposed();
     const normalizedPath = path.startsWith('/') ? path : '/' + path;
+
+    // Directories are deleted as a tree: one tombstone per contained file.
+    // The sync layer works file-by-file, so a directory-path tombstone alone
+    // would be a no-op on backends without directory entries and the children
+    // would be resurrected on the next pull.
+    if (await isDirectoryPath(this.cachedFS, normalizedPath)) {
+      const files = await collectFilesUnder(this.cachedFS, normalizedPath);
+      for (const file of files) await this.deleteFile(file);
+      await removeDirectoryTree(this.cachedFS, normalizedPath);
+      this.invalidateTombstoneCache();
+      this.schedulePostDeleteSync();
+      log.log(`[ConfigRepo] deleteFile(directory): ${normalizedPath} (${files.length} file(s))`);
+      return;
+    }
 
     // 1. Write tombstone (new `.meta/tombstones` + legacy mirror for one cycle)
     const tombstone: TombstoneMeta = {
@@ -2596,6 +2672,7 @@ class AppDataGroupImpl implements AppDataGroup {
       hiddenPrefixes: [META_DIR, CONFIG_DIR],
       onWrite: (path, data) => this.recordVersion(path, data),
       onUnlink: (path) => this.deleteFile(path),
+      onRmdir: (path) => this.deleteFile(path),
     });
 
     // Deduplicate backends pointing to the same endpoint — keep the oldest.
@@ -2748,8 +2825,23 @@ class AppDataGroupImpl implements AppDataGroup {
   async deleteFile(path: string): Promise<void> {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
     const normalized = path.startsWith('/') ? path : `/${path}`;
-    if (normalized.startsWith(`${META_DIR}/`) || normalized.startsWith(`${CONFIG_DIR}/`)) {
+    if (
+      normalized === META_DIR ||
+      normalized === CONFIG_DIR ||
+      normalized.startsWith(`${META_DIR}/`) ||
+      normalized.startsWith(`${CONFIG_DIR}/`)
+    ) {
       throw new Error(`Cannot delete metadata path "${normalized}"`);
+    }
+
+    // Directory: tombstone every contained file, then drop the empty tree.
+    if (await isDirectoryPath(this.localFS, normalized)) {
+      const files = await collectFilesUnder(this.localFS, normalized);
+      for (const file of files) await this.deleteFile(file);
+      await removeDirectoryTree(this.localFS, normalized);
+      this.schedulePostDeleteSync();
+      log.log(`[AppDataGroup:${this.groupId}] deleteFile(directory): ${normalized} (${files.length} file(s))`);
+      return;
     }
 
     const tombstone: TombstoneMeta = {
