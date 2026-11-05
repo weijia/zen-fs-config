@@ -47,11 +47,11 @@
 
 | 术语 | 含义 |
 |---|---|
-| 通用同步组（Generic Sync Group） | 同步组的抽象基类：承载本地主后端、远端副本集合与双向同步引擎；`type` 标记类型。版本化 sidecar / 墓碑 / 冲突归档为**基类通用能力，两种类型均开启**；两种类型的唯一区别是配置同步组额外承载 `.meta/app-data-groups/` 纳管层 |
+| 通用同步组（Generic Sync Group） | 同步组的抽象：**本地主存储 + 若干远端副本 + 通用 `.meta/` + 该组自己的后端定义**。配置组与数据组是同一基座上的两个**能力位**（`configHost` / `appData`），互不蕴含；墓碑为两组通用能力，版本 sidecar / 冲突归档可配置开启 |
 | 同步组类型（group type） | 组自身的 `type` 字段：`config-sync` / `data-sync` |
-| 配置同步组（Config Sync Group） | 通用同步组子类：具备版本 sidecar、墓碑、冲突归档（与 data-sync 同为基类通用能力），并**额外承载** `.meta/app-data-groups/`（数据同步组的配置）|
-| 数据同步组（Data Sync Group） | 通用同步组子类：与配置同步组能力完全一致（同样开启版本 sidecar / 墓碑 / 冲突），**唯一区别是不承载** `.meta/app-data-groups/` 纳管层；**一律由配置同步组以 `app-data-groups` 纳管创建（不提供独立顶层入口）** |
-| 应用数据组（App Data Group） | 配置同步组下登记的某数据同步组的配置项（存于 `.meta/app-data-groups/{appId}/{id}.json`）|
+| 配置同步组（Config Sync Group） | `configHost=true`：可承载 `.config/`（数据组登记、引导副本、`group-type`），pair 同步整棵 `/`；本身不是 `appData` |
+| 数据同步组（Data Sync Group） | `appData=true`：可被登记为数据组，pair 排除 `/.config`、`/nodes`、`/shared`；**自身后端拓扑的权威在 `.meta/backends/`**；**一律由配置同步组以 `app-data-groups` 纳管创建（不提供独立顶层入口）** |
+| 应用数据组（App Data Group） | 配置同步组下登记项（引导副本存于 `.config/app-data-groups/{appId}/{id}.json`，旧镜像 `.meta/`）；权威拓扑在数据组自己的 `.meta/backends/{id}.json` |
 | 本地主后端（Primary） | config-sync 固定 IndexedDB；data-sync 由 `resolveLocalPrimary`（浏览器 IndexedDB / Node 设 `folderPath` 或 `ZEN_FS_CONFIG_HOME` → Folder，否则 InMemory）|
 | 副本（Replica） | 用户接入的远端后端，与本地主后端双向同步 |
 | 自描述拓扑 | 后端连接信息存于 `.meta/backends/*.json`，可被任意节点读取重建 |
@@ -66,7 +66,7 @@
 
 ### FR0 — 通用同步组（Generic Sync Group，基类）
 
-- FR0.1：提供本地主后端 + 一组远端副本 + 双向同步引擎（zen-fs-sync）的抽象；版本 sidecar / 墓碑 / 冲突归档为**基类通用能力，两种类型均开启**；两种类型的唯一区别是配置同步组额外承载 `.meta/app-data-groups/` 纳管层。
+- FR0.1：提供本地主后端 + 一组远端副本 + 双向同步引擎（zen-fs-sync）的抽象；墓碑为两组通用能力（默认开启），版本 sidecar / 冲突归档可配置开启；配置组与数据组的差别是两个独立能力位 `configHost` / `appData`，不是包含关系（§9 D2-C）。
 - FR0.2：提供通用后端管理：`addBackend/removeBackend`、`getBackends`、`flush`、`getSyncStatuses`、`dispose`；`type` 字段标记组类型供 `connect` 路由。
 
 ### FR1 — 配置同步组（config-sync，继承 FR0）
@@ -83,11 +83,11 @@
 
 ### FR2 — 数据同步组（data-sync，继承 FR0，一律由配置同步组纳管）
 
-- FR2.1：**数据同步组不提供独立顶层入口**；一律经由配置同步组的 `createAppDataGroup(appId, id, options?)` 创建并登记到 `.meta/app-data-groups/{appId}/{id}.json`，由配置同步组统一纳管其存在、拓扑与账户复用（决策 A）。本地主后端经 `resolveLocalPrimary`（浏览器 IndexedDB / Node `Folder` / 否则 InMemory），与 config-sync 一致。
+- FR2.1：**数据同步组不提供独立顶层入口**；一律经由配置同步组的 `createAppDataGroup(appId, id, options?)` 创建并登记到 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json` 双写），由配置同步组统一纳管其存在与账户复用（决策 A）。本地主后端经 `resolveLocalPrimary`（浏览器 IndexedDB / Node `Folder` / 否则 InMemory），与 config-sync 一致；非 default 组按 groupId 隔离（Node `data/{appId}/{groupId}`、浏览器 `zen-fs-config-data-{appId}-{groupId}`），default 组沿用旧路径。
 - FR2.2：提供 `fs`（标准 node:fs API，chroot 到组根），供直接读写数据文件。
-- FR2.3：提供 `addBackend/removeBackend`、`listBackends`、`flush`、`getSyncStatuses`、`dispose`；接入后端时其配置（id/type/options/accountBackendId）**回写**到配置同步组的 `.meta/app-data-groups/{appId}/{id}.json`，作为权威配置源。
-- FR2.4：作为配置同步组下挂的"应用数据组"被纳管（从 `.meta/app-data-groups/{appId}/{id}.json` 实例化）；不再支持脱离配置同步组的独立创建。
-- FR2.5：结构简单（仅 `.meta/backends/` + 数据文件），能力与 config-sync 一致（同样具备版本 sidecar / 墓碑 / 冲突）；与 config-sync 的唯一区别是不承载 `.meta/app-data-groups/` 纳管层。
+- FR2.3：提供 `addBackend/removeBackend`、`listBackends`、`listDeclaredBackends`、`flush`、`getSyncStatuses`、`dispose`；后端拓扑**以数据组自己的 `.meta/backends/{id}.json` 为权威**（随数据组同步，任何设备连上任一数据后端即可自描述）；配置同步组的 `.config/app-data-groups/{appId}/{id}.json` 只作为**引导副本**回刷（投影字节相同则不写），不再宣称是权威配置源。
+- FR2.4：作为配置同步组下挂的"应用数据组"被纳管（从 `.config/app-data-groups/{appId}/{id}.json` 的引导副本实例化；本地 `.meta/backends/` 缺失时才回填），不再支持脱离配置同步组的独立创建。
+- FR2.5：结构（`.meta/group.json` + `.meta/backends/` + `.meta/tombstones|versions|conflicts` + 数据文件），能力与 config-sync 一致；与 config-sync 的区别是**能力位**而非包含关系：数据组 `appData=true`（可被登记、同步排除 `/.config`、`/nodes`、`/shared`），配置组 `configHost=true`（可承载 `.config`、整棵 `/` 参与同步）。
 
 **验收**：经配置同步组 `createAppDataGroup` 创建的数据组，其所有后端双向同步；无独立顶层入口可绕过配置同步组创建数据组。
 
@@ -119,7 +119,7 @@
 
 ### FR5 — 后端拓扑自描述与去重
 
-- FR5.1：每个后端存为 `.meta/backends/{id}.json`（原子增删，不重写整份拓扑）。
+- FR5.1：每个后端存为独立文件（原子增删，不重写整份拓扑）：配置组 `.config/backends/{id}.json`（旧镜像 `.meta/backends/{id}.json` 双写）；数据组 **`.meta/backends/{id}.json` 为权威定义**，随数据组同步。后端 id 会变成文件名，写入前必须校验（禁止 `/`、`\`、`..`）。
 - FR5.2（config-sync）：`addBackend` 必须按 **`type + options`（稳定 key，递归排序字段顺序）** 去重 —— 相同配置不同 id 应拒绝并提示复用已有 id；`readAllBackendDescriptors` 在读取时也应删除重复（保留最早 mtime）。
 - FR5.3（data-sync 组）：**当前仅按 `id` 去重**，不按参数去重（已知缺口，见 §8）。
 
@@ -198,10 +198,15 @@
 **D2 待定项（现状：A/B/C 已决策，D/E 已由实现落定，无未决项）：**
 
 - **A. 独立 data-sync 是否保留【已决策：废除独立入口】**：数据同步组一律经配置同步组的 `app-data-groups` 纳管创建（见 FR2.1），独立顶层入口（自带 `.meta/backends`、完全脱离 config-sync）**废除**。由此 §8 #4（独立 data-sync "只传 appId 重开"缺口）随之消失——数据组由 config-sync 启动恢复，不再有独立重开路径。代码落地见 §10 T5。
-- **B. `.meta/app-data-groups/{appId}/{id}.json` schema【已决策】**：配置同步组在该路径存**完整数据同步组描述符**（`{ id, groupType: "data-sync", backends: [{ id, type, options, accountBackendId? }] }`），含数据组自身后端列表；`accountBackendId` 指回 config-sync 账户后端以复用凭证。路径按 `{appId}` 分区，支持多 app 共存。
-- **C. 基类可选能力开关【已决策】**：版本化 sidecar / 墓碑 / 冲突归档为**两种类型通用能力，默认均开启**；两种同步组的唯一区别是配置同步组额外承载 `.meta/app-data-groups/` 纳管层。data-sync 同样具备墓碑，保证其多副本间删除传播（避免 `fs.unlink` 被重同步拉回）。
-- **D. 实例化连接是否独立【已决策：独立连接（由实现落定）】**：数据同步组从 `app-data-groups` 实例化时（`AppDataGroupImpl`，`config-repo.ts`），**独立建立自己的远端连接**——每个数据后端经 `createBackend()` 新建实例，并拥有独立的 `ZenFSSync` 引擎与本地主后端；`createBackend` 为无状态工厂（无连接池），传入的 `ConfigRepo` 父引用仅用于把拓扑回写 `.meta/app-data-groups`（FR2.3），**不共享 config-sync 已建连接实例**。仅凭证经 `accountBackendId` / `mergeAccountFields` 复用（凭证复用，非连接复用）。连接池化/复用可作为未来可选优化，但当前结构已确定为独立连接。
-- **E. 本地主后端是否各自独立【已决策：各自独立（由实现落定）】**：`resolveLocalPrimary(appId, kind)` 以 `kind`（`'config'` / `'data'`）区分存储——浏览器为不同 IndexedDB 库（`zen-fs-config-config-{appId}` vs `zen-fs-config-data-{appId}`），Node 为不同 Folder 路径（`base/config/{appId}` vs `base/data/{appId}`）。config 与 data 各自独立的本地主后端，与"离线隔离、各自重开"一致；统一到单一本地库暂不做。
+- **B. 数据组描述符 schema 与权威归属【已决策（0.6.0 修订）】**：配置同步组在 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json`）保存数据同步组的**引导副本**：`{ id, groupType: "data-sync", name?, features?, backends: [{ id, type, options, description?, createdAt?, accountBackendId? }] }`。`backends` 字段**长期保留、不删除**，用于「新设备只有配置组凭据」的引导，以及数据组本地还没有 `.meta/backends/` 时的懒迁移回填。
+  - **权威定义在数据组自己的 `.meta/backends/{id}.json`**：任何设备连上任意一个数据后端都能自描述完整拓扑；配置组描述符只是副本，回刷时按规范化字节比较，相同则不写。
+  - **冲突规则**：同一 backend id 同时存在「数据组墓碑」和「描述符条目」时，**墓碑优先**（防止删除被复活）。
+  - **凭据**：`accountBackendId` 仍指回 config-sync 账户后端以复用凭证；无配置组的独立模式直接把凭据内联进数据组 `.meta/backends/{id}.json`（不做脱敏、不引入本地-only 密钥目录）。
+  - 路径按 `{appId}` 分区，支持多 app 共存。
+- **C. 能力位与功能开关【已决策】**：墓碑为两组**默认开启**（删除传播的正确性依赖它）；版本 sidecar / 冲突归档是**具备能力、可配置开启**：配置组恒开，数据组默认关闭（`features.versions = false`，写入放大，见 SYNC-GROUP-UNIFICATION §4.6）。配置组与数据组的差别是**两个独立能力位**：`configHost`（可承载 `.config`，整棵 `/` 参与同步）与 `appData`（可被登记为数据组，同步排除 `/.config`、`/nodes`、`/shared`）；二者互不蕴含，不存在「配置组 ⊃ 数据组」。
+- **D. 实例化连接是否独立【已决策：独立连接（由实现落定）】**：数据同步组从引导副本实例化时（`AppDataGroupImpl`，`config-repo.ts`），**独立建立自己的远端连接**——每个数据后端经 `createBackend()` 新建实例，并拥有独立的 `ZenFSSync` 引擎与本地主后端；`createBackend` 为无状态工厂（无连接池），传入的 `ConfigRepo` 父引用仅用于把拓扑回刷 `.config/app-data-groups`（FR2.3），**不共享 config-sync 已建连接实例**。仅凭证经 `accountBackendId` / `mergeAccountFields` 复用（凭证复用，非连接复用）。连接池化/复用可作为未来可选优化，但当前结构已确定为独立连接。
+- **E. 本地主后端是否各自独立【已决策：各自独立（由实现落定）】**：`resolveLocalPrimary(appId, kind, { groupId })` 区分存储——浏览器为不同 IndexedDB 库（`zen-fs-config-config-{appId}` vs `zen-fs-config-data-{appId}`，非 default 数据组再加 `-{groupId}` 后缀），Node 为不同 Folder 路径（`base/config/{appId}` vs `base/data/{appId}`，非 default 数据组为 `base/data/{appId}/{groupId}`；default 组沿用旧路径，不搬文件）。config 与 data 各自独立的本地主后端，与"离线隔离、各自重开"一致；统一到单一本地库暂不做。
+- **F. 时间戳 / 版本号是否进入同步内容【已决策：一律不进】**：`updatedAt` 停止写入（`GroupDescriptor.updatedAt` 标 `@deprecated`，`schemaVersion: 2` 起不写、读侧忽略）；`syncedAt` / `lastSyncAt` / `lastError` 只放本地状态或运行时内存；不持久化 `backendsRevision` / 任何递增计数器 / 内容哈希。「是否需要写」用**规范化投影字节比较**（`serialize(parse(bytes)) === bytes`），保证「没变就不写」，避免「写 → 内容变 → 触发同步 → 对端再写」的回环。`createdAt` 保留原值、不参与判定、合并取 `min`。
 
 > 已完成 / 已决策（已移出本清单）：
 > - `connect()` 文档此前缺失 → 已在 README 补充（"Unified entry point: connect()"）。

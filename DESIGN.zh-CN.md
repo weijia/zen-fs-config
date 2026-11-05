@@ -2,7 +2,7 @@
 
 本文档描述 zen-fs-config 的初始化流程、同步引擎内部机制、墓碑删除传播、后端去重等核心逻辑。
 
-> **架构方向（REQUIREMENTS §9 D2）**：核心采用**通用同步组（GenericSyncGroup）基类 + 两种类型实现**——`config-sync`（版本化/墓碑/冲突，并承载 `.meta/app-data-groups/`）与 `data-sync`（纯文件同步，可经配置同步组以 app-data-groups 纳管）；**后端类型管理与数据后端信息写入仍留在核心 `zen-fs-config`（UI 仅做呈现）**。本文档描述的是**当前实现（两类 repo）**，目标架构以 D2 为准。
+> **架构方向（REQUIREMENTS §9 D2）**：核心采用**通用同步组（GenericSyncGroup）+ 能力位（`configHost` / `appData`）**——`config-sync`（`configHost`，承载 `.config/`：数据组登记、引导副本、`group-type`）与 `data-sync`（`appData`，纯文件同步、可经配置同步组纳管）；两者不是包含关系；**后端类型管理与数据后端信息写入仍留在核心 `zen-fs-config`（UI 仅做呈现）**。本文档描述的是**当前实现（两类 repo）**，目标架构以 D2 为准。
 
 ---
 
@@ -227,7 +227,9 @@ watch() 触发：
 
 ### 1.8 独立 Data-Sync 入口 — 已移除
 
-独立 data-sync 入口已从公开 API **移除**（决策 A / T5）。数据组一律经 `ConfigRepo.createAppDataGroup` 创建，且始终归属某个配置同步组，其 `.meta/app-data-groups/{appId}/{id}.json` 是数据组后端拓扑的权威来源。
+独立 data-sync 入口已从公开 API **移除**（决策 A / T5）。数据组一律经 `ConfigRepo.createAppDataGroup` 创建，且始终归属某个配置同步组。
+
+**权威归属（0.6.0）**：数据组自己的 `.meta/backends/{id}.json` 是后端拓扑的**权威定义**（随数据组同步，任何设备连上任一数据后端即可自描述）；配置同步组的 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json`）降级为**引导副本**，只用于「新设备只有配置组凭据」和「数据组本地还没有 `.meta/backends/`」时的懒迁移回填，回刷时按规范化字节比较、相同则不写。同一 backend id 上「数据组墓碑 vs 描述符条目」冲突时**墓碑优先**。
 
 ### 1.9 统一入口（`connect`）
 

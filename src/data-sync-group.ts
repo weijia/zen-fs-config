@@ -232,6 +232,14 @@ export class DataSyncGroup implements AppDataGroup {
     return Array.from(this.dataBackends.values()).map(b => b.desc);
   }
 
+  /**
+   * 旧版独立数据组没有 `.meta/backends/` 权威副本，声明列表等同已连接视图。
+   * @deprecated 新代码请使用 `ConfigRepo.createAppDataGroup()`。
+   */
+  listDeclaredBackends(): BackendDescriptor[] {
+    return this.listBackends();
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;

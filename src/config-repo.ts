@@ -47,15 +47,26 @@ import {
   LEGACY_CONFLICTS_DIR,
   TOMBSTONES_DIR,
   LEGACY_TOMBSTONES_DIR,
+  META_BACKENDS_DIR,
   encodeMetaPath,
   ensureParentDir,
   readGroupDescriptor,
   writeGroupDescriptor,
+  readBackendMetaDescriptors,
+  writeBackendMetaDescriptor,
+  removeBackendMetaDescriptor,
+  backendMetaFilePath,
+  assertValidBackendId,
   DATA_GROUP_DEFAULT_FEATURES,
   TombstoneStore,
   VersionStore,
   ConflictStore,
 } from './group-meta';
+import {
+  mergeDescriptorCreatedAt,
+  serializeAppDataGroupDescriptor,
+  serializeBackendDescriptor,
+} from './canonical-json';
 import type {
   VersionMeta,
   SyncGroupFeatures,
@@ -74,7 +85,7 @@ const GROUP_TYPE_FILE = `${CONFIG_DIR}/group-type`;
 const LEGACY_GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 const BACKENDS_FILE = `${META_DIR}/backends.json`; // Legacy single-file format (pre-0.4.0)
 const BACKENDS_DIR = `${CONFIG_DIR}/backends`;
-const LEGACY_BACKENDS_DIR = `${META_DIR}/backends`;
+const LEGACY_BACKENDS_DIR = META_BACKENDS_DIR;
 const APP_DATA_GROUPS_DIR = `${CONFIG_DIR}/app-data-groups`;
 const LEGACY_APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`;
 // Display metadata (name) for the config-sync group itself. Separate file so
@@ -1165,6 +1176,11 @@ export class ConfigRepo implements IConfigRepo {
     return [...this.backendDescriptorCache];
   }
 
+  /** 配置组的权威后端列表（`.config/backends/`），与 `listBackends()` 相同。 */
+  listDeclaredBackends(): AppDataBackendDescriptor[] {
+    return this.listBackends();
+  }
+
   /** Update the config-sync group's display name only. */
   async rename(name: string): Promise<void> {
     this.assertNotDisposed();
@@ -1644,6 +1660,16 @@ export class ConfigRepo implements IConfigRepo {
     }
   }
 
+  /** Read a text file; `null` when absent (used for byte-compare-then-write). */
+  private async readTextIfExists(path: string): Promise<string | null> {
+    try {
+      const raw = await this.cachedFS.readFile(path);
+      return new TextDecoder().decode(toUint8Array(raw));
+    } catch {
+      return null;
+    }
+  }
+
   // -----------------------------------------------------------------------
   // Internal — Individual Backend Descriptor Files
   // -----------------------------------------------------------------------
@@ -1811,11 +1837,17 @@ export class ConfigRepo implements IConfigRepo {
    * Write a single backend descriptor to `.config/backends/{id}.json`,
    * mirroring to the legacy `.meta/backends/{id}.json` for one release cycle
    * so older clients still see the backend.
+   *
+   * Both files use the canonical serializer and are only written when their
+   * bytes actually differ (no needless sync churn).
    */
   async writeBackendDescriptor(desc: BackendDescriptor): Promise<void> {
+    assertValidBackendId(desc.id);
     const author = `${this.appId}/${this.nodeId}`;
-    const bytes = new TextEncoder().encode(JSON.stringify(desc, null, 2));
+    const text = serializeBackendDescriptor(desc);
+    const bytes = new TextEncoder().encode(text);
     for (const path of [this.backendFilePath(desc.id), this.legacyBackendFilePath(desc.id)]) {
+      if ((await this.readTextIfExists(path)) === text) continue;
       await this.ensureDir(path);
       await this.cachedFS.writeFile(path, bytes);
       const version = await incrementVersion(this.fullFS, path, bytes, author);
@@ -2150,13 +2182,26 @@ export class ConfigRepo implements IConfigRepo {
     // Unified group descriptor (`.meta/group.json`) — written once, for both
     // kinds. Renames update it explicitly; launches must not rewrite it (that
     // would produce needless sync churn).
-    if (!(await readGroupDescriptor(this.cachedFS))) {
+    const existingDescriptor = await readGroupDescriptor(this.cachedFS);
+    if (!existingDescriptor) {
       await writeGroupDescriptor(this.cachedFS, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: 'config',
         id: CONFIG_GROUP_ID,
         ...(this.name ? { name: this.name } : {}),
         features: CONFIG_GROUP_FEATURES,
+      });
+    } else if (existingDescriptor.schemaVersion !== 2) {
+      // One-time upgrade of a legacy descriptor: drop the deprecated
+      // `updatedAt` and adopt schemaVersion 2. After this, byte-identical
+      // launches never write again.
+      const name = existingDescriptor.name ?? this.name;
+      await writeGroupDescriptor(this.cachedFS, {
+        schemaVersion: 2,
+        kind: 'config',
+        id: existingDescriptor.id ?? CONFIG_GROUP_ID,
+        ...(name ? { name } : {}),
+        features: existingDescriptor.features ?? CONFIG_GROUP_FEATURES,
       });
     }
     log.log(`[ConfigRepo] group-type set to "${type}"`);
@@ -2191,14 +2236,26 @@ export class ConfigRepo implements IConfigRepo {
     return `${LEGACY_APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
   }
 
-  /** Write a data-group descriptor to the new path, mirroring to the legacy one. */
+  /**
+   * Write a data-group descriptor to `.config/` (bootstrap copy), mirroring to
+   * the legacy `.meta/` path.
+   *
+   * 这份描述符是**引导副本**：它让只有配置组凭据的新设备知道有哪些数据组、
+   * 远端在哪。权威定义在数据组自己的 `.meta/backends/`。
+   *
+   * 幂等：按规范化字节比较，相同则不写；`createdAt` 与磁盘现值取 `min`，
+   * 因此时间戳差异不会让两台设备互相覆盖。
+   */
   private async writeAppDataGroupDescriptorFile(
     id: string,
     descriptor: AppDataGroupDescriptor,
   ): Promise<void> {
-    const bytes = new TextEncoder().encode(JSON.stringify(descriptor, null, 2));
+    const existing = await this.readAppDataGroupDescriptor(id);
+    const text = serializeAppDataGroupDescriptor(mergeDescriptorCreatedAt(descriptor, existing));
+    const bytes = new TextEncoder().encode(text);
     const author = `${this.appId}/${this.nodeId}`;
     for (const descPath of [this.appDataGroupFilePath(id), this.legacyAppDataGroupFilePath(id)]) {
+      if ((await this.readTextIfExists(descPath)) === text) continue;
       await this.ensureDir(descPath);
       await this.cachedFS.writeFile(descPath, bytes);
       const version = await incrementVersion(this.fullFS, descPath, bytes, author);
@@ -2274,6 +2331,7 @@ export class ConfigRepo implements IConfigRepo {
     // Resolve account fields for each backend
     const resolvedBackends: AppDataBackendDescriptor[] = [];
     for (const desc of backends) {
+      assertValidBackendId(desc.id);
       const mergedOptions = await this.resolveAppDataBackendOptions(desc);
       resolvedBackends.push({ ...desc, options: mergedOptions });
     }
@@ -2288,17 +2346,20 @@ export class ConfigRepo implements IConfigRepo {
       resolvedBackends,
       this.pollIntervalMs,
       this,
-      { name: options.name, features: options.features },
+      // 显式新拓扑：以参数为准并写入 `.meta/backends/`。
+      { name: options.name, features: options.features, backendsAreAuthoritative: true },
     );
     await group.init();
 
-    // Save descriptor to .config/app-data-groups/{appId}/{id}.json (+ legacy mirror)
+    // Save the **bootstrap copy** to `.config/app-data-groups/{appId}/{id}.json`
+    // (+ legacy `.meta/` mirror). The data group's own `.meta/backends/` stays
+    // authoritative; this file lets a new device discover the group.
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
       ...(options.name ? { name: options.name } : {}),
       ...(options.features ? { features: options.features } : {}),
-      backends: resolvedBackends,
+      backends: group.listDeclaredBackends(),
     };
     await this.writeAppDataGroupDescriptorFile(id, descriptor);
 
@@ -2309,20 +2370,29 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * Rewrite an app data group's descriptor (e.g. after addBackend/removeBackend)
-   * into .meta/app-data-groups/{appId}/{id}.json, keeping config-sync as the
-   * authoritative source of the data group's backend topology (FR2.3).
+   * Rewrite an app data group's **bootstrap copy** at
+   * `.config/app-data-groups/{appId}/{id}.json` (plus the legacy `.meta/`
+   * mirror). The authoritative backend list lives in the data group's own
+   * `.meta/backends/`; this file only lets a new device that has nothing but
+   * the config group's credentials discover the data groups and their remotes.
+   *
+   * 幂等：投影字节相同则不写（见 `writeAppDataGroupDescriptorFile`）。
    */
-  async updateAppDataGroupDescriptor(id: string, backends: AppDataBackendDescriptor[]): Promise<void> {
+  async updateAppDataGroupDescriptor(
+    id: string,
+    backends: AppDataBackendDescriptor[],
+    meta?: { name?: string; features?: Partial<SyncGroupFeatures> },
+  ): Promise<void> {
     this.assertNotDisposed();
-    // Preserve the display name and feature flags: adding/removing backends
-    // must not wipe them.
+    // 保留显示名与能力位：增删后端不能把它们抹掉。
     const existing = await this.readAppDataGroupDescriptor(id);
+    const name = meta?.name ?? existing?.name;
+    const features = meta?.features ?? existing?.features;
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
-      ...(existing?.name ? { name: existing.name } : {}),
-      ...(existing?.features ? { features: existing.features } : {}),
+      ...(name ? { name } : {}),
+      ...(features ? { features } : {}),
       backends,
     };
     await this.writeAppDataGroupDescriptorFile(id, descriptor);
@@ -2338,6 +2408,16 @@ export class ConfigRepo implements IConfigRepo {
     const existing = await this.readAppDataGroupDescriptor(id);
     if (!existing) {
       throw new Error(`App data group "${id}" not found`);
+    }
+    // 数据组自己的 `.meta/group.json` 是权威名；先写它，再回刷引导副本。
+    const live = this.appDataGroups.get(id);
+    if (live) {
+      live.name = normalized;
+      try {
+        await live.writeOwnGroupDescriptor();
+      } catch (err) {
+        log.warn(`[ConfigRepo] updateAppDataGroupName: "${id}" group.json update failed:`, err);
+      }
     }
     const descriptor: AppDataGroupDescriptor = {
       ...existing,
@@ -2365,58 +2445,64 @@ export class ConfigRepo implements IConfigRepo {
     description?: string,
   ): Promise<AppDataGroup> {
     this.assertNotDisposed();
+    assertValidBackendId(backendId);
     const descriptor = await this.readAppDataGroupDescriptor(groupId);
     if (!descriptor) {
       throw new Error(`App data group "${groupId}" not found`);
     }
-    const index = descriptor.backends.findIndex((b) => b.id === backendId);
+    // 权威列表优先取数据组自己的声明（描述符只是引导副本，可能落后）。
+    const live = this.appDataGroups.get(groupId);
+    const declared = live?.listDeclaredBackends() ?? descriptor.backends;
+    const index = declared.findIndex((b) => b.id === backendId);
     if (index < 0) {
       throw new Error(`Backend "${backendId}" not found in data group "${groupId}"`);
     }
 
     // Validate the new parameters before disposing the existing pair. The
     // group's own init also resolves account fields, so do that first.
-    const candidate = { ...descriptor.backends[index], type, options, description: description ?? descriptor.backends[index].description };
+    const candidate = { ...declared[index], type, options, description: description ?? declared[index].description };
     const mergedOptions = await this.resolveAppDataBackendOptions(candidate);
     const probe = await createBackend({ type, options: mergedOptions });
     try { await probe.dispose?.(); } catch { /* best effort */ }
 
-    const oldBackends = descriptor.backends.map((b) => ({ ...b }));
-    const nextBackends = descriptor.backends.map((b, i) =>
+    const oldBackends = declared.map((b) => ({ ...b }));
+    const nextBackends = declared.map((b, i) =>
       i === index ? { ...candidate, options: mergedOptions } : b,
     );
 
-    const live = this.appDataGroups.get(groupId);
     if (live) {
       await live.dispose();
       this.appDataGroups.delete(groupId);
     }
-    await this.updateAppDataGroupDescriptor(groupId, nextBackends);
 
     try {
+      // 先让数据组写自己的权威定义（`.meta/backends/`），再回刷引导副本。
       const group = new AppDataGroupImpl(
         groupId,
         this.appId,
         nextBackends,
         this.pollIntervalMs,
         this,
+        { backendsAreAuthoritative: true },
       );
       await group.init();
+      await this.updateAppDataGroupDescriptor(groupId, group.listDeclaredBackends());
       this.appDataGroups.set(groupId, group);
       return group;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log.warn(`[ConfigRepo] replaceAppDataGroupBackend: "${backendId}" failed, rolling back:`, err);
       try {
-        await this.updateAppDataGroupDescriptor(groupId, oldBackends);
         const restored = new AppDataGroupImpl(
           groupId,
           this.appId,
           oldBackends,
           this.pollIntervalMs,
           this,
+          { backendsAreAuthoritative: true },
         );
         await restored.init();
+        await this.updateAppDataGroupDescriptor(groupId, restored.listDeclaredBackends());
         this.appDataGroups.set(groupId, restored);
       } catch (rollbackErr) {
         log.error('[ConfigRepo] replaceAppDataGroupBackend: rollback ALSO failed:', rollbackErr);
@@ -2460,7 +2546,7 @@ export class ConfigRepo implements IConfigRepo {
     }
     // Keep `.meta/group.json` in sync with the display name.
     await writeGroupDescriptor(this.cachedFS, {
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind: 'config',
       id: CONFIG_GROUP_ID,
       name: normalized,
@@ -2616,7 +2702,14 @@ class AppDataGroupImpl implements AppDataGroup {
     backends: AppDataBackendDescriptor[],
     pollIntervalMs: number | undefined,
     parent: ConfigRepo,
-    descriptor: Pick<AppDataGroupDescriptor, 'name' | 'features'> = {},
+    descriptor: Pick<AppDataGroupDescriptor, 'name' | 'features'> & {
+      /**
+       * `createAppDataGroup` / `replaceAppDataGroupBackend` 传入的是**显式新拓扑**
+       * （例如同一个 groupId 被删除后用不同后端重建），此时以构造参数为准并
+       * 覆盖 `.meta/backends/`；普通 `getAppDataGroup` 读取时以磁盘为准。
+       */
+      backendsAreAuthoritative?: boolean;
+    } = {},
   ) {
     this.groupId = groupId;
     this.appId = appId;
@@ -2633,11 +2726,16 @@ class AppDataGroupImpl implements AppDataGroup {
     this.fs = null as any;
     this._backends = backends;
     this._pollIntervalMs = pollIntervalMs;
+    this._backendsAreAuthoritative = descriptor.backendsAreAuthoritative === true;
+    this._declaredFeatures = descriptor.features;
   }
 
   private parent: ConfigRepo;
   private _backends: AppDataBackendDescriptor[];
   private _pollIntervalMs?: number;
+  private _backendsAreAuthoritative: boolean;
+  /** 引导副本（`.config/` 里的描述符）原有的能力位，用于回刷时不丢信息。 */
+  private _declaredFeatures?: Partial<SyncGroupFeatures>;
 
   /** Local "backend" id used in tombstone bookkeeping. */
   private get localBackendId(): string {
@@ -2656,22 +2754,120 @@ class AppDataGroupImpl implements AppDataGroup {
     ];
   }
 
+  // -------------------------------------------------------------------------
+  // Data-group self-description (`.meta/backends/{id}.json`)
+  // -------------------------------------------------------------------------
+
+  /**
+   * 数据组自己的后端定义是**权威**：`.meta/backends/{id}.json` 随数据组同步，
+   * 因此任何设备连上任意一个数据后端都能读到完整拓扑。
+   *
+   * 引导副本（配置组 `.config/app-data-groups/...` 里的 `backends`）只在
+   * 「本地还没有 `.meta/backends/`」时用于首次回填（懒迁移）。
+   */
+  private async loadBackendDescriptors(): Promise<boolean> {
+    if (this._backendsAreAuthoritative) {
+      // create / replace：显式新拓扑，直接覆盖磁盘副本。
+      await this.persistBackendDescriptors(this._backends);
+      return false;
+    }
+
+    const stored = await readBackendMetaDescriptors(this.localFS);
+    if (stored === null) {
+      // 旧版本只把后端写在配置组描述符里 → 首次启动回填，之后以数据组为准。
+      await this.persistBackendDescriptors(this._backends);
+      return false;
+    }
+
+    // 墓碑优先：墓碑存在即视为已删除，即使描述符文件被对端「复活」也不采纳。
+    const tombstoned = await this.tombstonedBackendIds();
+    const kept: AppDataBackendDescriptor[] = [];
+    let pruned = false;
+    for (const desc of stored) {
+      if (tombstoned.has(desc.id)) {
+        await removeBackendMetaDescriptor(this.localFS, desc.id);
+        pruned = true;
+        continue;
+      }
+      kept.push(desc);
+    }
+    this._backends = kept;
+    return pruned;
+  }
+
+  /** Backend ids that currently have a tombstone for `.meta/backends/{id}.json`. */
+  private async tombstonedBackendIds(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    try {
+      for (const tombstone of await this.tombstones.list()) {
+        if (!tombstone.path.startsWith(`${META_BACKENDS_DIR}/`)) continue;
+        const file = tombstone.path.slice(META_BACKENDS_DIR.length + 1);
+        if (file.endsWith('.json')) ids.add(file.slice(0, -'.json'.length));
+      }
+    } catch {
+      /* best effort: tombstone listing failures must not block startup */
+    }
+    return ids;
+  }
+
+  /**
+   * 把权威列表写回 `.meta/backends/`：只写有差异的条目；不在列表里的旧条目
+   * 写墓碑后 `unlink`（墓碑保证对端不会把已删除的后端复活）。
+   *
+   * 写入前清除同路径的旧墓碑 —— `addBackend` 是显式的「重新添加」。
+   */
+  private async persistBackendDescriptors(descs: AppDataBackendDescriptor[]): Promise<void> {
+    const keep = new Set(descs.map((d) => d.id));
+    let tombstones: TombstoneMeta[] | null = null;
+    try {
+      tombstones = await this.tombstones.list();
+    } catch {
+      tombstones = null;
+    }
+
+    for (const desc of descs) {
+      const path = backendMetaFilePath(desc.id);
+      const stale = tombstones?.find((t) => t.path === path);
+      if (stale) {
+        await this.tombstones.remove(stale);
+        tombstones = tombstones!.filter((t) => t !== stale);
+      }
+      await writeBackendMetaDescriptor(this.localFS, desc);
+    }
+
+    for (const old of (await readBackendMetaDescriptors(this.localFS)) ?? []) {
+      if (keep.has(old.id)) continue;
+      await this.writeTombstoneFor(backendMetaFilePath(old.id));
+      await removeBackendMetaDescriptor(this.localFS, old.id);
+    }
+  }
+
+  /** Write this group's own `.meta/group.json` (idempotent: identical bytes → no write). */
+  async writeOwnGroupDescriptor(): Promise<void> {
+    await writeGroupDescriptor(this.localFS, {
+      schemaVersion: 2,
+      kind: 'data',
+      id: this.groupId,
+      ...(this.name ? { name: this.name } : {}),
+      features: this.features,
+    });
+  }
+
   async init(): Promise<void> {
     // Create local primary backend (Folder on Node, IndexedDB on browser).
     //
-    // Each data group gets its own IndexedDB store, except the legacy/default
-    // group which keeps using `zen-fs-config-data-{appId}` so existing user
-    // data stays untouched (lazy migration: no copy, no delete, no move).
-    // New groups start empty and get backfilled from their remote backends by
-    // the initial sync below.
+    // Each data group gets its own store: the legacy/default group keeps
+    // `data/{appId}` (and `zen-fs-config-data-{appId}`) untouched, while every
+    // other group is isolated by groupId — Node: `data/{appId}/{groupId}`,
+    // browser: `zen-fs-config-data-{appId}-{groupId}`. Lazy migration: no copy,
+    // no move, no deletion.
     try {
-      const localPrimary = await resolveLocalPrimary(
-        this.appId,
-        'data',
-        this.groupId === 'default'
+      const localPrimary = await resolveLocalPrimary(this.appId, 'data', {
+        groupId: this.groupId,
+        ...(this.groupId === 'default'
           ? {}
-          : { idbStoreName: `zen-fs-config-data-${this.appId}-${this.groupId}` },
-      );
+          : { idbStoreName: `zen-fs-config-data-${this.appId}-${this.groupId}` }),
+      });
       this.localFS = await createBackend(localPrimary);
     } catch {
       throw new Error(`Failed to create local primary for data group "${this.groupId}"`);
@@ -2712,15 +2908,20 @@ class AppDataGroupImpl implements AppDataGroup {
     this.versions = new VersionStore(this.localFS, `${this.appId}/${this.groupId}`);
     this.conflicts = new ConflictStore(this.localFS, this.appId, `${this.groupId}`, this.versions);
 
-    // Write the unified group descriptor so both kinds carry `.meta/group.json`.
+    // `.meta/backends/` 是数据组的**权威后端定义**：优先读自身副本；目录缺失
+    // （旧版本从未写过）时用配置组的引导描述符回填一次，之后一律以数据组为准。
+    let backendsChanged = false;
     try {
-      await writeGroupDescriptor(this.localFS, {
-        schemaVersion: 1,
-        kind: 'data',
-        id: this.groupId,
-        ...(this.name ? { name: this.name } : {}),
-        features: this.features,
-      });
+      backendsChanged = await this.loadBackendDescriptors();
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] failed to load .meta/backends:`, err);
+      this._backends = this._backends ?? [];
+    }
+
+    // Unified group descriptor (`.meta/group.json`) — byte-identical launches
+    // never rewrite it (no `updatedAt`, no timestamps in synced content).
+    try {
+      await this.writeOwnGroupDescriptor();
     } catch (err) {
       log.warn(`[AppDataGroup:${this.groupId}] failed to write .meta/group.json:`, err);
     }
@@ -2748,6 +2949,20 @@ class AppDataGroupImpl implements AppDataGroup {
         `(${removed.map(b => b.id).join(', ')}) — keeping ${kept.map(b => b.id).join(', ')}`,
       );
       this._backends = kept;
+      backendsChanged = true;
+    }
+
+    // 权威列表变化（去重 / 墓碑裁剪）→ 先落数据组，再回刷引导副本。
+    if (backendsChanged) {
+      try {
+        await this.persistBackendDescriptors(this._backends);
+        await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends, {
+          name: this.name,
+          features: this._declaredFeatures,
+        });
+      } catch (err) {
+        log.warn(`[AppDataGroup:${this.groupId}] failed to persist backend topology:`, err);
+      }
     }
 
     // Setup sync with each data backend
@@ -2811,16 +3026,6 @@ class AppDataGroupImpl implements AppDataGroup {
 
     // Now start watching — snapshots will reflect the synced state
     this.syncEngine.watchAll();
-
-    // Persist the deduplicated backend list so the duplicate is gone for good
-    // (otherwise it would reappear on the next load).
-    if (removed.length > 0) {
-      try {
-        await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends);
-      } catch (err) {
-        log.warn(`[AppDataGroup:${this.groupId}] dedupe: failed to persist deduplicated backends:`, err);
-      }
-    }
   }
 
   getSyncStatuses(): Map<string, SyncPairStatus> {
@@ -3018,6 +3223,7 @@ class AppDataGroupImpl implements AppDataGroup {
     description?: string,
   ): Promise<void> {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    assertValidBackendId(id);
     if (this.dataBackends.has(id)) {
       throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
     }
@@ -3059,6 +3265,19 @@ class AppDataGroupImpl implements AppDataGroup {
     this._backends = [...this._backends.filter(b => b.id !== id), desc];
     log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 
+    // 先写数据组自己的权威定义（`.meta/backends/{id}.json`），再让新 pair 首同步，
+    // 这样对端在拉取数据时已经能读到完整拓扑。
+    try {
+      // 重新添加同一 id 是显式动作：先清掉旧墓碑，再写权威定义。
+      const stale = (await this.tombstones.list()).find((t) =>
+        t.path === backendMetaFilePath(id),
+      );
+      if (stale) await this.tombstones.remove(stale);
+      await writeBackendMetaDescriptor(this.localFS, desc);
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] addBackend: failed to write .meta/backends/${id}.json:`, err);
+    }
+
     // Initial sync FIRST, then watch (same pattern as ConfigRepo.addBackend)
     try {
       await this.syncEngine.sync(pair.pairId);
@@ -3067,10 +3286,13 @@ class AppDataGroupImpl implements AppDataGroup {
     }
     this.syncEngine.watch(pair.pairId);
 
-    // Write the updated backend list back into config-sync's app-data-groups (FR2.3).
+    // 再回刷引导副本（配置组 `.config/app-data-groups`）。投影字节相同则不写。
     // Use _backends (not listBackends()) so descriptors that failed to connect
     // stay listed (and can be fixed/removed) instead of being silently dropped.
-    await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends);
+    await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends, {
+      name: this.name,
+      features: this._declaredFeatures,
+    });
   }
 
   async removeBackend(id: string): Promise<void> {
@@ -3081,6 +3303,13 @@ class AppDataGroupImpl implements AppDataGroup {
       throw new Error(`Backend "${id}" not found in data group "${this.groupId}"`);
     }
 
+    // 数据组权威定义：墓碑 + unlink。墓碑让对端删除同名副本，避免「删除被复活」。
+    // 必须在这个后端还挂着 pair 时跑一次墓碑 pass —— 否则它自己远端上的
+    // `.meta/backends/{id}.json` 副本会留下来，下次连上又会被拉回来。
+    await this.writeTombstoneFor(backendMetaFilePath(id));
+    await this.runTombstonePass('removeBackend');
+    await removeBackendMetaDescriptor(this.localFS, id);
+
     if (backend) {
       this.syncEngine.removePair(backend.pairId);
       this.dataBackends.delete(id);
@@ -3088,8 +3317,11 @@ class AppDataGroupImpl implements AppDataGroup {
     this.backendStates.delete(id);
     this._backends = this._backends.filter(b => b.id !== id);
 
-    // Write the updated backend list back into config-sync's app-data-groups (FR2.3).
-    await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends);
+    // 再回刷引导副本（投影字节相同则不写）。
+    await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends, {
+      name: this.name,
+      features: this._declaredFeatures,
+    });
 
     if (backend?.instance?.dispose) {
       await backend.instance.dispose();
@@ -3100,6 +3332,14 @@ class AppDataGroupImpl implements AppDataGroup {
 
   listBackends(): AppDataBackendDescriptor[] {
     return Array.from(this.dataBackends.values()).map(b => b.desc);
+  }
+
+  /**
+   * 声明式后端列表：以数据组自己的 `.meta/backends/` 为准，包含暂时连接失败的条目。
+   * 这才是权威列表；`listBackends()` 只是「当前已连接」的视图。
+   */
+  listDeclaredBackends(): AppDataBackendDescriptor[] {
+    return this._backends.map((desc) => ({ ...desc }));
   }
 
   async dispose(): Promise<void> {
@@ -3240,7 +3480,7 @@ export async function createConfigRepo(
     // Unified descriptor (`.meta/group.json`) — shared by both group kinds.
     if (!(await readGroupDescriptor(primaryInstance))) {
       await writeGroupDescriptor(primaryInstance, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: 'config',
         id: CONFIG_GROUP_ID,
         features: CONFIG_GROUP_FEATURES,

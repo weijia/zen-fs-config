@@ -157,6 +157,13 @@ export function isBrowserEnv(): boolean {
 export interface LocalPrimaryOptions {
   idbStoreName?: string;
   folderPath?: string;
+  /**
+   * Data groups only: non-default groups live in an isolated directory
+   * (`<base>/data/{appId}/{groupId}`) so two groups never share files.
+   * `default` keeps the legacy `<base>/data/{appId}` path (lazy migration:
+   * existing files are neither moved nor deleted).
+   */
+  groupId?: string;
 }
 
 /**
@@ -182,7 +189,7 @@ export async function resolveLocalPrimary(
   }
   const label = `zen-fs-config-${kind}-${appId}`;
   if (opts.folderPath || process.env.ZEN_FS_CONFIG_HOME) {
-    const dir = opts.folderPath || (await defaultNodeDir(appId, kind));
+    const dir = opts.folderPath || (await defaultNodeDir(appId, kind, opts.groupId));
     return { type: 'Folder', options: { path: dir, label } };
   }
   // Backward-compatible default on Node: in-memory (no persistence)
@@ -195,7 +202,11 @@ export function localPrimaryType(): string {
   return process.env.ZEN_FS_CONFIG_HOME ? 'Folder' : 'InMemory';
 }
 
-async function defaultNodeDir(appId: string, kind: 'config' | 'data'): Promise<string> {
+async function defaultNodeDir(
+  appId: string,
+  kind: 'config' | 'data',
+  groupId?: string,
+): Promise<string> {
   const os = await import('node:os');
   const pathMod = await import('node:path');
   const base =
@@ -203,5 +214,11 @@ async function defaultNodeDir(appId: string, kind: 'config' | 'data'): Promise<s
     (process.env.VITEST || process.env.NODE_ENV === 'test'
       ? pathMod.join(os.tmpdir(), 'zen-fs-config-tests')
       : pathMod.join(os.homedir(), '.zen-fs-config'));
-  return pathMod.join(base, kind, appId);
+  const kindDir = pathMod.join(base, kind, appId);
+  // Only data groups are id-scoped; `default` keeps the legacy path so existing
+  // user data stays where it is.
+  if (kind === 'data' && groupId && groupId !== 'default') {
+    return pathMod.join(kindDir, groupId);
+  }
+  return kindDir;
 }

@@ -318,19 +318,34 @@ export interface SyncGroupFeatures {
 
 /** Content of `.meta/group.json` — the unified group descriptor. */
 export interface GroupDescriptor {
-  schemaVersion: 1;
+  /**
+   * 2 = 规范化序列化 + 不再写 `updatedAt`。读取时 1 与 2 一视同仁；
+   * 1 的老文件会在下一次内容变化时被就地升级。
+   */
+  schemaVersion: 1 | 2;
   kind: SyncGroupKind;
   /** Group id (`config` for the config-sync group, the descriptor id otherwise). */
   id?: string;
   /** User-editable display name. */
   name?: string;
   features?: Partial<SyncGroupFeatures>;
+  /**
+   * @deprecated 不再写入、读取侧忽略。时间戳写进随同步走的内容会形成
+   * 「写 → 内容变 → 触发同步 → 对端再写」的无限回环，只允许放在本地存储。
+   */
   updatedAt?: number;
 }
 
 /**
- * Common handle shared by config-sync and data-sync groups.
- * The config group is the capability superset (see ConfigSyncGroupHandle).
+ * One sync group = a local primary store + zero-or-more remote replicas +
+ * the shared `.meta/` metadata area + that group's own backend definitions.
+ *
+ * 配置组与数据组是**同一基座上的两个能力位**，不是「配置组 ⊃ 数据组」：
+ *   - 配置组 `configHost = true`：可承载 `.config`（数据组登记、引导副本、
+ *     `group-type`），整棵 `/` 参与同步；
+ *   - 数据组 `appData = true`：可被登记为数据组，同步时排除 `/.config`、
+ *     `/nodes`、`/shared`。
+ * 两个能力位互不蕴含。
  */
 export interface SyncGroupHandle {
   readonly groupId: string;
@@ -358,6 +373,14 @@ export interface SyncGroupHandle {
   ): Promise<void>;
   removeBackend(id: string): Promise<void>;
   listBackends(): AppDataBackendDescriptor[];
+  /**
+   * 该组**声明**的后端列表（权威定义，允许尚未连接成功的条目）。
+   *
+   * 数据组读自自己的 `.meta/backends/`；配置组读自 `.config/backends/`。
+   * 与 `listBackends()`（已连接视图）不同，这个列表不会因为后端暂时不可达
+   * 而少显示条目。
+   */
+  listDeclaredBackends(): AppDataBackendDescriptor[];
   /** Update the display name only (descriptor-only). */
   rename(name: string): Promise<void>;
 

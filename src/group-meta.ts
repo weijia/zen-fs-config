@@ -15,6 +15,7 @@
  */
 
 import type {
+  AppDataBackendDescriptor,
   ConflictArchive,
   GroupDescriptor,
   SyncGroupFeatures,
@@ -22,6 +23,11 @@ import type {
   VersionMeta,
 } from './types';
 import { sha256 } from './version';
+import {
+  mergeBackendDescriptor,
+  serializeBackendDescriptor,
+  serializeGroupDescriptor,
+} from './canonical-json';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,6 +35,7 @@ import { sha256 } from './version';
 
 export const META_DIR = '/.meta';
 export const GROUP_DESCRIPTOR_FILE = `${META_DIR}/group.json`;
+export const META_BACKENDS_DIR = `${META_DIR}/backends`;
 export const TOMBSTONES_DIR = `${META_DIR}/tombstones`;
 export const LEGACY_TOMBSTONES_DIR = `${META_DIR}/.deleted`;
 export const VERSIONS_DIR = `${META_DIR}/versions`;
@@ -81,9 +88,19 @@ export async function ensureParentDir(fs: MetaFS, filePath: string): Promise<voi
 }
 
 async function readJson<T>(fs: MetaFS, path: string): Promise<T | null> {
+  const raw = await readText(fs, path);
+  if (raw === null) return null;
   try {
-    const raw = await fs.readFile(path);
-    return JSON.parse(new TextDecoder().decode(toBytes(raw))) as T;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** Read a text file, returning `null` when it does not exist / cannot be read. */
+async function readText(fs: MetaFS, path: string): Promise<string | null> {
+  try {
+    return new TextDecoder().decode(toBytes(await fs.readFile(path)));
   } catch {
     return null;
   }
@@ -129,14 +146,115 @@ export function encodeMetaPath(filePath: string): string {
 // Group descriptor
 // ---------------------------------------------------------------------------
 
-/** Read `.meta/group.json`. */
-export function readGroupDescriptor(fs: MetaFS): Promise<GroupDescriptor | null> {
-  return readJson<GroupDescriptor>(fs, GROUP_DESCRIPTOR_FILE);
+/** Read `.meta/group.json`. `updatedAt` is deprecated and ignored on read. */
+export async function readGroupDescriptor(fs: MetaFS): Promise<GroupDescriptor | null> {
+  const parsed = await readJson<GroupDescriptor & { updatedAt?: number }>(fs, GROUP_DESCRIPTOR_FILE);
+  if (!parsed) return null;
+  const { updatedAt: _ignored, ...rest } = parsed;
+  return rest as GroupDescriptor;
 }
 
-/** Write `.meta/group.json` (idempotent). */
+/**
+ * Write `.meta/group.json`.
+ *
+ * 幂等：内容与磁盘现有内容字节相同则不写。`updatedAt` 是 deprecated 字段，
+ * 不再写入（写进随同步走的内容会形成「写 → 内容变 → 触发同步 → 对端再写」
+ * 的无限回环）。
+ */
 export async function writeGroupDescriptor(fs: MetaFS, descriptor: GroupDescriptor): Promise<void> {
-  await writeJson(fs, GROUP_DESCRIPTOR_FILE, { ...descriptor, updatedAt: Date.now() });
+  const bytes = serializeGroupDescriptor(descriptor);
+  if ((await readText(fs, GROUP_DESCRIPTOR_FILE)) === bytes) return;
+  await ensureParentDir(fs, GROUP_DESCRIPTOR_FILE);
+  await fs.writeFile(GROUP_DESCRIPTOR_FILE, new TextEncoder().encode(bytes));
+}
+
+// ---------------------------------------------------------------------------
+// Data-group backend descriptors (`.meta/backends/{id}.json`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Backend ids become file names, so they must not escape `.meta/backends/`.
+ * `/`, `\` and `..` are rejected (path traversal).
+ */
+export function assertValidBackendId(id: string): void {
+  if (typeof id !== 'string' || id.trim() === '') {
+    throw new Error('Backend id must be a non-empty string');
+  }
+  if (id.includes('/') || id.includes('\\') || id.includes('..')) {
+    throw new Error(`Invalid backend id "${id}": must not contain "/", "\\" or ".."`);
+  }
+}
+
+/** Path of a data-group backend descriptor: `.meta/backends/{id}.json`. */
+export function backendMetaFilePath(id: string): string {
+  assertValidBackendId(id);
+  return `${META_BACKENDS_DIR}/${id}.json`;
+}
+
+/**
+ * Read every backend descriptor from `.meta/backends/`.
+ *
+ * Returns `null` when the directory does not exist (→ caller may lazily
+ * backfill from the config group's bootstrap descriptor) and `[]` when the
+ * directory exists but holds no usable descriptors (→ authoritative empty list,
+ * e.g. after every backend was removed).
+ */
+export async function readBackendMetaDescriptors(
+  fs: MetaFS,
+): Promise<AppDataBackendDescriptor[] | null> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(META_BACKENDS_DIR);
+  } catch {
+    return null;
+  }
+  const out: AppDataBackendDescriptor[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const desc = await readJson<AppDataBackendDescriptor>(fs, `${META_BACKENDS_DIR}/${entry}`);
+    if (!desc || typeof desc.id !== 'string' || typeof desc.type !== 'string') continue;
+    out.push(desc);
+  }
+  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/**
+ * Write one backend descriptor with canonical bytes.
+ *
+ * `createdAt` is merged with the value already on disk by `min`, so two devices
+ * never rewrite each other's file just because they recorded different
+ * timestamps. Returns `true` when the file was actually written.
+ */
+export async function writeBackendMetaDescriptor(
+  fs: MetaFS,
+  descriptor: AppDataBackendDescriptor,
+): Promise<boolean> {
+  assertValidBackendId(descriptor.id);
+  const path = backendMetaFilePath(descriptor.id);
+  const raw = await readText(fs, path);
+  let existing: AppDataBackendDescriptor | null = null;
+  if (raw !== null) {
+    try {
+      existing = JSON.parse(raw) as AppDataBackendDescriptor;
+    } catch {
+      existing = null; // corrupt → overwrite with the good copy
+    }
+  }
+  const bytes = serializeBackendDescriptor(mergeBackendDescriptor(existing, descriptor));
+  if (raw === bytes) return false;
+  await ensureParentDir(fs, path);
+  await fs.writeFile(path, new TextEncoder().encode(bytes));
+  return true;
+}
+
+/** Delete one backend descriptor file. The caller is responsible for the tombstone. */
+export async function removeBackendMetaDescriptor(fs: MetaFS, id: string): Promise<void> {
+  const path = backendMetaFilePath(id);
+  try {
+    await fs.unlink(path);
+  } catch {
+    /* already gone */
+  }
 }
 
 // ---------------------------------------------------------------------------
