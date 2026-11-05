@@ -105,6 +105,18 @@ async function existsSafe(fs: MetaFS, path: string): Promise<boolean> {
 }
 
 /**
+ * Backend-internal mtime sidecar (`<name>.mtime`).
+ *
+ * GiteeFS keeps these out of its Index and only in its SHA cache, so `exists()`
+ * reports `false` for them even when the blob is still on the remote. They must
+ * be unlinked unconditionally, otherwise `<dir>/.keep.mtime` survives a
+ * directory delete and keeps the (now empty) directory alive in Git.
+ */
+function isMtimeSidecarPath(path: string): boolean {
+  return path.endsWith('.mtime');
+}
+
+/**
  * Encode a file path into a flat metadata entry name.
  * `/a/b.json` → `a__b++json`
  */
@@ -232,7 +244,10 @@ export class TombstoneStore {
   }
 
   private async deleteEverywhere(fs: any, filePath: string): Promise<void> {
-    if (!(await existsSafe(fs, filePath))) return;
+    // `.mtime` sidecars are hidden from the backend index (GiteeFS keeps them in
+    // its SHA cache only), so exists() lies and the unlink below would never run.
+    // Attempt the delete unconditionally — a missing blob just throws and is ignored.
+    if (!isMtimeSidecarPath(filePath) && !(await existsSafe(fs, filePath))) return;
     try {
       await fs.unlink(filePath);
     } catch {

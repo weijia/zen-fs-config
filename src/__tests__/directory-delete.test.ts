@@ -104,8 +104,11 @@ describe('directory deletion', () => {
 
     // Every deleted directory gets a `.keep` tombstone so a hidden placeholder
     // left on a Git backend cannot resurrect the (now empty) directory.
+    // Its `.keep.mtime` sidecar is a real blob and needs its own tombstone:
+    // alone it keeps the directory alive in Git.
     for (const dir of [`/${appId}/dir`, `/${appId}/dir/sub`]) {
       expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
+      expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(true);
     }
 
     await repo.dispose();
@@ -178,6 +181,7 @@ describe('directory deletion', () => {
     }
     for (const dir of ['/unlinked', '/unlinked/sub']) {
       expect(await exists(localFS, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
+      expect(await exists(localFS, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(true);
     }
 
     // `fs.rmdir` goes through the same tombstone-aware path.
@@ -193,6 +197,51 @@ describe('directory deletion', () => {
     expect(await exists(group.fs, '/.config')).toBe(false);
 
     await group.dispose();
+    await repo.dispose();
+  });
+
+  it('config-sync group: .mtime tombstones bypass exists() on replicas', async () => {
+    const appId = 'dir-del-mtime';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-mtime' });
+    await mkdirp(repo.rootFS, `/${appId}/ghost`);
+
+    await repo.deleteFile(`/${appId}/ghost`);
+
+    // Backends like GiteeFS hide `.mtime` sidecars from their Index, so
+    // exists() returns false for a blob that is still on the remote. The
+    // tombstone pass must unlink them unconditionally.
+    const deleted: string[] = [];
+    const fakeReplica = {
+      exists: async () => false,
+      unlink: async (p: string) => { deleted.push(p); },
+    };
+    (repo as any).replicaBackends.set('fake-hidden-sidecars', { instance: fakeReplica });
+
+    await (repo as any).processTombstonesPublic();
+
+    expect(deleted).toContain(`/${appId}/ghost/.keep.mtime`);
+    // A sidecar tombstone must not spawn a `.mtime.version` follow-up.
+    expect(deleted.some((p) => p.includes('.mtime.version'))).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('config-sync group: deleting a file also drops its local .mtime sidecar', async () => {
+    const appId = 'dir-del-file-sidecar';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-sidecar' });
+    const root = repo.rootFS;
+
+    await mkdirp(root, `/${appId}/notes`);
+    await root.promises.writeFile(`/${appId}/notes/a.txt`, 'a');
+    // Older builds leaked backend sidecars into the local primary.
+    await root.promises.writeFile(`/${appId}/notes/a.txt.mtime`, '{"mtime":1}');
+    expect(await exists(root, `/${appId}/notes/a.txt.mtime`)).toBe(true);
+
+    await repo.deleteFile(`/${appId}/notes/a.txt`);
+
+    expect(await exists(root, `/${appId}/notes/a.txt`)).toBe(false);
+    expect(await exists(root, `/${appId}/notes/a.txt.mtime`)).toBe(false);
+
     await repo.dispose();
   });
 });

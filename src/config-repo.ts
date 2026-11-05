@@ -37,7 +37,7 @@ import { createBackend, mergeAccountFields, getAccountFields, getBackendMetadata
 import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
-import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
+import { purgeMtimeSidecars, isMtimeSidecar, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
 import { migrateVersionSidecars, type VersionMigrationResult } from './version-migration';
 import {
@@ -657,8 +657,15 @@ export class ConfigRepo implements IConfigRepo {
       // internal `.keep` placeholder, which readdir()/createSnapshot() hide and
       // the local primary does not carry. Without an explicit tombstone it
       // survives the delete and the directory reappears on the next pull.
+      //
+      // The placeholder's `<dir>/.keep.mtime` sidecar is a REAL blob (backends
+      // persist mtime as `<name>.mtime`): if only `.keep` is tombstoned, the
+      // sidecar alone keeps the directory alive in Git. It also outlives the
+      // `.keep` itself when an older build already removed the placeholder.
       for (const dir of await collectDirectoriesUnder(this.cachedFS, normalizedPath)) {
-        await this.writeTombstoneFor(dir === '/' ? '/.keep' : `${dir}/.keep`);
+        const keepPath = dir === '/' ? '/.keep' : `${dir}/.keep`;
+        await this.writeTombstoneFor(keepPath);
+        await this.writeTombstoneFor(`${keepPath}.mtime`);
       }
       await removeDirectoryTree(this.cachedFS, normalizedPath);
       this.invalidateTombstoneCache();
@@ -683,6 +690,16 @@ export class ConfigRepo implements IConfigRepo {
       try {
         await this.cachedFS.unlink(versionPath);
       } catch { /* no version file */ }
+    }
+
+    // 3b. Best-effort: drop the backend-internal mtime sidecar from the local
+    // primary as well (older builds leaked `<file>.mtime` into it, and a stale
+    // sidecar would outlive its data file forever). Remote backends delete it
+    // inside their own remove() path.
+    if (!isMtimeSidecar(normalizedPath)) {
+      try {
+        await this.cachedFS.unlink(`${normalizedPath}.mtime`);
+      } catch { /* no sidecar */ }
     }
 
     log.log(`[ConfigRepo] deleteFile: ${normalizedPath} (tombstone at ${tombstonePathFor(normalizedPath)})`);
@@ -779,11 +796,16 @@ export class ConfigRepo implements IConfigRepo {
     let alreadyDeleted = 0;
 
     for (const tombstone of tombstones) {
-      const tVersionPath = versionPathFor(tombstone.path);
-      log.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? 'null'}`);
+      // `.mtime` sidecars are backend-internal and hidden from the backend's
+      // index (GiteeFS keeps them in its SHA cache only), so `exists()` returns
+      // false even when the blob is still on the remote. Attempt the unlink
+      // unconditionally for them — that is what removes `<dir>/.keep.mtime`.
+      const forceDelete = isMtimeSidecar(tombstone.path);
+      const tVersionPath = forceDelete ? null : versionPathFor(tombstone.path);
+      log.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? 'null'} forceDelete=${forceDelete}`);
 
       // Delete on primary (in case it was re-created)
-      const existedOnPrimary = await this.safeExists(this.cachedFS, tombstone.path);
+      const existedOnPrimary = forceDelete || (await this.safeExists(this.cachedFS, tombstone.path));
       log.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) → ${existedOnPrimary}`);
       if (existedOnPrimary) {
         log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary → EXISTS`);
@@ -805,7 +827,7 @@ export class ConfigRepo implements IConfigRepo {
         // Check existence before unlink — avoids wasteful DELETE requests
         // on remote backends (RemoteStorage, Gitee, WebDAV) when the file
         // was already deleted on a previous sync cycle.
-        const existed = await this.safeExists(replica.instance, tombstone.path);
+        const existed = forceDelete || (await this.safeExists(replica.instance, tombstone.path));
         log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) → ${existed}`);
         if (existed) {
           log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} → EXISTS`);
@@ -2890,9 +2912,12 @@ class AppDataGroupImpl implements AppDataGroup {
       // Hidden `.keep` placeholders keep otherwise-empty directories alive on
       // Git/RemoteStorage but never reach the local primary; tombstone them
       // explicitly so a directory whose remote copy only has `.keep` cannot
-      // reappear on the next pull.
+      // reappear on the next pull. The placeholder's `<dir>/.keep.mtime`
+      // sidecar is a real blob too — on its own it keeps the directory alive.
       for (const dir of await collectDirectoriesUnder(this.localFS, normalized)) {
-        await this.writeTombstoneFor(dir === '/' ? '/.keep' : `${dir}/.keep`);
+        const keepPath = dir === '/' ? '/.keep' : `${dir}/.keep`;
+        await this.writeTombstoneFor(keepPath);
+        await this.writeTombstoneFor(`${keepPath}.mtime`);
       }
       await removeDirectoryTree(this.localFS, normalized);
       this.schedulePostDeleteSync();
@@ -2914,6 +2939,17 @@ class AppDataGroupImpl implements AppDataGroup {
         await this.localFS.unlink(versionPath);
       } catch {
         // No version record — fine.
+      }
+    }
+
+    // Drop the backend-internal mtime sidecar on the local store as well (older
+    // builds leaked `<file>.mtime` into it). Remote backends remove it inside
+    // their own remove() path; a leftover sidecar would outlive its data file.
+    if (!isMtimeSidecar(normalized)) {
+      try {
+        await this.localFS.unlink(`${normalized}.mtime`);
+      } catch {
+        // No sidecar — fine.
       }
     }
 
