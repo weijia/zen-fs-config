@@ -1170,6 +1170,33 @@ export class ConfigRepo implements IConfigRepo {
     return new Map(this.backendStates);
   }
 
+  /**
+   * Mirror per-pair `sync:error` into `getBackendSyncStates()`.
+   *
+   * `SyncEngine.syncAll()` catches per-pair exceptions and substitutes an empty
+   * result, so a failed replica otherwise only shows up as a missing
+   * `lastResult`. Recording the real error lets callers report the actual
+   * status (401/403/404/timeout) instead of guessing "remote unreachable or
+   * invalid credentials".
+   */
+  private trackSyncErrors(backendId: string, pairId: string): void {
+    this.syncEngine.on(pairId, 'sync:error', (event) => {
+      const error = event.error;
+      this.backendStates.set(backendId, {
+        backendId,
+        pairId,
+        error: {
+          message: error instanceof Error ? error.message : String(error ?? 'sync failed'),
+          timestamp: Date.now(),
+        },
+      });
+    });
+    this.syncEngine.on(pairId, 'sync:end', () => {
+      const current = this.backendStates.get(backendId);
+      if (current?.error) this.backendStates.set(backendId, { backendId, pairId });
+    });
+  }
+
   /** Registered replica backend descriptors (excludes the implicit local primary). */
   listBackends(): AppDataBackendDescriptor[] {
     this.assertNotDisposed();
@@ -1403,6 +1430,7 @@ export class ConfigRepo implements IConfigRepo {
           this.handleConflict(event);
         };
         this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
+        this.trackSyncErrors(desc.id, pair.pairId);
 
         // NOTE: Do NOT call watch() here. watch() triggers buildInitialSnapshots()
         // which caches a merged (source ∪ target) snapshot WITHOUT actually
@@ -2006,6 +2034,7 @@ export class ConfigRepo implements IConfigRepo {
       this.handleConflict(event);
     };
     this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
+    this.trackSyncErrors(id, pair.pairId);
 
     log.log(`[ConfigRepo] addBackend: ${id} (${type}) added, sync pair=${pair.pairId}`);
 
@@ -3002,6 +3031,7 @@ class AppDataGroupImpl implements AppDataGroup {
           };
           this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
         }
+        this.trackSyncErrors(desc.id, pair.pairId);
         // NOTE: Don't watch yet — sync first, then watch (same pattern as ConfigRepo)
         log.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
       } catch (err: any) {
@@ -3049,6 +3079,25 @@ class AppDataGroupImpl implements AppDataGroup {
 
   getBackendSyncStates(): Map<string, BackendSyncState> {
     return new Map(this.backendStates);
+  }
+
+  /** Mirror per-pair `sync:error` into `getBackendSyncStates()` (see ConfigRepo). */
+  private trackSyncErrors(backendId: string, pairId: string): void {
+    this.syncEngine.on(pairId, 'sync:error', (event) => {
+      const error = event.error;
+      this.backendStates.set(backendId, {
+        backendId,
+        pairId,
+        error: {
+          message: error instanceof Error ? error.message : String(error ?? 'sync failed'),
+          timestamp: Date.now(),
+        },
+      });
+    });
+    this.syncEngine.on(pairId, 'sync:end', () => {
+      const current = this.backendStates.get(backendId);
+      if (current?.error) this.backendStates.set(backendId, { backendId, pairId });
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -3262,6 +3311,7 @@ class AppDataGroupImpl implements AppDataGroup {
         });
       });
     }
+    this.trackSyncErrors(id, pair.pairId);
     this._backends = [...this._backends.filter(b => b.id !== id), desc];
     log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
 
