@@ -58,6 +58,7 @@ import {
   backendMetaFilePath,
   assertValidBackendId,
   DATA_GROUP_DEFAULT_FEATURES,
+  readTombstonesFromFs,
   TombstoneStore,
   VersionStore,
   ConflictStore,
@@ -756,31 +757,7 @@ export class ConfigRepo implements IConfigRepo {
     if (this.tombstoneCache !== null) {
       return this.tombstoneCache;
     }
-    const byPath = new Map<string, TombstoneMeta>();
-    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-      let entries: string[];
-      try {
-        entries = await this.cachedFS.readdir(dir);
-      } catch {
-        continue; // directory doesn't exist in this layout
-      }
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        try {
-          const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
-          const data = JSON.parse(new TextDecoder().decode(toUint8Array(raw))) as TombstoneMeta;
-          const prev = byPath.get(data.path);
-          if (prev) {
-            for (const id of data.confirmedBy ?? []) {
-              if (!prev.confirmedBy.includes(id)) prev.confirmedBy.push(id);
-            }
-          } else {
-            byPath.set(data.path, data);
-          }
-        } catch { /* skip corrupt tombstone */ }
-      }
-    }
-    this.tombstoneCache = Array.from(byPath.values());
+    this.tombstoneCache = await readTombstonesFromFs(this.cachedFS, (message) => log.warn(message));
     return this.tombstoneCache;
   }
 

@@ -23,11 +23,14 @@ import type {
   VersionMeta,
 } from './types';
 import { sha256 } from './version';
+import { createLogger } from '@richard432/localstorage-logger';
 import {
   mergeBackendDescriptor,
   serializeBackendDescriptor,
   serializeGroupDescriptor,
 } from './canonical-json';
+
+const log = createLogger('zen-fs-config:tombstones');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -140,6 +143,210 @@ function isMtimeSidecarPath(path: string): boolean {
 export function encodeMetaPath(filePath: string): string {
   const normalized = filePath.startsWith('/') ? filePath : `/${filePath}`;
   return normalized.replace(/^\//, '').replace(/\//g, '__').replace(/\./g, '++');
+}
+
+/**
+ * Decode a tombstone entry name back into the deleted file path.
+ * `a__b++json.json` → `/a/b.json`. Returns `null` for names that cannot have
+ * been produced by {@link encodeMetaPath}.
+ *
+ * This is the last-resort source of the target path: the name encodes the path,
+ * so it survives a truncated or concatenated tombstone body.
+ */
+export function decodeMetaPath(entry: string): string | null {
+  if (!entry.endsWith('.json')) return null;
+  const encoded = entry.slice(0, -'.json'.length);
+  if (!encoded) return null;
+  return `/${encoded.replace(/__/g, '/').replace(/\+\+/g, '.')}`;
+}
+
+function fallbackTombstone(path: string): TombstoneMeta {
+  // The body is unusable: keep the record minimal but still valid so the
+  // downstream confirmation/GC passes can rewrite it into a well-formed file.
+  return { path, deletedAt: 0, deletedBy: 'unknown', confirmedBy: [] };
+}
+
+function normalizeTombstoneRecord(value: unknown, fallbackPath?: string): TombstoneMeta | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const rawPath = typeof record.path === 'string' ? record.path : fallbackPath;
+  if (!rawPath) return null;
+  const path = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  const confirmedBy = Array.isArray(record.confirmedBy)
+    ? (record.confirmedBy as unknown[]).filter((id): id is string => typeof id === 'string')
+    : [];
+  return {
+    path,
+    deletedAt: typeof record.deletedAt === 'number' ? record.deletedAt : 0,
+    deletedBy: typeof record.deletedBy === 'string' ? record.deletedBy : 'unknown',
+    confirmedBy,
+  };
+}
+
+/**
+ * Extract every balanced `{...}` object from `raw`.
+ *
+ * Tombstones are written with a plain PUT/POST to the remote. When two writers
+ * race on the same path (or a write is cut off mid-body), the result is a
+ * truncated object followed by the beginning of another one — invalid JSON that
+ * still contains recoverable complete objects. Braces inside strings are
+ * ignored so a path such as `/{a}.json` cannot confuse the scanner.
+ */
+function extractJsonObjects(raw: string): string[] {
+  const objects: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+    if (ch === '}') {
+      if (depth === 0) continue;
+      depth--;
+      if (depth === 0 && start >= 0) {
+        objects.push(raw.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return objects;
+}
+
+/**
+ * Parse one tombstone file body, tolerating corruption.
+ *
+ * Policy — a corrupt tombstone means "this path was deleted" (conservative):
+ *   - The alternative ("ignore it") is what the old `catch {}` did, and it lets
+ *     a stale replica resurrect a file the user deliberately deleted. That is
+ *     unrecoverable data loss from the user's point of view.
+ *   - Honoring it costs at most one extra unlink of an already-absent path,
+ *     which is idempotent and cheap.
+ *   - The target path is recovered from the filename (`decodeMetaPath`) when the
+ *     body is unusable, so a truncated write still protects the right file.
+ *
+ * A body can contain several JSON documents (a cut-off write followed by a
+ * concurrent rewrite). Every balanced object is returned; the caller merges
+ * duplicates by path.
+ */
+export function parseTombstoneFile(
+  raw: string,
+  fallbackPath?: string,
+): { tombstones: TombstoneMeta[]; problems: string[] } {
+  const problems: string[] = [];
+  const text = raw.trim();
+  if (text === '') {
+    problems.push('empty body');
+    if (fallbackPath) {
+      problems.push('path derived from filename');
+      return { tombstones: [fallbackTombstone(fallbackPath)], problems };
+    }
+    problems.push('no path derivable from filename — skipped');
+    return { tombstones: [], problems };
+  }
+
+  try {
+    const parsed = normalizeTombstoneRecord(JSON.parse(text), fallbackPath);
+    if (parsed) return { tombstones: [parsed], problems: [] };
+    problems.push('JSON parsed but has no usable "path"');
+  } catch (err) {
+    problems.push(`JSON parse error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  const recovered = extractJsonObjects(text)
+    .map((chunk) => {
+      try {
+        return normalizeTombstoneRecord(JSON.parse(chunk));
+      } catch {
+        return null;
+      }
+    })
+    .filter((t): t is TombstoneMeta => t !== null);
+
+  if (recovered.length > 0) {
+    if (recovered.length > 1) problems.push(`${recovered.length} concatenated documents recovered`);
+    return { tombstones: recovered, problems };
+  }
+
+  if (fallbackPath) {
+    problems.push('no recoverable document; path derived from filename');
+    return { tombstones: [fallbackTombstone(fallbackPath)], problems };
+  }
+
+  problems.push('no recoverable document and no path derivable from filename — skipped');
+  return { tombstones: [], problems };
+}
+
+function mergeTombstone(byPath: Map<string, TombstoneMeta>, tombstone: TombstoneMeta): void {
+  const prev = byPath.get(tombstone.path);
+  if (!prev) {
+    byPath.set(tombstone.path, tombstone);
+    return;
+  }
+  // Duplicate writes (same file, or new + legacy mirror) must not block GC:
+  // union the confirmations, keep the first record's metadata.
+  for (const id of tombstone.confirmedBy) {
+    if (!prev.confirmedBy.includes(id)) prev.confirmedBy.push(id);
+  }
+}
+
+/**
+ * Read every tombstone from `.meta/tombstones/` and the legacy `.meta/.deleted/`
+ * mirror, never dropping a corrupt record silently.
+ *
+ * `warn` receives a human-readable diagnostic (file path + parse problem) for
+ * each file that needed repair or recovery.
+ */
+export async function readTombstonesFromFs(
+  fs: MetaFS,
+  warn: (message: string) => void,
+): Promise<TombstoneMeta[]> {
+  const byPath = new Map<string, TombstoneMeta>();
+  for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      continue; // directory doesn't exist in this layout
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith('.json')) continue;
+      const filePath = `${dir}/${entry}`;
+      let raw: string;
+      try {
+        raw = new TextDecoder().decode(toBytes(await fs.readFile(filePath)));
+      } catch (err) {
+        warn(
+          `[Tombstones] unreadable tombstone ${filePath}: ` +
+          `${err instanceof Error ? err.message : String(err)} — skipped`,
+        );
+        continue;
+      }
+      const { tombstones, problems } = parseTombstoneFile(raw, decodeMetaPath(entry) ?? undefined);
+      if (problems.length > 0) {
+        const action = tombstones.length > 0
+          ? tombstones.map((t) => `"${t.path}" treated as deleted`).join(', ')
+          : 'skipped';
+        warn(`[Tombstones] corrupt tombstone ${filePath}: ${problems.join('; ')} → ${action}`);
+      }
+      for (const tombstone of tombstones) mergeTombstone(byPath, tombstone);
+    }
+  }
+  return Array.from(byPath.values());
 }
 
 // ---------------------------------------------------------------------------
@@ -285,30 +492,7 @@ export class TombstoneStore {
 
   /** All tombstones, new path first, legacy only for paths not already seen. */
   async list(): Promise<TombstoneMeta[]> {
-    const byPath = new Map<string, TombstoneMeta>();
-    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-      let entries: string[];
-      try {
-        entries = await this.fs.readdir(dir);
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        const data = await readJson<TombstoneMeta>(this.fs, `${dir}/${entry}`);
-        if (!data || typeof data.path !== 'string') continue;
-        const prev = byPath.get(data.path);
-        if (prev) {
-          // Merge confirmations so GC is not blocked by a stale mirror.
-          for (const id of data.confirmedBy ?? []) {
-            if (!prev.confirmedBy.includes(id)) prev.confirmedBy.push(id);
-          }
-        } else {
-          byPath.set(data.path, data);
-        }
-      }
-    }
-    return Array.from(byPath.values());
+    return readTombstonesFromFs(this.fs, (message) => log.warn(message));
   }
 
   /** Write a tombstone (new + legacy mirror). */
