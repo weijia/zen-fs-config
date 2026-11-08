@@ -182,4 +182,97 @@ describe('tombstone GC safety', () => {
 
     await repo.dispose();
   });
+
+  it('never unlinks a sidecar whose data file still exists (repeated writes stay idempotent)', async () => {
+    const appId = 'tomb-gc-live-sidecar';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-live-sidecar' });
+    await repo.addBackend('replica-sidecar', 'DirRemote', { label: 'tomb-gc-live-sidecar' });
+
+    const dir = `/${appId}/.config/app-data-groups/demo`;
+    const descPath = `${dir}/default.json`;
+    const sidecarPath = `${descPath}.mtime`;
+    await mkdirp(repo.rootFS, dir);
+    await repo.rootFS.promises.writeFile(descPath, '{"a":1}');
+    await repo.rootFS.promises.writeFile(sidecarPath, '1');
+
+    // 遗留墓碑指向“仍在用”的 sidecar：旧行为会在每轮同步里 DELETE 后再重建。
+    await (repo as any).writeTombstoneFor(sidecarPath);
+
+    const replica = (repo as any).replicaBackends.get('replica-sidecar').instance;
+    // 副本上数据文件同样存在（真实场景：描述符已同步到副本）。
+    try { await replica.mkdir(dir); } catch { /* exists */ }
+    await replica.writeFile(descPath, '{"a":1}');
+    await replica.writeFile(sidecarPath, '1');
+    const unlinked: string[] = [];
+    const origUnlink = replica.unlink.bind(replica);
+    replica.unlink = async (p: string) => { unlinked.push(p); return origUnlink(p); };
+
+    // 连续两轮：每轮都重写同一描述符与同一 sidecar，不得产生任何 unlink。
+    for (let round = 0; round < 2; round++) {
+      await repo.rootFS.promises.writeFile(descPath, '{"a":1}');
+      await repo.rootFS.promises.writeFile(sidecarPath, '1');
+      await runTombstonePipeline(repo);
+    }
+
+    expect(unlinked).toEqual([]);
+    // 数据文件仍在 → 墓碑被确认后 GC，不再每轮触发删除。
+    expect(
+      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', sidecarPath)),
+    ).toBe(false);
+    expect(await exists(repo.rootFS, sidecarPath)).toBe(true);
+    expect(await exists(repo.rootFS, descPath)).toBe(true);
+
+    await repo.dispose();
+  });
+
+  it('still removes a sidecar whose data file is gone', async () => {
+    const appId = 'tomb-gc-orphan-sidecar';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-orphan-sidecar' });
+    await repo.addBackend('replica-orphan', 'DirRemote', { label: 'tomb-gc-orphan-sidecar' });
+
+    const dir = `/${appId}/.config/app-data-groups/orphan`;
+    const descPath = `${dir}/default.json`;
+    const sidecarPath = `${descPath}.mtime`;
+    await mkdirp(repo.rootFS, dir);
+    await repo.rootFS.promises.writeFile(descPath, '{"a":1}');
+    await repo.rootFS.promises.writeFile(sidecarPath, '1');
+    await (repo as any).writeTombstoneFor(sidecarPath);
+    // 数据文件已真的没了 —— 此时侧车是孤儿，必须删掉。
+    await repo.rootFS.promises.unlink(descPath);
+
+    const replica = (repo as any).replicaBackends.get('replica-orphan').instance;
+    const unlinked: string[] = [];
+    const origUnlink = replica.unlink.bind(replica);
+    replica.unlink = async (p: string) => { unlinked.push(p); return origUnlink(p); };
+
+    await runTombstonePipeline(repo);
+
+    expect(unlinked).toContain(sidecarPath);
+    expect(await exists(repo.rootFS, sidecarPath)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('still removes `.keep.mtime` placeholders of a deleted directory', async () => {
+    const appId = 'tomb-gc-keep-sidecar';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-keep-sidecar' });
+    await repo.addBackend('replica-keep', 'DirRemote', { label: 'tomb-gc-keep-sidecar' });
+
+    await mkdirp(repo.rootFS, `/${appId}/keep`);
+    await repo.rootFS.promises.writeFile(`/${appId}/keep/a.txt`, 'a');
+    await repo.deleteFile(`/${appId}/keep`);
+
+    // `.keep` 是目录占位，不是“仍在用的数据文件”：它的 sidecar 仍须被清除。
+    const replica = (repo as any).replicaBackends.get('replica-keep').instance;
+    try { await replica.mkdir(`/${appId}/keep`); } catch { /* exists */ }
+    await replica.writeFile(`/${appId}/keep/.keep`, '\n');
+    await replica.writeFile(`/${appId}/keep/.keep.mtime`, '1');
+
+    await repo.flush();
+
+    expect(await exists(replica, `/${appId}/keep/.keep`)).toBe(false);
+    expect(await exists(replica, `/${appId}/keep/.keep.mtime`)).toBe(false);
+
+    await repo.dispose();
+  });
 });

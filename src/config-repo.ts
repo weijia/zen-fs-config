@@ -859,9 +859,20 @@ export class ConfigRepo implements IConfigRepo {
       const forceDelete = isMtimeSidecar(tombstone.path) || isKeepPlaceholder;
       const tVersionPath = forceDelete ? null : versionPathFor(tombstone.path);
 
+      // 侧车墓碑（`<file>.mtime` / `<file>.version` / `<file>.version.mtime`）只在
+      // 其数据文件也已被删除时才该清理。数据文件仍然存在 = 这个侧车是"仍在用的
+      // 元数据"：每轮都先 DELETE、随后由同步/写入路径重建，会形成
+      // delete → create 的提交抖动（Gitee 上还会因读侧滞后撞 400）。
+      // 这里改为不动它：内容需要更新时由写入路径直接 PUT 覆写。
+      const sidecarOwner = sidecarOwnerPath(tombstone.path);
+      const isKeepSidecar = sidecarOwner === '/.keep' || (sidecarOwner?.endsWith('/.keep') ?? false);
+      const liveSidecarCandidate = sidecarOwner !== null && !isKeepSidecar;
+
       // 1. 本地主存储：清掉可能被重建的残留（目录按树删，含 `.keep` 占位）。
       if (forceDelete) {
-        try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* 已不存在 */ }
+        if (!(liveSidecarCandidate && await this.pathExistsOnBackend(this.cachedFS, sidecarOwner!))) {
+          try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* 已不存在 */ }
+        }
       } else {
         const existedOnPrimary = await this.pathExistsOnBackend(this.cachedFS, tombstone.path);
         const gone = await this.purgePathOnBackend(this.cachedFS, tombstone.path);
@@ -874,11 +885,17 @@ export class ConfigRepo implements IConfigRepo {
       for (const [replicaId, replica] of this.replicaBackends) {
         let gone: boolean;
         if (forceDelete) {
-          // `.mtime` 侧车对 exists() 不可见，unlink 成功（或明确报"不存在"）
-          // 才算确认删除。
-          try { await replica.instance.unlink(tombstone.path); gone = true; }
-          catch (err) { gone = isNotFoundError(err); }
-          if (gone) processed++;
+          if (liveSidecarCandidate && await this.pathExistsOnBackend(replica.instance, sidecarOwner!)) {
+            // 数据文件仍在 → 侧车仍在被使用，保留（不再 DELETE 后重建）。
+            gone = true;
+            alreadyDeleted++;
+          } else {
+            // `.mtime` 侧车对 exists() 不可见，unlink 成功（或明确报"不存在"）
+            // 才算确认删除。
+            try { await replica.instance.unlink(tombstone.path); gone = true; }
+            catch (err) { gone = isNotFoundError(err); }
+            if (gone) processed++;
+          }
         } else {
           const existed = await this.pathExistsOnBackend(replica.instance, tombstone.path);
           gone = await this.purgePathOnBackend(replica.instance, tombstone.path);
@@ -3810,4 +3827,19 @@ export async function createConfigRepo(
   });
 
   return repo;
+}
+
+/**
+ * 若 `path` 是侧车（`<file>.mtime` / `<file>.version` / `<file>.version.mtime`），
+ * 返回它所属的数据文件路径；不是侧车返回 null。
+ *
+ * 用于墓碑处理时判断侧车是否“仍被现存数据文件使用”：是则绝不能先删后重建，
+ * 否则每轮同步都会给同一个文件产生一对 delete/create 提交。
+ */
+function sidecarOwnerPath(path: string): string | null {
+  let owner: string | null = null;
+  if (path.endsWith('.mtime')) owner = path.slice(0, -'.mtime'.length);
+  else if (path.endsWith('.version')) owner = path.slice(0, -'.version'.length);
+  if (owner && owner.endsWith('.version')) owner = owner.slice(0, -'.version'.length);
+  return owner === '' ? null : owner;
 }
