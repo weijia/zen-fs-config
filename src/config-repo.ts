@@ -12,6 +12,7 @@ import {
   type SyncResult,
   type SyncEvent,
   type SyncEventHandler,
+  type SyncFilter,
 } from 'zen-fs-sync';
 import type {
   IConfigRepo,
@@ -186,6 +187,19 @@ async function removeDirectoryTree(fs: TreeFS, dir: string): Promise<void> {
   } catch {
     /* best effort — a leftover empty dir is harmless */
   }
+}
+
+/**
+ * True when an unlink failure means "the entry was already gone" rather than a
+ * real deletion failure. Needed for backend-internal placeholders (`.keep` /
+ * `.mtime`) that are hidden from `exists()`: the only way to remove them is
+ * unlink(), and the only signal we get is the error.
+ */
+function isNotFoundError(err: unknown): boolean {
+  const code = (err as any)?.code;
+  if (code === 'ENOENT' || code === 'ENOTDIR') return true;
+  const message = String((err as any)?.message ?? err);
+  return /ENOENT|not found|does not exist|\b404\b/i.test(message);
 }
 
 /**
@@ -384,6 +398,22 @@ export class ConfigRepo implements IConfigRepo {
   private readonly pollIntervalMs?: number;
   /** Tombstone cache — avoids redundant reads within a single flush() cycle. */
   private tombstoneCache: TombstoneMeta[] | null = null;
+  /**
+   * 墓碑存在期间被排除在同步之外的路径。
+   *
+   * 远端副本可能仍残留被删路径（哪怕只剩 `.keep` / `.keep.mtime` 占位）。
+   * 若同步照常进行，这类残留会被当成"远端新增"再拉回本地，造成空壳复活。
+   * 这些路径改由 processTombstones 主动删除，直到所有副本确认不存在、
+   * 墓碑被 GC 之后才恢复同步。
+   */
+  private readonly tombstoneExcludePrefixes: string[] = [];
+  private readonly syncFilter: SyncFilter = { excludePrefixes: this.tombstoneExcludePrefixes };
+  /**
+   * 本轮 processTombstones 中，各副本对墓碑路径"已确认不存在"的结果。
+   * 目录类路径用 exists() 复核；`.mtime` 侧车对部分后端不可见，只能用
+   * unlink() 是否成功来判定。
+   */
+  private readonly tombstoneConfirmations = new Map<string, Set<string>>();
   /** Per-backend sync state (successful pairs + connect failures). */
   private backendStates = new Map<string, BackendSyncState>();
   /** Last known backend descriptors, for the synchronous unified handle API. */
@@ -758,7 +788,36 @@ export class ConfigRepo implements IConfigRepo {
       return this.tombstoneCache;
     }
     this.tombstoneCache = await readTombstonesFromFs(this.cachedFS, (message) => log.warn(message));
+    this.refreshSyncExclusions(this.tombstoneCache);
     return this.tombstoneCache;
+  }
+
+  /**
+   * 把当前墓碑路径同步到同步排除表。
+   *
+   * 排除表与各同步对共享同一个数组实例（zen-fs-sync 在每次检测时实时读取
+   * `filter.excludePrefixes`），所以这里原地更新即可生效。
+   */
+  private refreshSyncExclusions(tombstones: TombstoneMeta[]): void {
+    this.tombstoneExcludePrefixes.length = 0;
+    const add = (target: string) => {
+      this.tombstoneExcludePrefixes.push(target, `${target}/`);
+    };
+    for (const tombstone of tombstones) {
+      if (!tombstone.path) continue;
+      add(tombstone.path);
+      // `.keep` / `.keep.mtime` 墓碑表示它所在的目录已被删除。同步引擎的
+      // "保留空目录"逻辑会给每个源目录 mkdir，只排除占位文件的话，副本上
+      // 的空目录仍会在本地被重建出来（空壳复活）。这里把目录本身也排除。
+      if (
+        tombstone.path === '/.keep' ||
+        tombstone.path.endsWith('/.keep') ||
+        tombstone.path.endsWith('/.keep.mtime')
+      ) {
+        const dir = tombstone.path.slice(0, tombstone.path.lastIndexOf('/')) || '/';
+        if (dir !== '/') add(dir);
+      }
+    }
   }
 
   /** Invalidate the tombstone cache — call after tombstones are modified. */
@@ -778,80 +837,141 @@ export class ConfigRepo implements IConfigRepo {
    */
   private async processTombstones(): Promise<void> {
     const tombstones = await this.readTombstones();
+    // 每轮重置：`.mtime` 侧车对部分后端不可见，只能用本轮 unlink 结果确认。
+    this.tombstoneConfirmations.clear();
     if (tombstones.length === 0) return;
 
     let processed = 0;
     let alreadyDeleted = 0;
+    let unresolved = 0;
 
     for (const tombstone of tombstones) {
-      // `.mtime` sidecars are backend-internal and hidden from the backend's
-      // index (GiteeFS keeps them in its SHA cache only), so `exists()` returns
-      // false even when the blob is still on the remote. Attempt the unlink
-      // unconditionally for them — that is what removes `<dir>/.keep.mtime`.
-      const forceDelete = isMtimeSidecar(tombstone.path);
+      // `.mtime` sidecars and `.keep` placeholders are backend-internal and
+      // hidden from the backend's index (GiteeFS keeps them in its SHA cache
+      // only), so `exists()` returns false even when the blob is still on the
+      // remote. Attempt the unlink unconditionally for them — that is what
+      // removes `<dir>/.keep.mtime` / `<dir>/.keep`. Otherwise a hidden
+      // placeholder would be "confirmed gone" without ever being deleted, the
+      // tombstone would be GC'd, and the empty directory would reappear on the
+      // next pull.
+      const isKeepPlaceholder =
+        tombstone.path === '/.keep' || tombstone.path.endsWith('/.keep');
+      const forceDelete = isMtimeSidecar(tombstone.path) || isKeepPlaceholder;
       const tVersionPath = forceDelete ? null : versionPathFor(tombstone.path);
-      log.log(`[TOMB-TRACE] processing tombstone: path=${tombstone.path} versionPath=${tVersionPath ?? 'null'} forceDelete=${forceDelete}`);
 
-      // Delete on primary (in case it was re-created)
-      const existedOnPrimary = forceDelete || (await this.safeExists(this.cachedFS, tombstone.path));
-      log.log(`[TOMB-TRACE] primary safeExists(${tombstone.path}) → ${existedOnPrimary}`);
-      if (existedOnPrimary) {
-        log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on primary → EXISTS`);
-      }
-      if (existedOnPrimary) {
-        try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* race */ }
-      }
-      if (tVersionPath) {
-        const vExistedOnPrimary = await this.safeExists(this.cachedFS, tVersionPath);
-        log.log(`[TOMB-TRACE] primary safeExists(${tVersionPath}) → ${vExistedOnPrimary}`);
-        if (vExistedOnPrimary) {
-          try { await this.cachedFS.unlink(tVersionPath); } catch { /* race */ }
-        }
+      // 1. 本地主存储：清掉可能被重建的残留（目录按树删，含 `.keep` 占位）。
+      if (forceDelete) {
+        try { await this.cachedFS.unlink(tombstone.path); processed++; } catch { /* 已不存在 */ }
+      } else {
+        const existedOnPrimary = await this.pathExistsOnBackend(this.cachedFS, tombstone.path);
+        const gone = await this.purgePathOnBackend(this.cachedFS, tombstone.path);
+        if (gone) { if (existedOnPrimary) processed++; else alreadyDeleted++; }
+        else unresolved++;
+        if (tVersionPath) await this.purgePathOnBackend(this.cachedFS, tVersionPath);
       }
 
-      // Delete on all replicas
+      // 2. 所有副本：同样按树清理；只有确认不存在才记录"已确认"。
       for (const [replicaId, replica] of this.replicaBackends) {
-        log.log(`[TOMB-TRACE] checking replica: ${replicaId} for ${tombstone.path}`);
-        // Check existence before unlink — avoids wasteful DELETE requests
-        // on remote backends (RemoteStorage, Gitee, WebDAV) when the file
-        // was already deleted on a previous sync cycle.
-        const existed = forceDelete || (await this.safeExists(replica.instance, tombstone.path));
-        log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tombstone.path}) → ${existed}`);
-        if (existed) {
-          log.log(`[TOMB-TRACE] tombstone check: ${tombstone.path} on ${replicaId} → EXISTS`);
-          try {
-            log.log(`[TOMB-TRACE] calling unlink(${tombstone.path}) on ${replicaId}`);
-            await replica.instance.unlink(tombstone.path);
-            log.log(`[TOMB-TRACE] tombstone ${tombstone.path}: deleted on ${replicaId}`);
-            processed++;
-          } catch (err) {
-            log.log(`[TOMB-TRACE] unlink(${tombstone.path}) on ${replicaId} FAILED: ${err}`);
-            // race — file removed between exists and unlink
-            alreadyDeleted++;
-          }
+        let gone: boolean;
+        if (forceDelete) {
+          // `.mtime` 侧车对 exists() 不可见，unlink 成功（或明确报"不存在"）
+          // 才算确认删除。
+          try { await replica.instance.unlink(tombstone.path); gone = true; }
+          catch (err) { gone = isNotFoundError(err); }
+          if (gone) processed++;
         } else {
-          log.log(`[TOMB-TRACE] replica ${replicaId}: already gone, skipping unlink`);
-          alreadyDeleted++;
+          const existed = await this.pathExistsOnBackend(replica.instance, tombstone.path);
+          gone = await this.purgePathOnBackend(replica.instance, tombstone.path);
+          if (gone) { if (existed) processed++; else alreadyDeleted++; }
+          if (tVersionPath) await this.purgePathOnBackend(replica.instance, tVersionPath);
         }
-        if (tVersionPath) {
-          const vExisted = await this.safeExists(replica.instance, tVersionPath);
-          log.log(`[TOMB-TRACE] replica ${replicaId} safeExists(${tVersionPath}) → ${vExisted}`);
-          if (vExisted) {
-            try {
-              log.log(`[TOMB-TRACE] calling unlink(${tVersionPath}) on ${replicaId}`);
-              await replica.instance.unlink(tVersionPath);
-            } catch (err) {
-              log.log(`[TOMB-TRACE] unlink(${tVersionPath}) on ${replicaId} FAILED: ${err}`);
-            }
+
+        if (gone) {
+          let confirmed = this.tombstoneConfirmations.get(tombstone.path);
+          if (!confirmed) {
+            confirmed = new Set<string>();
+            this.tombstoneConfirmations.set(tombstone.path, confirmed);
           }
+          confirmed.add(replicaId);
+        } else {
+          // 副本仍持有该路径（哪怕只剩 `.keep` / `.keep.mtime`）：
+          // 墓碑必须保留，等下一轮继续清理。
+          unresolved++;
+          log.warn(
+            `[ConfigRepo] tombstone kept: ${tombstone.path} still present on replica ${replicaId}`,
+          );
         }
       }
     }
 
-    // Only log summary — per-file logs only appear for actual deletions
-    if (processed > 0 || alreadyDeleted > 0) {
-      log.log(`[TOMB-TRACE] processTombstones: ${tombstones.length} tombstone(s), ${processed} deleted, ${alreadyDeleted} already gone`);
+    if (processed > 0 || alreadyDeleted > 0 || unresolved > 0) {
+      log.log(
+        `[ConfigRepo] processTombstones: ${tombstones.length} tombstone(s), ` +
+        `${processed} deleted, ${alreadyDeleted} already gone, ${unresolved} unresolved`,
+      );
     }
+  }
+
+  /**
+   * 删除墓碑目标在某个后端上的全部残留。
+   *
+   * 目录不能直接 unlink（会抛 EISDIR）。旧实现把这个异常当成"已被并发删除"
+   * 而继续推进确认，墓碑随后被 GC；但副本上的占位目录仍然存在，下一次同步
+   * 就把它当作远端内容拉回本地，形成空壳复活。
+   *
+   * 这里按树清理：
+   * 1. 强制删掉 `.keep` / `.keep.mtime` 占位（部分后端把 `.keep` 隐藏在索引里，
+   *    readdir 看不到，只能按路径直接删）；
+   * 2. 递归清理可见子项；
+   * 3. rmdir（后端不支持目录时退回 unlink）。
+   *
+   * @returns 是否确认该路径已不存在；清理失败返回 false，墓碑必须保留。
+   */
+  private async purgePathOnBackend(fs: any, targetPath: string): Promise<boolean> {
+    let isDir = false;
+    try {
+      const stat = await fs.stat(targetPath);
+      isDir = typeof stat?.isDirectory === 'function'
+        ? stat.isDirectory()
+        : !!(stat && ((stat.mode ?? 0) & 0o170000) === 0o040000);
+    } catch {
+      // stat 失败：路径可能本就不存在，也可能后端不支持 stat。
+      if (!(await this.pathExistsOnBackend(fs, targetPath))) return true;
+    }
+
+    if (!isDir) {
+      try { await fs.unlink(targetPath); } catch { /* 可能已被删除 */ }
+      return !(await this.pathExistsOnBackend(fs, targetPath));
+    }
+
+    for (const placeholder of [`${targetPath}/.keep`, `${targetPath}/.keep.mtime`]) {
+      try { await fs.unlink(placeholder); } catch { /* 不存在或后端不支持 */ }
+    }
+    let children: string[] = [];
+    try { children = await fs.readdir(targetPath); } catch { /* 目录可能已消失 */ }
+    for (const child of children) {
+      await this.purgePathOnBackend(fs, `${targetPath}/${child}`);
+    }
+    try { await fs.rmdir(targetPath); } catch {
+      try { await fs.unlink(targetPath); } catch { /* 仍存在 */ }
+    }
+    if (await this.pathExistsOnBackend(fs, targetPath)) {
+      // 目录还在（多半是占位文件又出现）：再清一次占位后判定失败。
+      for (const placeholder of [`${targetPath}/.keep`, `${targetPath}/.keep.mtime`]) {
+        try { await fs.unlink(placeholder); } catch { /* ignore */ }
+      }
+      try { await fs.rmdir(targetPath); } catch { /* ignore */ }
+      return !(await this.pathExistsOnBackend(fs, targetPath));
+    }
+    return true;
+  }
+
+  /** 后端无关的存在性判断：优先 exists()，否则退化为 stat()。 */
+  private async pathExistsOnBackend(fs: any, path: string): Promise<boolean> {
+    if (typeof fs?.exists === 'function') {
+      try { return !!(await fs.exists(path)); } catch { return false; }
+    }
+    try { await fs.stat(path); return true; } catch { return false; }
   }
 
   /**
@@ -1023,7 +1143,13 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * After sync: mark each tombstone as confirmed by all replica backends.
+   * After sync: mark each tombstone as confirmed by replicas where the target
+   * path was actually verified absent.
+   *
+   * 旧实现把所有副本无条件写进 confirmedBy，只要有一轮同步跑过就认为
+   * "所有副本都删干净了"。但副本可能因为网络/后端限制删除失败，或只剩
+   * `.keep` / `.keep.mtime` 占位目录；墓碑一旦被 GC，下一轮同步就把残留
+   * 当作远端内容拉回本地。现在只确认 processTombstones 本轮真正清干净的副本。
    */
   private async updateTombstoneConfirmations(): Promise<void> {
     const tombstones = await this.readTombstones();
@@ -1031,13 +1157,13 @@ export class ConfigRepo implements IConfigRepo {
 
     let modified = 0;
     for (const tombstone of tombstones) {
-      // Add all replica IDs that we just synced with
       let changed = false;
+      const confirmedReplicas = this.tombstoneConfirmations.get(tombstone.path);
       for (const replicaId of this.replicaBackends.keys()) {
-        if (!tombstone.confirmedBy.includes(replicaId)) {
-          tombstone.confirmedBy.push(replicaId);
-          changed = true;
-        }
+        if (tombstone.confirmedBy.includes(replicaId)) continue;
+        if (!confirmedReplicas?.has(replicaId)) continue;
+        tombstone.confirmedBy.push(replicaId);
+        changed = true;
       }
       // Only rewrite when the confirmation set actually changed — otherwise we
       // would re-touch the tombstone's mtime every cycle and feed the sync
@@ -1063,6 +1189,31 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * 墓碑路径是否已在所有副本上确认不存在。
+   *
+   * `.mtime` 侧车与 `.keep` 占位对部分后端不可见（`exists()` 恒为 false），
+   * 因此只能相信本轮 `processTombstones` 的 unlink 结果；其余路径在 GC 前
+   * 现场复核一次，避免"确认之后副本又把残留带了回来"。
+   *
+   * 任一位置仍存在就返回 false —— 墓碑必须保留，直到真正删干净。
+   */
+  private async allReplicasConfirmAbsent(path: string): Promise<boolean> {
+    const confirmed = this.tombstoneConfirmations.get(path);
+    const hiddenPlaceholder = isMtimeSidecar(path) || path === '/.keep' || path.endsWith('/.keep');
+    if (hiddenPlaceholder) {
+      for (const replicaId of this.replicaBackends.keys()) {
+        if (!confirmed?.has(replicaId)) return false;
+      }
+      return true;
+    }
+
+    for (const [, replica] of this.replicaBackends) {
+      if (await this.pathExistsOnBackend(replica.instance, path)) return false;
+    }
+    return true;
+  }
+
+  /**
    * GC: remove tombstones where all backends in backends.json have confirmed.
    *
    * Tombstones are deleted from ALL backends (local + replicas), not just
@@ -1083,7 +1234,9 @@ export class ConfigRepo implements IConfigRepo {
     const allBackendIds = [...this.replicaBackends.keys()];
 
     for (const tombstone of tombstones) {
-      const allConfirmed = allBackendIds.every(id => tombstone.confirmedBy.includes(id));
+      // 不能只看历史 confirmedBy：某副本可能在上一次确认之后又把路径/占位目录
+      // 带了回来。GC 前必须逐个副本复核"当前确实不存在"。
+      const allConfirmed = await this.allReplicasConfirmAbsent(tombstone.path);
       if (allConfirmed) {
         for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
           const tombstonePath = tombstonePathFor(tombstone.path, dir);
@@ -1378,6 +1531,9 @@ export class ConfigRepo implements IConfigRepo {
             direction: SyncDirection.BiDirectional,
             conflictStrategy: 'source-wins' as any,
             pollIntervalMs,
+            // 墓碑未清理前排除被删路径：副本残留（含 `.keep` 占位）不会被当成
+            // "远端新增"再拉回本地。
+            filter: this.syncFilter,
             preSyncHook: async () => {
               try {
                 this.invalidateTombstoneCache();
@@ -1982,6 +2138,8 @@ export class ConfigRepo implements IConfigRepo {
       {
         direction: SyncDirection.BiDirectional,
         conflictStrategy: 'source-wins' as any,
+        // 墓碑未清理前排除被删路径，避免副本残留复活到本地。
+        filter: this.syncFilter,
         preSyncHook: async () => {
           try {
             this.invalidateTombstoneCache();
