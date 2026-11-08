@@ -4,7 +4,7 @@
  * Implements the layout agreed in SYNC-GROUP-UNIFICATION.zh-CN.md:
  *
  *   /.meta/group.json                 # group descriptor (kind/id/features)
- *   /.meta/tombstones/{encoded}.json  # tombstones (legacy: /.meta/.deleted)
+ *   /.meta/tombstones/{encoded}.json  # tombstones (the only deletion record)
  *   /.meta/versions/{encoded}.json    # version records for data groups
  *   /.meta/conflicts/{conflictId}/    # conflict archives (legacy: /.meta/.conflicts)
  *   /.config/**                       # config-sync only (not synced by data groups)
@@ -40,6 +40,10 @@ export const META_DIR = '/.meta';
 export const GROUP_DESCRIPTOR_FILE = `${META_DIR}/group.json`;
 export const META_BACKENDS_DIR = `${META_DIR}/backends`;
 export const TOMBSTONES_DIR = `${META_DIR}/tombstones`;
+/**
+ * 历史归档目录。仅作为常量保留（旧数据仍在远端，按普通内容对待）：
+ * 既不读取也不写入，删除状态只以 {@link TOMBSTONES_DIR} 为准。
+ */
 export const LEGACY_TOMBSTONES_DIR = `${META_DIR}/.deleted`;
 export const VERSIONS_DIR = `${META_DIR}/versions`;
 export const CONFLICTS_DIR = `${META_DIR}/conflicts`;
@@ -305,8 +309,8 @@ function mergeTombstone(byPath: Map<string, TombstoneMeta>, tombstone: Tombstone
 }
 
 /**
- * Read every tombstone from `.meta/tombstones/` and the legacy `.meta/.deleted/`
- * mirror, never dropping a corrupt record silently.
+ * Read every tombstone from `.meta/tombstones/`, never dropping a corrupt
+ * record silently.
  *
  * `warn` receives a human-readable diagnostic (file path + parse problem) for
  * each file that needed repair or recovery.
@@ -316,12 +320,13 @@ export async function readTombstonesFromFs(
   warn: (message: string) => void,
 ): Promise<TombstoneMeta[]> {
   const byPath = new Map<string, TombstoneMeta>();
-  for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
+  {
+    const dir = TOMBSTONES_DIR;
     let entries: string[];
     try {
       entries = await fs.readdir(dir);
     } catch {
-      continue; // directory doesn't exist in this layout
+      return []; // directory doesn't exist in this layout
     }
     for (const entry of entries) {
       if (!entry.endsWith('.json')) continue;
@@ -476,9 +481,7 @@ export interface TombstoneTarget {
 /**
  * Tombstone store for a group's local store.
  *
- * New writes go to `/.meta/tombstones/`; for one release cycle a mirror copy is
- * also written to the legacy `/.meta/.deleted/` path so older clients still see
- * deletions. Reads accept both.
+ * 删除状态只写在 `/.meta/tombstones/`；历史归档目录不再读写。
  */
 export class TombstoneStore {
   constructor(
@@ -486,48 +489,39 @@ export class TombstoneStore {
     private author: string,
   ) {}
 
-  private pathFor(filePath: string, dir = TOMBSTONES_DIR): string {
-    return `${dir}/${encodeMetaPath(filePath)}.json`;
+  private pathFor(filePath: string): string {
+    return `${TOMBSTONES_DIR}/${encodeMetaPath(filePath)}.json`;
   }
 
-  /** All tombstones, new path first, legacy only for paths not already seen. */
+  /** All tombstones. */
   async list(): Promise<TombstoneMeta[]> {
     return readTombstonesFromFs(this.fs, (message) => log.warn(message));
   }
 
-  /** Write a tombstone (new + legacy mirror). */
+  /** Write a tombstone. */
   async write(tombstone: TombstoneMeta): Promise<void> {
     const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
-    const paths = [
-      this.pathFor(tombstone.path),
-      this.pathFor(tombstone.path, LEGACY_TOMBSTONES_DIR),
-    ];
-    for (const p of paths) {
-      await ensureParentDir(this.fs, p);
-      await this.fs.writeFile(p, bytes);
-    }
+    const p = this.pathFor(tombstone.path);
+    await ensureParentDir(this.fs, p);
+    await this.fs.writeFile(p, bytes);
   }
 
-  /** Persist an updated tombstone (confirmations) to whichever paths exist. */
+  /** Persist an updated tombstone (confirmations) when it still exists. */
   async save(tombstone: TombstoneMeta): Promise<void> {
     const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
-    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-      const p = this.pathFor(tombstone.path, dir);
-      if (!(await existsSafe(this.fs, p))) continue;
-      await this.fs.writeFile(p, bytes);
-    }
+    const p = this.pathFor(tombstone.path);
+    if (!(await existsSafe(this.fs, p))) return;
+    await this.fs.writeFile(p, bytes);
   }
 
-  /** Delete a tombstone from both layouts. */
+  /** Delete a tombstone. */
   async remove(tombstone: TombstoneMeta): Promise<void> {
-    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-      const p = this.pathFor(tombstone.path, dir);
-      if (!(await existsSafe(this.fs, p))) continue;
-      try {
-        await this.fs.unlink(p);
-      } catch {
-        /* race */
-      }
+    const p = this.pathFor(tombstone.path);
+    if (!(await existsSafe(this.fs, p))) return;
+    try {
+      await this.fs.unlink(p);
+    } catch {
+      /* race */
     }
   }
 
@@ -580,28 +574,26 @@ export class TombstoneStore {
     return modified;
   }
 
-  /** Remove tombstones confirmed by every connected backend (and their mirrors). */
+  /** Remove tombstones confirmed by every connected backend. */
   async gc(allBackendIds: string[], targets: TombstoneTarget[] = []): Promise<void> {
     const tombstones = await this.list();
     for (const tombstone of tombstones) {
       const allConfirmed = allBackendIds.every((id) => tombstone.confirmedBy.includes(id));
       if (!allConfirmed) continue;
-      for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-        const p = this.pathFor(tombstone.path, dir);
-        if (await existsSafe(this.fs, p)) {
+      const p = this.pathFor(tombstone.path);
+      if (await existsSafe(this.fs, p)) {
+        try {
+          await this.fs.unlink(p);
+        } catch {
+          /* race */
+        }
+      }
+      for (const target of targets) {
+        if (await existsSafe(target.fs, p)) {
           try {
-            await this.fs.unlink(p);
+            await target.fs.unlink(p);
           } catch {
             /* race */
-          }
-        }
-        for (const target of targets) {
-          if (await existsSafe(target.fs, p)) {
-            try {
-              await target.fs.unlink(p);
-            } catch {
-              /* race */
-            }
           }
         }
       }

@@ -372,7 +372,7 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
     expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
 
     // A tombstone should have been created for the corrupted file
-    const deletedEntries = await repo.rootFS.promises.readdir('/.meta/.deleted').catch(() => []);
+    const deletedEntries = await repo.rootFS.promises.readdir('/.meta/tombstones').catch(() => []);
     const corruptTombstone = deletedEntries.find((f: string) => f.includes('corrupt-rs'));
     expect(corruptTombstone).toBeDefined();
 
@@ -561,8 +561,8 @@ describe('removeBackend — tombstone-based deletion', () => {
     // Remove it
     await repo.removeBackend('rs-1');
 
-    // Check that a tombstone file was created in /.meta/.deleted/
-    const deletedDir = '/.meta/.deleted';
+    // Check that a tombstone file was created in /.meta/tombstones/
+    const deletedDir = '/.meta/tombstones';
     const entries = await repo.rootFS.promises.readdir(deletedDir);
     const tombstoneFiles = entries.filter((f: string) => f.includes('rs-1'));
     expect(tombstoneFiles.length).toBeGreaterThan(0);

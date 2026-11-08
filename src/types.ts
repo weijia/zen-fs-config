@@ -376,7 +376,7 @@ export interface SyncGroupHandle {
   /**
    * 该组**声明**的后端列表（权威定义，允许尚未连接成功的条目）。
    *
-   * 数据组读自自己的 `.meta/backends/`；配置组读自 `.config/backends/`。
+   * 数据组与配置组都读自 `.meta/backends/`（唯一权威位置）。
    * 与 `listBackends()`（已连接视图）不同，这个列表不会因为后端暂时不可达
    * 而少显示条目。
    */

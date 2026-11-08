@@ -67,17 +67,17 @@ interface SyncGroup {
 /
 ├─ .meta/
 │  ├─ group.json                      # 统一组描述符 { schemaVersion:2, kind:'config', id, name?, features }
-│  ├─ backends/{id}.json              # 旧镜像（双写，兼容旧客户端；权威在 .config/backends/）
+│  ├─ backends/{id}.json              # **权威后端描述符**（配置组与数据组统一位置）
 │  ├─ backends.json                   # 更旧格式（pre-0.4.0，仅读迁移）
-│  ├─ app-data-groups/{appId}/{id}.json   # 旧镜像（双写）
-│  ├─ tombstones/{encoded}.json       # 墓碑
+│  ├─ app-data-groups/{appId}/{id}.json   # 旧镜像（只读兼容，不再写）
+│  ├─ tombstones/{encoded}.json       # 墓碑（删除状态的唯一凭据）
 │  ├─ versions/...                    # 版本
 │  └─ conflicts/...                   # 冲突归档
 ├─ .config/
 │  ├─ group-type                      # 'config-sync'
-│  ├─ backends/{id}.json              # 本组副本拓扑（权威）
+│  ├─ backends/{id}.json              # 历史位置：**不再读取**，删除后端时尽力清理
 │  ├─ config-sync-group.json          # 显示名
-│  └─ app-data-groups/{appId}/{id}.json   # 数据组**引导副本**
+│  └─ app-data-groups/{appId}/{id}.json   # 数据组**登记 + 引导副本**（唯一写入位置）
 ├─ nodes/{nodeId}/...                 # 节点配置
 ├─ shared/...                         # 共享配置
 └─ <app 配置数据>
@@ -98,6 +98,50 @@ interface SyncGroup {
 数据组 pair 的 `filter.excludePrefixes = ['/.config', '/nodes', '/shared']`（[config-repo.ts#L89](file:///C:/codes/nodejs/zen-fs-config/src/config-repo.ts#L89)），`.meta/` 保留在同步区；`group.fs` 仍隐藏并拒写 `.meta`、`.config`（隐藏 ≠ 不同步）。
 
 > 版本 sidecar 不是目录，而是与数据文件同目录的 `<name>.version`（[version.ts#L19-L41](file:///C:/codes/nodejs/zen-fs-config/src/version.ts#L19-L41)）；墓碑文件名由路径编码：`/a/b.json` → `a__b++json.json`（[config-repo.ts#L94-L100](file:///C:/codes/nodejs/zen-fs-config/src/config-repo.ts#L94-L100)）。
+
+### 1.2.1 目录结构（权威关系与读取优先级）
+
+**总览**
+
+```
+/
+├─ .meta/                                # 两组共享的元数据（参与数据组同步）
+│  ├─ group.json                         # 组自描述（kind / id / features）
+│  ├─ backends/{id}.json                 # ★权威：所有组的后端描述符（配置组 + 数据组）
+│  ├─ tombstones/{encodedPath}.json      # ★权威：删除状态（唯一凭据）
+│  ├─ versions/{encodedPath}.json        # 数据组版本记录
+│  ├─ conflicts/{conflictId}/            # 冲突归档
+│  ├─ app-data-groups/{appId}/{id}.json  # 旧镜像：只读兼容，不再写入
+│  ├─ backends.json                      # 更旧单文件拓扑：只读迁移
+│  └─ .deleted/                          # 历史归档：不读不写，按普通内容对待
+├─ .config/                              # 配置组专属（数据组 filter 排除）
+│  ├─ group-type                         # 'config-sync' | 'data-sync'
+│  ├─ config-sync-group.json             # 配置组显示名
+│  ├─ app-data-groups/{appId}/{id}.json  # ★登记权威：数据组登记 + 引导副本
+│  └─ backends/{id}.json                 # 历史位置：不再读取，删除后端时尽力清理
+├─ nodes/{nodeId}/...                    # 节点配置（配置组）
+├─ shared/...                            # 共享配置（配置组）
+└─ <用户数据 / app 配置>
+```
+
+**职责与权威关系**
+
+| 目录 / 文件 | 职责 | 权威？ | 读取优先级 | 参与数据组同步 |
+|---|---|---|---|---|
+| `.meta/backends/{id}.json` | 所有同步组的后端列表（含凭据） | ✅ 唯一权威 | 唯一来源，无回退 | 是 |
+| `.config/backends/{id}.json` | 0.6.x 及更早的配置组后端位置 | ❌ 历史残留 | **不读** | 否 |
+| `.meta/app-data-groups/{appId}/{id}.json` | 0.6.x 的数据组登记镜像 | ❌ 历史镜像 | 仅当 `.config` 那份缺失/损坏时回退读 | 是 |
+| `.config/app-data-groups/{appId}/{id}.json` | 数据组登记 + 新设备引导 | ✅ 登记权威 | 优先读 | 否 |
+| `.meta/tombstones/{encoded}.json` | 删除状态 | ✅ 唯一凭据 | 唯一来源，无回退 | 是 |
+| `.meta/.deleted/` | 0.6.x 墓碑归档 | ❌ | **不读不写** | 是（作为普通内容） |
+| `.meta/versions/`、`.meta/conflicts/` | 版本 / 冲突 | ✅ | 新路径优先，旧 `.conflicts` 回退 | 是 |
+
+**读写规则**
+
+- **后端**：写入只落 `.meta/backends/{id}.json`；删除后端时写 `.meta/tombstones/...` 墓碑并删该文件，同时对 `.config/backends/{id}.json` 残留做尽力 unlink（清不掉不影响正确性——读侧根本不依赖它）。
+- **数据组登记**：写入只落 `.config/app-data-groups/...`；`.meta/app-data-groups/...` 只读，用于兼容旧布局，并保证「只在 `.meta` 存在的坏描述符」仍能按 groupId 定位并删除。
+- **墓碑**：写入只落 `.meta/tombstones/`；`.meta/.deleted/` 既不读也不写，历史文件按普通内容对待。
+- **迁移**：不做懒迁移。`/.config/backends/` 中的旧条目不参与后端枚举，需要时由用户在 Backends 页重新添加（见 README / 手工重加指引）。
 
 ### 1.3 pair 构建方式
 
@@ -172,10 +216,10 @@ interface SyncGroup {
 | 路径 | 归属 | 权威？ | 是否参与数据组同步 | 说明 |
 |---|---|---|---|---|
 | `.meta/group.json` | 通用（每个组各一份） | ✅ 本组自描述 | 是 | `{ schemaVersion, kind, id, name?, features }`；**不写 `updatedAt`** |
-| `.meta/backends/{id}.json` | 数据组：**权威**；配置组：旧镜像 | ✅（数据组） | 是 | 数据组自身拓扑，懒迁移自引导副本 |
-| `.config/backends/{id}.json` | 配置组专属 | ✅（配置组） | **否** | 本组副本拓扑/凭据 |
-| `.config/app-data-groups/{appId}/{id}.json` | 配置组专属 | ❌ 引导副本 | **否** | 登记 + 新设备引导；`backends` 字段长期保留 |
-| `.meta/app-data-groups/...` | 配置组专属（旧镜像） | ❌ | 否 | 双写兼容旧客户端，停止条件见 §4.4 |
+| `.meta/backends/{id}.json` | 通用（每个组各一份） | ✅ **唯一权威** | 是 | 配置组与数据组共用同一位置 |
+| `.config/backends/{id}.json` | 历史位置（0.6.x 及更早） | ❌ 残留 | **否** | 不再读取，仅删除时尽力清理 |
+| `.config/app-data-groups/{appId}/{id}.json` | 配置组专属 | ✅ 登记权威 | **否** | 登记 + 新设备引导；`backends` 字段长期保留 |
+| `.meta/app-data-groups/...` | 配置组专属（旧镜像） | ❌ | 否 | 只读兼容，不再写入 |
 | `.meta/tombstones`、`.meta/versions`、`.meta/conflicts` | 通用 | ✅ | **是** | 两组都需要的跨设备删除/版本/冲突依据 |
 | `nodes/`、`shared/` | 配置组专属（内容） | — | 否 | 由配置 API 读写，用户可见 |
 | `<用户数据>` | 数据组 | ✅ | 是 | 产品层 `group.fs` 的可见范围 |
@@ -275,12 +319,12 @@ filter: {
 
 | 旧路径 | 新路径 | 说明 |
 |---|---|---|
-| `/.meta/backends/{id}.json`、`/.meta/backends.json`（配置组） | `.config/backends/{id}.json` | 含 token 等凭据；**必须**迁移或双读，不能丢失 |
-| `/.meta/app-data-groups/{appId}/{id}.json` | `.config/app-data-groups/{appId}/{groupId}.json` | 数据组引导副本 |
+| `/.meta/backends.json`（pre-0.4.0 单文件） | `.meta/backends/{id}.json` | 启动时一次性迁移，迁完删旧文件 |
+| `/.meta/app-data-groups/{appId}/{id}.json` | `.config/app-data-groups/{appId}/{groupId}.json` | 数据组引导副本（旧路径只读） |
 | **（新增）数据组 `/.meta/backends/`** | **数据组自身 `/.meta/backends/{id}.json`（权威）** | 旧版本从不写它；首次启动从配置组引导副本**懒迁移回填**，不搬文件 |
 | `/.meta/group-type` | `.config/group-type` | `connect()` 类型探测依赖 |
 | `/.meta/config-sync-group.json` | `.config/config-sync-group.json` | 配置组显示名 |
-| `/.meta/.deleted/*.json` | `.meta/tombstones/*.json` | 仅改名，内容不变 |
+| `/.meta/.deleted/*.json` | `.meta/tombstones/*.json` | 已完成改名；0.7 起旧目录既不读也不写，历史文件留存 |
 | `/.meta/.conflicts/*` | `.meta/conflicts/*` | 仅改名 |
 | `<file>.version`（与数据文件同目录） | `.meta/versions/{encodedPath}.version` | 路径语义变化，**必须双读回退** |
 
@@ -294,7 +338,7 @@ filter: {
 **具体风险**
 
 - 版本 sidecar 集中化后，读取必须“先新路径、后旧 sidecar”；否则版本判定会重置，冲突策略退化为 `source-wins`（旧 sidecar 还在，但新代码读不到）。
-- `.config/backends` 是同步拓扑与登录凭据的唯一来源；迁移失败会导致“远端仍在、客户端无法再连接”，且用户不易自助恢复。
+- `.meta/backends` 是同步拓扑与登录凭据的唯一来源。0.7 起 `.config/backends` 不再读取：未迁移的旧部署升级后需在 Backends 页重新添加后端（凭据需重新填写）。
 - `.meta` 在部分后端（Gitee）是逐文件 API；搬迁需要幂等、可重入、可断点续跑，并处理“搬到一半失败”的中间态。
 - 半迁移态下同步引擎会把缺失文件当删除/新增（删除判定依赖内存快照，无持久化记忆），可能造成重复上传或误删。
 
@@ -480,7 +524,7 @@ export interface ConnectResult {
 | 工作 | 可验证点 |
 |---|---|
 | `SyncGroupHandle` / `ConfigSyncGroupHandle` 落地；`connect()` 增加 `groups` | 单测：同一份 data-sync 远端 `connect()` 后 `groups[0].kind='config'`（本地-only）、`groups[1].kind='data'` |
-| 描述符 v2：`.meta/group.json`（通用）+ `.config/backends/*.json`（配置专属） | 旧 `/.meta/backends/*` 与 `/.meta/backends.json` 仍可读（回退）；新写双写；`getGroupType()` 优先读 `.config/group-type`、回退 `/.meta/group-type` |
+| 描述符 v2：`.meta/group.json`（通用）+ `.meta/backends/*.json`（**配置与数据统一**） | `/.meta/backends.json` 仍可读（一次性迁移）；`.config/backends/*` 不再读取也不写入；`getGroupType()` 优先读 `.config/group-type`、回退 `/.meta/group-type` |
 | **数据组自描述（0.6.0 已完成）**：数据组写自己的 `.meta/backends/{id}.json` 并作为权威；配置组描述符降级为引导副本；删除写墓碑；冲突墓碑优先 | 单测 `data-group-self-description.test.ts`：写入、懒迁移回填、墓碑裁剪、重复打开字节不变 |
 | **规范化序列化 + 幂等写（0.6.0 已完成）**：`serialize(parse(bytes)) === bytes`；构造顺序无关；投影相同零写入 | 单测同上；`updatedAt` 不再出现在 `group.json` |
 | 统一命名 API：`rename()`、`replaceBackend(id, type, options)` | 配置组与数据组同签名；UI 不再有两条改名路径 |

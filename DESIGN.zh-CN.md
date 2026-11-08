@@ -87,7 +87,7 @@ createConfigRepo('my-app', options?)
 flush()
   │
   ├─ 1. processTombstones()
-  │     遍历 /.meta/.deleted/ 中的每个墓碑：
+  │     遍历 /.meta/tombstones/ 中的每个墓碑（`.meta/.deleted/` 不再参与）：
   │     ├─ 删除主后端上的实际文件（防止被同步重新创建）
   │     ├─ 删除所有副本上的实际文件
   │     └─ 删除所有副本上的版本 sidecar 文件
@@ -124,7 +124,7 @@ flush()
 ```
 deleteFile('/.meta/backends/old-backend.json')
   │
-  ├─ 1. 写入墓碑：/.meta/.deleted/++meta__backends__old-backend++json.json
+  ├─ 1. 写入墓碑：/.meta/tombstones/++meta__backends__old-backend++json.json
   │     { path, deletedAt, deletedBy, confirmedBy: [primaryBackendId] }
   │
   ├─ 2. 删除主后端上的实际文件（IndexedDB）
@@ -242,8 +242,8 @@ connect('my-app', options?)
   │
   ├─ 2. 若提供了 options.backendInfo，读取 /.meta/group-type
   │
-  ├─ "config-sync" → 将该后端连到配置同步组；再按 .meta/app-data-groups/{appId}/*.json
-  │                  加载每个数据组（UC2）
+  ├─ "config-sync" → 将该后端连到配置同步组；再按 .config/app-data-groups/{appId}/*.json
+  │                  （缺失时回退 .meta/app-data-groups/{appId}/*.json）加载每个数据组（UC2）
   │                  返回 { groupType: "config-sync", repo, appDataGroups }
   │
   ├─ "data-sync"   → 配置同步组保持本地；确保默认数据组存在并把该后端挂上去（UC3）。
@@ -390,17 +390,23 @@ syncBidirectional()
 ```
 /
 ├─ .meta/                               [同步到副本]
-│  ├─ group-type                        组类型标记："config-sync"
-│  ├─ backends/                         后端拓扑（每个后端一个文件）
-│  │  ├─ local-idb.json                 { id, type, options, description }
-│  │  ├─ gitee-prod.json
+│  ├─ group.json                        统一组描述符 { schemaVersion:2, kind, id, name?, features }
+│  ├─ backends/                         后端拓扑（配置组与数据组统一，唯一权威）
+│  │  ├─ gitee-prod.json                { id, type, options, description }
 │  │  └─ ...
-│  ├─ app-data-groups/                  数据同步组引用（按应用）
+│  ├─ app-data-groups/                  旧镜像（只读兼容，不再写入）
 │  │  └─ {appId}/
 │  │     └─ {dataGroupId}.json
-│  ├─ .deleted/                         删除墓碑（跨后端删除传播）
+│  ├─ tombstones/                       删除墓碑（删除状态的唯一凭据）
 │  │  └─ {encoded-path}.json
-│  └─ .conflicts/                       冲突归档（双方内容都保存）
+│  ├─ .deleted/                         历史归档（不读不写，按普通内容对待）
+│  └─ conflicts/                        冲突归档（双方内容都保存）
+│
+├─ .config/                             配置组专属（数据组不同步）
+│  ├─ group-type                        "config-sync" | "data-sync"
+│  ├─ config-sync-group.json            配置组显示名
+│  ├─ app-data-groups/{appId}/{id}.json 数据组登记 + 引导副本（唯一写入位置）
+│  └─ backends/                         历史位置（不再读取，仅删除时尽力清理）
 │
 ├─ {appId}/                             [双向同步]
 │  ├─ db.json
@@ -506,7 +512,7 @@ private async getSnapshot(fs: SyncableFS): Promise<Map<string, FileSnapshot> | n
 
 | 机制 | 所在层 | 触发方式 | 工作原理 |
 |------|-------|---------|---------|
-| 墓碑 | `zen-fs-config`（应用层） | 应用调用 `deleteFile()` | 写入 `.meta/.deleted/` 标记，在同步**之前**直接在所有副本上物理删除文件 |
+| 墓碑 | `zen-fs-config`（应用层） | 应用调用 `deleteFile()` | 写入 `.meta/tombstones/` 标记，在同步**之前**直接在所有副本上物理删除文件 |
 | 删除传播 | `zen-fs-sync`（引擎层） | 同步检测到一端独有文件 | 与上次快照比较，判断文件是新建还是被删除 |
 
 墓碑处理应用主动发起的删除（常见场景）。删除传播处理绕过墓碑流程的删除 — 例如远端后端上的外部修改，或其他同步机制移除的文件。

@@ -3,7 +3,7 @@
  *
  * Covers:
  * - `.meta/group.json` written by both kinds.
- * - `.config/` config metadata + legacy `.meta` mirrors and legacy read fallback.
+ * - `.meta/backends/` is the only backend descriptor location (`.config/backends/` ignored).
  * - data groups: `.meta` synced, `.config|nodes|shared` filtered, metadata hidden.
  * - tombstone delete survives a restart (no resurrection).
  * - version records, conflict store, purge helpers, failed backend states.
@@ -94,8 +94,10 @@ describe('config-sync group layout', () => {
     expect(decode(await repo.rootFS.promises.readFile('/.meta/group-type'))).toBe('config-sync');
 
     await repo.addBackend('cfg-b1', 'UnifyRemote', { label: 'cfg-b1' });
-    expect(await exists(repo.rootFS, '/.config/backends/cfg-b1.json')).toBe(true);
+    // Backend descriptors live in `.meta/backends/` only — `.config/backends/`
+    // is no longer read or written.
     expect(await exists(repo.rootFS, '/.meta/backends/cfg-b1.json')).toBe(true);
+    expect(await exists(repo.rootFS, '/.config/backends/cfg-b1.json')).toBe(false);
 
     // Unified handle surface.
     expect(repo.kind).toBe('config');
@@ -109,16 +111,29 @@ describe('config-sync group layout', () => {
     await repo.dispose();
   });
 
-  it('reads legacy-only backend descriptors from .meta/backends', async () => {
+  it('reads backend descriptors written directly under .meta/backends', async () => {
     const repo = await createConfigRepo('unify-legacy-read', { nodeId: 'n2' });
 
-    const legacy = JSON.stringify({ id: 'legacy-only', type: 'UnifyRemote', options: { label: 'legacy-only' } });
+    const descriptor = JSON.stringify({ id: 'meta-only', type: 'UnifyRemote', options: { label: 'meta-only' } });
     await mkdirp(repo.rootFS, '/.meta/backends');
-    await repo.rootFS.promises.writeFile('/.meta/backends/legacy-only.json', new TextEncoder().encode(legacy));
+    await repo.rootFS.promises.writeFile('/.meta/backends/meta-only.json', new TextEncoder().encode(descriptor));
 
     const backends = await (repo as any).readAllBackendDescriptors() as Array<{ id: string }>;
-    expect(backends.some((b) => b.id === 'legacy-only')).toBe(true);
-    expect(repo.listBackends().some((b) => b.id === 'legacy-only')).toBe(true);
+    expect(backends.some((b) => b.id === 'meta-only')).toBe(true);
+    expect(repo.listBackends().some((b) => b.id === 'meta-only')).toBe(true);
+
+    await repo.dispose();
+  });
+
+  it('ignores leftovers in .config/backends', async () => {
+    const repo = await createConfigRepo('unify-config-backends-ignored', { nodeId: 'n2b' });
+
+    const stale = JSON.stringify({ id: 'stale-cfg', type: 'UnifyRemote', options: { label: 'stale' } });
+    await mkdirp(repo.rootFS, '/.config/backends');
+    await repo.rootFS.promises.writeFile('/.config/backends/stale-cfg.json', new TextEncoder().encode(stale));
+
+    const backends = await (repo as any).readAllBackendDescriptors() as Array<{ id: string }>;
+    expect(backends.some((b) => b.id === 'stale-cfg')).toBe(false);
 
     await repo.dispose();
   });

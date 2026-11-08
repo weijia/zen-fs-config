@@ -4,8 +4,7 @@
  * 所有会随同步走、且需要「内容相同则字节相同」的判断都使用这里的序列化器：
  *
  *   - `.meta/group.json`            （组描述符）
- *   - `.meta/backends/{id}.json`    （数据组权威后端描述符）
- *   - `.config/backends/{id}.json`  （配置组后端描述符）
+ *   - `.meta/backends/{id}.json`    （配置组与数据组的权威后端描述符）
  *   - `.config/app-data-groups/**`  （数据组引导描述符）
  *
  * 规范化规则（跨设备必须完全确定，否则两台设备会写出「语义相同、字节不同」
@@ -106,7 +105,7 @@ export function serializeGroupDescriptor(descriptor: GroupDescriptor): string {
   return stringify(canonicalObject(rest as Record<string, unknown>, GROUP_DESCRIPTOR_ORDER));
 }
 
-/** 单个后端描述符（配置组 `.config/backends` 或数据组 `.meta/backends`）的规范化字节。 */
+/** 单个后端描述符（`.meta/backends/{id}.json`）的规范化字节。 */
 export function serializeBackendDescriptor(
   descriptor: BackendDescriptor | AppDataBackendDescriptor,
 ): string {

@@ -94,9 +94,9 @@ describe('directory deletion', () => {
     expect(await exists(root, `/${appId}/dir/b.txt`)).toBe(false);
 
     for (const file of [`/${appId}/dir/sub/a.txt`, `/${appId}/dir/b.txt`]) {
-      // New layout + legacy mirror (one release cycle).
       expect(await exists(root, tombstonePath('/.meta/tombstones', file))).toBe(true);
-      expect(await exists(root, tombstonePath('/.meta/.deleted', file))).toBe(true);
+      // The legacy `/.meta/.deleted/` archive is no longer written.
+      expect(await exists(root, tombstonePath('/.meta/.deleted', file))).toBe(false);
       const raw = await root.promises.readFile(tombstonePath('/.meta/tombstones', file));
       const tombstone = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
       expect(tombstone.path).toBe(file);
@@ -177,7 +177,7 @@ describe('directory deletion', () => {
     expect(await exists(group.fs, '/unlinked')).toBe(false);
     for (const file of ['/unlinked/sub/a.txt', '/unlinked/b.txt']) {
       expect(await exists(localFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
-      expect(await exists(localFS, tombstonePath('/.meta/.deleted', file))).toBe(true);
+      expect(await exists(localFS, tombstonePath('/.meta/.deleted', file))).toBe(false);
     }
     for (const dir of ['/unlinked', '/unlinked/sub']) {
       expect(await exists(localFS, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);

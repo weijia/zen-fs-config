@@ -68,28 +68,21 @@ describe('tombstone corruption', () => {
     expect(warnings[0]).toContain('treated as deleted');
   });
 
-  it('duplicate writes for the same path are merged (new + legacy, and concatenated docs)', async () => {
+  it('merges concatenated documents and ignores the legacy .deleted archive', async () => {
     const fs = await newFs('duplicates');
-    const bodyA = record('/data/dup.txt', ['local-idb']);
-    const bodyB = record('/data/dup.txt', ['local-idb', 'gitee']);
-    await writeTombstone(fs, NEW_DIR, '/data/dup.txt', bodyA);
-    await writeTombstone(fs, LEGACY_DIR, '/data/dup.txt', bodyB);
 
     // A second file for a different path whose body holds two concatenated docs.
     await writeTombstone(fs, NEW_DIR, '/data/concat.txt', record('/data/concat.txt', ['local-idb']) + '\n' + record('/data/concat.txt', ['local-idb', 'remote']));
+    // A tombstone that only exists in the legacy archive must NOT be read.
+    await writeTombstone(fs, LEGACY_DIR, '/data/legacy-only.txt', record('/data/legacy-only.txt', ['local-idb']));
 
     const warnings: string[] = [];
     const tombstones = await readTombstonesFromFs(fs, (m) => warnings.push(m));
 
-    const dup = tombstones.find((t) => t.path === '/data/dup.txt');
-    expect(dup).toBeDefined();
-    expect([...dup!.confirmedBy].sort()).toEqual(['gitee', 'local-idb']);
+    expect(tombstones.map((t) => t.path)).toEqual(['/data/concat.txt']);
+    expect([...tombstones[0].confirmedBy].sort()).toEqual(['local-idb', 'remote']);
 
-    const concat = tombstones.find((t) => t.path === '/data/concat.txt');
-    expect(concat).toBeDefined();
-    expect([...concat!.confirmedBy].sort()).toEqual(['local-idb', 'remote']);
-
-    // Only the concatenated body is reported; the two valid mirrors are not.
+    // Only the concatenated body is reported; the legacy archive is ignored.
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('2 concatenated documents recovered');
   });

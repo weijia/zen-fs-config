@@ -47,7 +47,6 @@ import {
   CONFLICTS_DIR,
   LEGACY_CONFLICTS_DIR,
   TOMBSTONES_DIR,
-  LEGACY_TOMBSTONES_DIR,
   META_BACKENDS_DIR,
   encodeMetaPath,
   ensureParentDir,
@@ -86,8 +85,16 @@ const GROUP_DESCRIPTOR_FILE = `${META_DIR}/group.json`;
 const GROUP_TYPE_FILE = `${CONFIG_DIR}/group-type`;
 const LEGACY_GROUP_TYPE_FILE = `${META_DIR}/group-type`;
 const BACKENDS_FILE = `${META_DIR}/backends.json`; // Legacy single-file format (pre-0.4.0)
-const BACKENDS_DIR = `${CONFIG_DIR}/backends`;
-const LEGACY_BACKENDS_DIR = META_BACKENDS_DIR;
+/**
+ * 后端描述符的权威目录：`/.meta/backends/{id}.json`。
+ * 配置组与数据组共用同一位置，不再区分。
+ */
+const BACKENDS_DIR = META_BACKENDS_DIR;
+/**
+ * 历史位置 `/.config/backends/`。**不再读取**：里面的文件按普通内容对待，
+ * 只在删除后端时尽力清理残留。
+ */
+const LEGACY_BACKENDS_DIR = `${CONFIG_DIR}/backends`;
 const APP_DATA_GROUPS_DIR = `${CONFIG_DIR}/app-data-groups`;
 const LEGACY_APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`;
 // Display metadata (name) for the config-sync group itself. Separate file so
@@ -660,9 +667,9 @@ export class ConfigRepo implements IConfigRepo {
   // -----------------------------------------------------------------------
 
   /**
-   * Write the tombstone record for `filePath` (new `.meta/tombstones` + legacy
-   * mirror for one release cycle). Records only metadata — it never creates
-   * the deleted file locally.
+   * Write the tombstone record for `filePath` under `.meta/tombstones/`.
+   * Records only metadata — it never creates the deleted file locally, and the
+   * legacy `/.meta/.deleted/` archive is neither read nor written.
    */
   private async writeTombstoneFor(filePath: string): Promise<void> {
     const normalizedPath = filePath.startsWith('/') ? filePath : '/' + filePath;
@@ -673,11 +680,9 @@ export class ConfigRepo implements IConfigRepo {
       confirmedBy: [this.primaryBackendId],
     };
     const tombstoneBytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
-    for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-      const tombstonePath = tombstonePathFor(normalizedPath, dir);
-      await this.ensureDir(tombstonePath);
-      await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
-    }
+    const tombstonePath = tombstonePathFor(normalizedPath, TOMBSTONES_DIR);
+    await this.ensureDir(tombstonePath);
+    await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
   }
 
   /**
@@ -1189,11 +1194,9 @@ export class ConfigRepo implements IConfigRepo {
       if (changed) {
         try {
           const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
-          for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-            const tombstonePath = tombstonePathFor(tombstone.path, dir);
-            if (await this.safeExists(this.cachedFS, tombstonePath)) {
-              await this.cachedFS.writeFile(tombstonePath, bytes);
-            }
+          const tombstonePath = tombstonePathFor(tombstone.path, TOMBSTONES_DIR);
+          if (await this.safeExists(this.cachedFS, tombstonePath)) {
+            await this.cachedFS.writeFile(tombstonePath, bytes);
           }
           modified++;
         } catch { /* ignore write error */ }
@@ -1255,26 +1258,24 @@ export class ConfigRepo implements IConfigRepo {
       // 带了回来。GC 前必须逐个副本复核"当前确实不存在"。
       const allConfirmed = await this.allReplicasConfirmAbsent(tombstone.path);
       if (allConfirmed) {
-        for (const dir of [TOMBSTONES_DIR, LEGACY_TOMBSTONES_DIR]) {
-          const tombstonePath = tombstonePathFor(tombstone.path, dir);
+        const tombstonePath = tombstonePathFor(tombstone.path, TOMBSTONES_DIR);
 
-          // Delete tombstone on local primary
-          try {
-            await this.cachedFS.unlink(tombstonePath);
-          } catch { /* already gone */ }
+        // Delete tombstone on local primary
+        try {
+          await this.cachedFS.unlink(tombstonePath);
+        } catch { /* already gone */ }
 
-          // Delete tombstone on all replicas — prevents the sync engine
-          // from re-copying them back on the next cycle.
-          for (const [, replica] of this.replicaBackends) {
-            if (await this.safeExists(replica.instance, tombstonePath)) {
-              try {
-                await replica.instance.unlink(tombstonePath);
-              } catch { /* race */ }
-            }
+        // Delete tombstone on all replicas — prevents the sync engine
+        // from re-copying them back on the next cycle.
+        for (const [, replica] of this.replicaBackends) {
+          if (await this.safeExists(replica.instance, tombstonePath)) {
+            try {
+              await replica.instance.unlink(tombstonePath);
+            } catch { /* race */ }
           }
-
-          log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
         }
+
+        log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
       }
     }
   }
@@ -1350,7 +1351,7 @@ export class ConfigRepo implements IConfigRepo {
     return [...this.backendDescriptorCache];
   }
 
-  /** 配置组的权威后端列表（`.config/backends/`），与 `listBackends()` 相同。 */
+  /** 配置组的权威后端列表（`.meta/backends/`），与 `listBackends()` 相同。 */
   listDeclaredBackends(): AppDataBackendDescriptor[] {
     return this.listBackends();
   }
@@ -1852,12 +1853,16 @@ export class ConfigRepo implements IConfigRepo {
   // Internal — Individual Backend Descriptor Files
   // -----------------------------------------------------------------------
 
-  /** Path for a single backend descriptor: .config/backends/{id}.json */
+  /** Path for a single backend descriptor: `.meta/backends/{id}.json`. */
   backendFilePath(id: string): string {
     return `${BACKENDS_DIR}/${id}.json`;
   }
 
-  /** Legacy path: .meta/backends/{id}.json (read + dual-write for one cycle). */
+  /**
+   * Legacy pre-0.7 path `/.config/backends/{id}.json`.
+   *
+   * 该目录已不再读取：此处只用于删除后端时尽力清理残留副本。
+   */
   legacyBackendFilePath(id: string): string {
     return `${LEGACY_BACKENDS_DIR}/${id}.json`;
   }
@@ -1913,8 +1918,11 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * Read all backend descriptors from `.config/backends/*.json` with legacy
-   * `.meta/backends/*.json` as a one-cycle fallback (new layout wins by id).
+   * Read all backend descriptors from `.meta/backends/*.json` — the single
+   * authoritative location for both config-sync and data-sync groups.
+   *
+   * `/.config/backends/` is intentionally **not** read: leftovers there are
+   * plain content and never take part in backend enumeration.
    *
    * If duplicate backends are detected (same type + options but different id),
    * only the first one (sorted by id) is kept and the rest are removed
@@ -1922,17 +1930,9 @@ export class ConfigRepo implements IConfigRepo {
    */
   async readAllBackendDescriptors(): Promise<BackendDescriptor[]> {
     const fresh = await this.readBackendDescriptorsFrom(BACKENDS_DIR);
-    const legacy = await this.readBackendDescriptorsFrom(LEGACY_BACKENDS_DIR);
 
     const items = [...fresh.items];
-    const seenIds = new Set(items.map((i) => i.desc.id));
-    for (const item of legacy.items) {
-      if (!seenIds.has(item.desc.id)) {
-        items.push(item);
-        seenIds.add(item.desc.id);
-      }
-    }
-    const corruptFiles = [...fresh.corruptFiles, ...legacy.corruptFiles];
+    const corruptFiles = [...fresh.corruptFiles];
 
     // Clean up corrupted descriptor files: delete on all replicas, tombstone, delete locally.
     // This prevents corrupted files from persisting and being re-synced indefinitely.
@@ -2012,20 +2012,18 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * Write a single backend descriptor to `.config/backends/{id}.json`,
-   * mirroring to the legacy `.meta/backends/{id}.json` for one release cycle
-   * so older clients still see the backend.
+   * Write a single backend descriptor to `.meta/backends/{id}.json`.
    *
-   * Both files use the canonical serializer and are only written when their
-   * bytes actually differ (no needless sync churn).
+   * Uses the canonical serializer and is only written when the bytes actually
+   * differ (no needless sync churn). `/.config/backends/` is never written.
    */
   async writeBackendDescriptor(desc: BackendDescriptor): Promise<void> {
     assertValidBackendId(desc.id);
     const author = `${this.appId}/${this.nodeId}`;
     const text = serializeBackendDescriptor(desc);
     const bytes = new TextEncoder().encode(text);
-    for (const path of [this.backendFilePath(desc.id), this.legacyBackendFilePath(desc.id)]) {
-      if ((await this.readTextIfExists(path)) === text) continue;
+    const path = this.backendFilePath(desc.id);
+    if ((await this.readTextIfExists(path)) !== text) {
       await this.ensureDir(path);
       await this.cachedFS.writeFile(path, bytes);
       const version = await incrementVersion(this.fullFS, path, bytes, author);
@@ -2037,7 +2035,10 @@ export class ConfigRepo implements IConfigRepo {
     else this.backendDescriptorCache.push({ ...desc });
   }
 
-  /** Remove a single backend descriptor file + its version sidecar (both layouts) */
+  /**
+   * Remove a single backend descriptor: always `.meta/backends/{id}.json`, plus
+   * a best-effort cleanup of the legacy `/.config/backends/{id}.json` residue.
+   */
   async removeBackendDescriptor(id: string): Promise<void> {
     for (const path of [this.backendFilePath(id), this.legacyBackendFilePath(id)]) {
       try { await this.cachedFS.unlink(path); } catch { /* already gone */ }
@@ -2206,8 +2207,9 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     const replica = this.replicaBackends.get(id);
-    // Both layouts are written during the transition cycle, so both must be
-    // removed (otherwise the legacy mirror survives and re-appears via sync).
+    // `.meta/backends/{id}.json` is authoritative; `.config/backends/{id}.json`
+    // is a legacy residue that is only cleaned up best-effort (it is no longer
+    // read, so a failed cleanup cannot resurrect the backend).
     const descPaths = [this.backendFilePath(id), this.legacyBackendFilePath(id)];
 
     if (replica) {
@@ -2418,8 +2420,9 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * Write a data-group descriptor to `.config/` (bootstrap copy), mirroring to
-   * the legacy `.meta/` path.
+   * Write a data-group descriptor to `.config/app-data-groups/` (registration
+   * + bootstrap copy). The legacy `.meta/app-data-groups/` mirror is no longer
+   * written; it is still read so old layouts keep working.
    *
    * 这份描述符是**引导副本**：它让只有配置组凭据的新设备知道有哪些数据组、
    * 远端在哪。权威定义在数据组自己的 `.meta/backends/`。
@@ -2435,13 +2438,12 @@ export class ConfigRepo implements IConfigRepo {
     const text = serializeAppDataGroupDescriptor(mergeDescriptorCreatedAt(descriptor, existing));
     const bytes = new TextEncoder().encode(text);
     const author = `${this.appId}/${this.nodeId}`;
-    for (const descPath of [this.appDataGroupFilePath(id), this.legacyAppDataGroupFilePath(id)]) {
-      if ((await this.readTextIfExists(descPath)) === text) continue;
-      await this.ensureDir(descPath);
-      await this.cachedFS.writeFile(descPath, bytes);
-      const version = await incrementVersion(this.fullFS, descPath, bytes, author);
-      await this.writeVersionSidecar(descPath, version);
-    }
+    const descPath = this.appDataGroupFilePath(id);
+    if ((await this.readTextIfExists(descPath)) === text) return;
+    await this.ensureDir(descPath);
+    await this.cachedFS.writeFile(descPath, bytes);
+    const version = await incrementVersion(this.fullFS, descPath, bytes, author);
+    await this.writeVersionSidecar(descPath, version);
   }
 
   /**
