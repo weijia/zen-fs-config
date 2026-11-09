@@ -906,9 +906,10 @@ export class ConfigRepo implements IConfigRepo {
     for (const tombstone of tombstones) {
       if (!tombstone.path) continue;
       add(tombstone.path);
-      // `.keep` / `.keep.mtime` 墓碑表示它所在的目录已被删除。同步引擎的
-      // "保留空目录"逻辑会给每个源目录 mkdir，只排除占位文件的话，副本上
-      // 的空目录仍会在本地被重建出来（空壳复活）。这里把目录本身也排除。
+      // `.keep` / `.keep.mtime` 墓碑只可能来自历史数据：旧版同步引擎会在目标端
+      // 为每个源目录 mkdir 保活空目录。现行同步引擎不再同步空目录，这里保留
+      // 目录级排除是为了防御历史 `.keep` 墓碑与异常远端残留——只排除占位文件
+      // 的话，副本上残留的空目录仍可能被重建出来。
       if (
         tombstone.path === '/.keep' ||
         tombstone.path.endsWith('/.keep') ||
