@@ -197,7 +197,86 @@ async function removeDirectoryTree(fs: TreeFS, dir: string): Promise<void> {
 }
 
 /**
- * True when an unlink failure means "the entry was already gone" rather than a
+ * A FS surface that can be enumerated, plus a human-readable label used when
+ * its enumeration fails (local cache vs a specific replica backend).
+ */
+type NamedTreeFS = { label: string; fs: TreeFS };
+
+/**
+ * Collect files under `dir` from **every** surface and merge the results.
+ *
+ * The local primary only mirrors what this node has already seen: a directory
+ * whose children live solely on a backend (e.g. archives written by an older
+ * build) would otherwise be enumerated as empty, so deleting it would never
+ * write per-file tombstones and the children would simply be pulled back.
+ *
+ * A surface whose enumeration fails is reported through `onError` and skipped;
+ * it must never be silently treated as an empty directory.
+ */
+async function collectFilesUnderAny(
+  surfaces: NamedTreeFS[],
+  dir: string,
+  onError: (label: string, error: unknown) => void,
+): Promise<string[]> {
+  const merged = new Set<string>();
+  for (const surface of surfaces) {
+    try {
+      for (const file of await collectFilesUnder(surface.fs, dir)) merged.add(file);
+    } catch (error) {
+      onError(surface.label, error);
+    }
+  }
+  return [...merged];
+}
+
+/**
+ * Strict variant of {@link collectDirectoriesUnder}: a failing `readdir` is
+ * propagated to the caller instead of being treated as "no subdirectories".
+ * Paths discovered before the failure are kept in `out`.
+ */
+async function collectDirectoriesUnderStrict(
+  fs: TreeFS,
+  dir: string,
+  out: string[] = [],
+): Promise<string[]> {
+  out.push(dir);
+  const entries = await fs.readdir(dir);
+  for (const entry of entries) {
+    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
+    if (await isDirectoryPath(fs, child)) await collectDirectoriesUnderStrict(fs, child, out);
+  }
+  return out;
+}
+
+/** Directory-path counterpart of {@link collectFilesUnderAny} (includes `dir`). */
+async function collectDirectoriesUnderAny(
+  surfaces: NamedTreeFS[],
+  dir: string,
+  onError: (label: string, error: unknown) => void,
+): Promise<string[]> {
+  const merged = new Set<string>();
+  for (const surface of surfaces) {
+    const found: string[] = [];
+    try {
+      await collectDirectoriesUnderStrict(surface.fs, dir, found);
+    } catch (error) {
+      // Keep whatever was walked before the failure; never treat it as empty.
+      onError(surface.label, error);
+    }
+    for (const child of found) merged.add(child);
+  }
+  return [...merged];
+}
+
+/** True when `path` is a directory on at least one surface. */
+async function isDirectoryAny(surfaces: NamedTreeFS[], path: string): Promise<boolean> {
+  for (const surface of surfaces) {
+    if (await isDirectoryPath(surface.fs, path)) return true;
+  }
+  return false;
+}
+
+/** True when an unlink failure means "the entry was already gone" rather than a
  * real deletion failure. Needed for backend-internal placeholders (`.keep` /
  * `.mtime`) that are hidden from `exists()`: the only way to remove them is
  * unlink(), and the only signal we get is the error.
@@ -697,8 +776,24 @@ export class ConfigRepo implements IConfigRepo {
     // The sync layer works file-by-file, so a directory-path tombstone alone
     // would be a no-op on backends without directory entries and the children
     // would be resurrected on the next pull.
-    if (await isDirectoryPath(this.cachedFS, normalizedPath)) {
-      const files = await collectFilesUnder(this.cachedFS, normalizedPath);
+    //
+    // Enumeration must span the local cache **and** every replica backend: a
+    // path may live only on a backend (the cache never saw it), and reading
+    // just the cache would silently produce "empty directory" → no tombstones
+    // → the children come straight back.
+    const surfaces: NamedTreeFS[] = [{ label: 'local-cache', fs: this.cachedFS }];
+    for (const [id, replica] of this.replicaBackends) {
+      surfaces.push({ label: id, fs: replica.instance as TreeFS });
+    }
+    const onEnumerateError = (label: string, error: unknown) => {
+      const reason = (error as any)?.message ?? String(error);
+      log.warn(
+        `[ConfigRepo] deleteFile(directory): cannot enumerate "${label}" under ${normalizedPath}: ${reason}`,
+      );
+    };
+
+    if (await isDirectoryAny(surfaces, normalizedPath)) {
+      const files = await collectFilesUnderAny(surfaces, normalizedPath, onEnumerateError);
       for (const file of files) await this.deleteFile(file);
       // Backends that cannot store empty directories keep them alive with an
       // internal `.keep` placeholder, which readdir()/createSnapshot() hide and
@@ -709,7 +804,7 @@ export class ConfigRepo implements IConfigRepo {
       // persist mtime as `<name>.mtime`): if only `.keep` is tombstoned, the
       // sidecar alone keeps the directory alive in Git. It also outlives the
       // `.keep` itself when an older build already removed the placeholder.
-      for (const dir of await collectDirectoriesUnder(this.cachedFS, normalizedPath)) {
+      for (const dir of await collectDirectoriesUnderAny(surfaces, normalizedPath, onEnumerateError)) {
         const keepPath = dir === '/' ? '/.keep' : `${dir}/.keep`;
         await this.writeTombstoneFor(keepPath);
         await this.writeTombstoneFor(`${keepPath}.mtime`);

@@ -10,7 +10,7 @@
  * - `repo.deleteFile(dir)` / `group.deleteFile(dir)` (admin UI path)
  * - `fs.unlink(dir)` / `fs.rmdir(dir)` on the chroot views
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { registerBackend, createBackend, type BackendInstance } from '../backend-registry';
@@ -140,6 +140,84 @@ describe('directory deletion', () => {
     // directory cannot be pulled back into existence.
     await (repo as any).processTombstonesPublic();
     expect(await exists(replica, `/${appId}/only-keep/.keep`)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('config-sync group: a directory that exists only on a replica is tombstoned per file', async () => {
+    const appId = 'dir-del-remote-only';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-ro' });
+    await repo.addBackend('remote-only', 'DirRemote', { label: 'dir-del-remote-only' });
+    const replica = (repo as any).replicaBackends.get('remote-only').instance;
+
+    // The local primary cache has never seen this tree — this is exactly the
+    // shape of `.meta/.deleted/` (archives written by an older build and only
+    // present on the backend).
+    for (const dir of [`/${appId}`, `/${appId}/remote-only`, `/${appId}/remote-only/nested`]) {
+      try { await replica.mkdir(dir); } catch { /* already exists */ }
+    }
+    await replica.writeFile(`/${appId}/remote-only/a.txt`, 'a');
+    await replica.writeFile(`/${appId}/remote-only/nested/b.txt`, 'b');
+
+    expect(await exists(repo.rootFS, `/${appId}/remote-only`)).toBe(false);
+
+    await repo.deleteFile(`/${appId}/remote-only`);
+
+    for (const file of [`/${appId}/remote-only/a.txt`, `/${appId}/remote-only/nested/b.txt`]) {
+      expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
+      const raw = await repo.rootFS.promises.readFile(tombstonePath('/.meta/tombstones', file));
+      const tombstone = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
+      expect(tombstone.path).toBe(file);
+    }
+    for (const dir of [`/${appId}/remote-only`, `/${appId}/remote-only/nested`]) {
+      expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
+      expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(true);
+    }
+
+    // The tombstones are actionable: processing them removes the replica copy.
+    await (repo as any).processTombstonesPublic();
+    expect(await exists(replica, `/${appId}/remote-only/a.txt`)).toBe(false);
+    expect(await exists(replica, `/${appId}/remote-only/nested/b.txt`)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('config-sync group: a failing replica enumeration is reported, others still get tombstones', async () => {
+    const appId = 'dir-del-broken-replica';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-broken' });
+
+    await repo.addBackend('good', 'DirRemote', { label: 'dir-del-good' });
+    const good = (repo as any).replicaBackends.get('good').instance;
+
+    // A replica whose readdir throws must not be treated as an empty directory.
+    const broken = {
+      readdir: async () => { throw new Error('replica unreachable'); },
+      stat: async () => { throw new Error('replica unreachable'); },
+      exists: async () => false,
+      unlink: async () => { /* nothing to remove */ },
+    };
+    (repo as any).replicaBackends.set('broken', { instance: broken, syncable: null, pairId: 'broken' });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await mkdirp(repo.rootFS, `/${appId}/mixed`);
+      await repo.rootFS.promises.writeFile(`/${appId}/mixed/local.txt`, 'l');
+      try { await good.mkdir(`/${appId}`); } catch { /* already exists */ }
+      try { await good.mkdir(`/${appId}/mixed`); } catch { /* already exists */ }
+      await good.writeFile(`/${appId}/mixed/remote.txt`, 'r');
+
+      await repo.deleteFile(`/${appId}/mixed`);
+
+      for (const file of [`/${appId}/mixed/local.txt`, `/${appId}/mixed/remote.txt`]) {
+        expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
+      }
+      // The failure is logged with the backend id, not silently swallowed.
+      expect(
+        warnSpy.mock.calls.some((call) => call.join(' ').includes('broken') && call.join(' ').includes('mixed')),
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
 
     await repo.dispose();
   });
