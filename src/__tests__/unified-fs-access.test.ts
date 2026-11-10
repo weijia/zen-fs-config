@@ -140,8 +140,9 @@ describe('Unified fs access for data storage', () => {
 
     expect(result.groupType).toBe('config-sync');
     expect(result.repo).toBeDefined();
-    // Data groups are always managed by config-sync: a default data group is created.
-    expect(result.dataGroup).toBeDefined();
+    // connect() never auto-creates groups anymore: creation is an explicit action.
+    const dataGroup = await result.repo!.createAppDataGroup('default', []);
+    expect(dataGroup).toBeDefined();
 
     const repo = result.repo!;
 
@@ -163,7 +164,7 @@ describe('Unified fs access for data storage', () => {
     // Both fs.writeFile and setConfig write to the same /{appId}/ directory
     // and both are synced via the config-sync group's sync pairs.
 
-    await result.dataGroup?.dispose();
+    await dataGroup.dispose();
     await repo.dispose();
   });
 
@@ -181,11 +182,10 @@ describe('Unified fs access for data storage', () => {
     });
 
     expect(result.groupType).toBe('data-sync');
-    expect(result.dataGroup).toBeDefined();
+    // connect() no longer creates a group implicitly.
+    const dataGroup = await result.repo!.createAppDataGroup('default', []);
     // Even when targeting a data group, config-sync always anchors it.
     expect(result.repo).toBeDefined();
-
-    const dataGroup = result.dataGroup!;
 
     // Write a data file using dataGroup.fs (chroot to /)
     const dataContent = JSON.stringify({ message: 'hello from data-sync' });
@@ -211,8 +211,8 @@ describe('Unified fs access for data storage', () => {
     const dataResult = await connect(appId2, { groupType: 'data-sync' });
 
     const repo = configResult.repo!;
-    const dataGroup = dataResult.dataGroup!;
     const dataRepo = dataResult.repo!;
+    const dataGroup = await dataRepo.createAppDataGroup('default', []);
 
     // Both have .fs property
     expect(repo.fs).toBeDefined();

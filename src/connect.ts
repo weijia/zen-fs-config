@@ -106,8 +106,9 @@ export async function connect(
       syncPollIntervalMs: options.syncPollIntervalMs,
     });
     // Recover any locally-cached data groups (persisted in the local primary
-    // store) instead of blindly recreating an empty default on every connect.
-    // Only create the default placeholder when no data group exists yet.
+    // store). Never create a group here: connect() is not a create action, and
+    // a descriptor that exists but fails to load must surface as an error
+    // instead of being overwritten by an empty "default" group.
     const appDataGroups: AppDataGroup[] = [];
     const descriptors = await repo.listAppDataGroups();
     for (const d of descriptors) {
@@ -117,10 +118,12 @@ export async function connect(
         log(`connect: failed to load app data group "${d.id}":`, err);
       }
     }
-    let dataGroup = appDataGroups[0];
-    if (!dataGroup) {
-      dataGroup = await repo.createAppDataGroup('default', []);
-      appDataGroups.push(dataGroup);
+    const dataGroup = appDataGroups[0];
+    if (!dataGroup && descriptors.length > 0) {
+      log(
+        `connect: ${descriptors.length} data group descriptor(s) found but none could be loaded; ` +
+        'leaving them untouched (no empty group is created)',
+      );
     }
     return {
       groupType: options.groupType ?? 'config-sync',
@@ -195,14 +198,26 @@ export async function connect(
   // If the remote is itself a data-sync backend (UC3): ensure the default data
   // group exists and attach this backend to it. AppDataGroupImpl.addBackend
   // writes the backend info back into config-sync's app-data-groups.
+  //
+  // Guard: only create the group when there is truly no descriptor yet. If
+  // descriptors exist but failed to load, creating "default" would overwrite
+  // an existing group (and, once connected, its remote bootstrap copy) with an
+  // empty one — surface the failure instead.
   let dataGroup: AppDataGroup | undefined = appDataGroups[0];
   if (groupType === 'data-sync') {
     if (!dataGroup) {
-      dataGroup = await repo.createAppDataGroup('default', []);
-      appDataGroups.push(dataGroup);
+      if (descriptors.length > 0) {
+        log(
+          `connect: ${descriptors.length} data group descriptor(s) exist but could not be loaded; ` +
+          'refusing to create/overwrite "default"',
+        );
+      } else {
+        dataGroup = await repo.createAppDataGroup('default', []);
+        appDataGroups.push(dataGroup);
+      }
     }
     const backendId = `${type}-primary`;
-    if (!dataGroup.listBackends().some(b => b.id === backendId)) {
+    if (dataGroup && !dataGroup.listBackends().some(b => b.id === backendId)) {
       await dataGroup.addBackend(backendId, type, backendOptions);
     }
   }
