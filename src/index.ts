@@ -12,6 +12,19 @@ export { createConfigRepo, ConfigRepo, LOCAL_IDB_BACKEND_ID } from './config-rep
 // Node.js local persistent backend (Folder) — self-registers on import
 export { resolveLocalPrimary, localPrimaryType, isBrowserEnv, FolderStore, registerFolderBackend } from './folder-backend';
 
+// 本地数据组存储不可用：可识别的错误类型 + 重建（删库）原语
+export {
+  LOCAL_STORAGE_UNAVAILABLE,
+  LocalStorageUnavailableError,
+  isLocalStorageUnavailableError,
+  dataGroupLocalStoreName,
+  deleteDataGroupLocalStore,
+} from './errors';
+export type {
+  LocalStorageUnavailableDetails,
+  LocalStoreDeletionResult,
+} from './errors';
+
 // Unified connect entry point — the single recommended external entry.
 // Data-sync groups are always managed by a config-sync repo (decision A / T5);
 // the standalone `createDataSyncGroup` factory is deprecated and NOT exported.

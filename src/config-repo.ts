@@ -36,6 +36,12 @@ import type { PathAwareSerializer } from './serializer';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, mergeAccountFields, getAccountFields, getBackendMetadata, type BackendInstance } from './backend-registry';
 import { resolveLocalPrimary, localPrimaryType } from './folder-backend';
+import {
+  LocalStorageUnavailableError,
+  dataGroupLocalStoreName,
+  isLocalStorageUnavailableError,
+  summarizeError,
+} from './errors';
 import { createLogger } from '@richard432/localstorage-logger';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 import { purgeMtimeSidecars, isMtimeSidecar, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
@@ -3140,16 +3146,34 @@ class AppDataGroupImpl implements AppDataGroup {
     // other group is isolated by groupId — Node: `data/{appId}/{groupId}`,
     // browser: `zen-fs-config-data-{appId}-{groupId}`. Lazy migration: no copy,
     // no move, no deletion.
+    // 本地主存储不可用（IndexedDB 记录丢失 / EIO）是**可识别、可修复**的状态，
+    // 不能被降级成「组不存在」：抛出带原始 cause 的专用错误，由 UI 提示并重建。
+    const storeName = dataGroupLocalStoreName(this.appId, this.groupId);
     try {
       const localPrimary = await resolveLocalPrimary(this.appId, 'data', {
         groupId: this.groupId,
         ...(this.groupId === 'default'
           ? {}
-          : { idbStoreName: `zen-fs-config-data-${this.appId}-${this.groupId}` }),
+          : { idbStoreName: storeName }),
       });
       this.localFS = await createBackend(localPrimary);
-    } catch {
-      throw new Error(`Failed to create local primary for data group "${this.groupId}"`);
+    } catch (err) {
+      if (isLocalStorageUnavailableError(err)) {
+        throw new LocalStorageUnavailableError({
+          appId: this.appId,
+          groupId: this.groupId,
+          storeName,
+          cause: err,
+        });
+      }
+      // 其它失败（例如后端类型未注册）也保留原始 message / code，不再只说一句概括。
+      const detail = summarizeError(err);
+      const wrapped = new Error(
+        `Failed to create local primary for data group "${this.groupId}"` +
+          ` (${[detail.name, detail.code, detail.message].filter(Boolean).join(': ')})`,
+        { cause: err },
+      );
+      throw wrapped;
     }
 
     // Purge leaked .mtime sidecars from this group's local store (they are
