@@ -40,6 +40,12 @@ export const META_DIR = '/.meta';
 export const GROUP_DESCRIPTOR_FILE = `${META_DIR}/group.json`;
 export const META_BACKENDS_DIR = `${META_DIR}/backends`;
 export const TOMBSTONES_DIR = `${META_DIR}/tombstones`;
+
+/**
+ * 「删除后重建」判定的容差（毫秒）。文件 mtime 比 `deletedAt` 新出这个余量，
+ * 才认定墓碑已被写操作撤销（避免秒级时钟抖动造成误判）。
+ */
+const RECREATE_AFTER_DELETE_SKEW_MS = 3000;
 /**
  * 历史归档目录。仅作为常量保留（旧数据仍在远端，按普通内容对待）：
  * 既不读取也不写入，删除状态只以 {@link TOMBSTONES_DIR} 为准。
@@ -528,14 +534,53 @@ export class TombstoneStore {
   /**
    * Delete every tombstoned file (and its version record) on the local store
    * and on each target backend, so bi-directional sync cannot resurrect it.
+   *
+   * 墓碑只对「删除之后没有再写入」的路径有效。同步类工具会不断重建某些文件
+   * （最典型的是 `.sync.lock`：每轮删除 → 重建），若墓碑永久生效，路径会被每一
+   * 轮 preSync 删掉，表现为「刚写完 1 秒就消失、锁永远拿不到」。因此这里先判定
+   * 目标路径是否在 `deletedAt` 之后被重新写入：是则墓碑已被用户写操作撤销，保留
+   * 文件并删除墓碑；否则按删除传播处理。
    */
   async process(targets: TombstoneTarget[] = []): Promise<void> {
     const tombstones = await this.list();
+    const expired: TombstoneMeta[] = [];
     for (const tombstone of tombstones) {
+      if (await this.wasRecreatedAfterDeletion(tombstone)) {
+        expired.push(tombstone);
+        continue;
+      }
       await this.deleteEverywhere(this.fs, tombstone.path);
       for (const target of targets) {
         await this.deleteEverywhere(target.fs, tombstone.path);
       }
+    }
+    for (const tombstone of expired) {
+      await this.remove(tombstone);
+      log.log(
+        `[TombstoneStore] expired tombstone for ${tombstone.path} — recreated after deletion`,
+      );
+    }
+  }
+
+  /**
+   * 本地存储上该路径的 mtime 是否晚于墓碑的删除时刻。
+   *
+   * 只看本地主存储：副本上的同路径文件可能只是「删除之前的旧副本」，它的 mtime
+   * 本来就旧，用副本判定既不可靠又会掩盖真正的删除传播。
+   */
+  private async wasRecreatedAfterDeletion(tombstone: TombstoneMeta): Promise<boolean> {
+    const mtimeMs = await this.mtimeOf(this.fs, tombstone.path);
+    if (mtimeMs === null) return false;
+    return mtimeMs > tombstone.deletedAt + RECREATE_AFTER_DELETE_SKEW_MS;
+  }
+
+  private async mtimeOf(fs: any, filePath: string): Promise<number | null> {
+    try {
+      const stat = await fs.stat?.(filePath);
+      const mtimeMs = Number(stat?.mtimeMs);
+      return Number.isFinite(mtimeMs) ? mtimeMs : null;
+    } catch {
+      return null; // 不存在（或后端不支持 stat）→ 不判定为重建
     }
   }
 

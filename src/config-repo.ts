@@ -327,6 +327,15 @@ const CONFIG_ONLY_PREFIXES = [CONFIG_DIR, NODES_DIR, SHARED_DIR];
 /** Fixed ID for the local IndexedDB primary backend. */
 export const LOCAL_IDB_BACKEND_ID = 'local-idb';
 
+/**
+ * 「删除后重建」判定的容差（毫秒）。
+ *
+ * 墓碑记录的是删除时刻（deletedAt）。若同一路径在删除之后又被写入（同步工具的
+ * `.sync.lock` 每轮删了再建就是典型例子），文件的 mtime 会晚于删除时刻，说明
+ * 墓碑已被用户的写操作"撤销"。时钟与提交时间有秒级抖动，这里留出余量避免误判。
+ */
+const TOMBSTONE_RECREATE_SKEW_MS = 3000;
+
 /** Encode a file path into a tombstone filename (no slashes, no dots issue). */
 function tombstoneFileName(filePath: string): string {
   return `${encodeMetaPath(filePath)}.json`;
@@ -912,24 +921,48 @@ export class ConfigRepo implements IConfigRepo {
     for (const tombstone of tombstones) {
       if (!tombstone.path) continue;
       add(tombstone.path);
-      // `.keep` / `.keep.mtime` 墓碑只可能来自历史数据：旧版同步引擎会在目标端
-      // 为每个源目录 mkdir 保活空目录。现行同步引擎不再同步空目录，这里保留
-      // 目录级排除是为了防御历史 `.keep` 墓碑与异常远端残留——只排除占位文件
-      // 的话，副本上残留的空目录仍可能被重建出来。
-      if (
-        tombstone.path === '/.keep' ||
-        tombstone.path.endsWith('/.keep') ||
-        tombstone.path.endsWith('/.keep.mtime')
-      ) {
-        const dir = tombstone.path.slice(0, tombstone.path.lastIndexOf('/')) || '/';
-        if (dir !== '/') add(dir);
-      }
+      // `.keep` / `.keep.mtime` 是后端用来保活空目录的占位文件，墓碑本身已经
+      // 通过上面的 add() 排除掉了。
+      //
+      // 这里**不能**再排除整个目录：目录级前缀会把该目录下的真实数据一并挡在
+      // 同步之外（表现为快照只看到寥寥几个文件、深层 data 永远传不上去，而远端
+      // 目录看起来是空的）。空目录被重建是无害的；丢数据才是致命的。
     }
   }
 
   /** Invalidate the tombstone cache — call after tombstones are modified. */
   private invalidateTombstoneCache(): void {
     this.tombstoneCache = null;
+  }
+
+  /**
+   * 判定墓碑目标路径是否在删除之后被重新创建。
+   *
+   * 墓碑表达的是「删除意图」，但删除之后同一路径完全可能被再次写入。同步类工具
+   * 的锁文件（`.sync.lock`）就是每轮「删除 → 重建」；若把墓碑当作永久否决权，
+   * 这个路径会被每一轮 sync 反复删除，表现为「刚写进去 1 秒后就消失」、锁永远拿
+   * 不到、深层目录刚建就没了。
+   *
+   * 判定依据是文件 mtime 晚于 `deletedAt`：写入必然刷新 mtime，因此 mtime 比删除
+   * 时刻新就意味着这条墓碑已经被写操作撤销。
+   */
+  private async isPathRecreatedAfterTombstone(tombstone: TombstoneMeta): Promise<boolean> {
+    const surfaces: NamedTreeFS[] = [{ label: 'local-cache', fs: this.cachedFS as TreeFS }];
+    for (const [id, replica] of this.replicaBackends) {
+      surfaces.push({ label: id, fs: replica.instance as TreeFS });
+    }
+
+    for (const surface of surfaces) {
+      let mtimeMs: number;
+      try {
+        const inode = await surface.fs.stat(tombstone.path);
+        mtimeMs = Number((inode as any)?.mtimeMs ?? 0);
+      } catch {
+        continue; // 该表面上不存在 → 不是重建
+      }
+      if (mtimeMs > tombstone.deletedAt + TOMBSTONE_RECREATE_SKEW_MS) return true;
+    }
+    return false;
   }
 
   /**
@@ -951,6 +984,8 @@ export class ConfigRepo implements IConfigRepo {
     let processed = 0;
     let alreadyDeleted = 0;
     let unresolved = 0;
+    // 目标路径在删除之后被重建 → 墓碑已被撤销，需要真正删掉墓碑文件。
+    const expired: TombstoneMeta[] = [];
 
     for (const tombstone of tombstones) {
       // `.mtime` sidecars and `.keep` placeholders are backend-internal and
@@ -965,6 +1000,14 @@ export class ConfigRepo implements IConfigRepo {
         tombstone.path === '/.keep' || tombstone.path.endsWith('/.keep');
       const forceDelete = isMtimeSidecar(tombstone.path) || isKeepPlaceholder;
       const tVersionPath = forceDelete ? null : versionPathFor(tombstone.path);
+
+      // 用户写操作撤销了删除意图：该路径在删除之后又被写入（例如 `.sync.lock`
+      // 每轮删了再建）。此时必须保留文件并让墓碑过期，否则每轮 sync 都会把它删掉。
+      // `.mtime` / `.keep` 是后端内部元数据，不适用此语义，仍按删除处理。
+      if (!forceDelete && (await this.isPathRecreatedAfterTombstone(tombstone))) {
+        expired.push(tombstone);
+        continue;
+      }
 
       // 侧车墓碑（`<file>.mtime` / `<file>.version` / `<file>.version.mtime`）只在
       // 其数据文件也已被删除时才该清理。数据文件仍然存在 = 这个侧车是"仍在用的
@@ -1026,6 +1069,24 @@ export class ConfigRepo implements IConfigRepo {
           );
         }
       }
+    }
+
+    // 已失效的墓碑必须真正从存储里删除：墓碑路径会进入 sync 排除列表
+    // （refreshSyncExclusions），留在原地的墓碑会让该路径永久不参与同步。
+    if (expired.length > 0) {
+      for (const tombstone of expired) {
+        try {
+          await this.cachedFS.unlink(tombstonePathFor(tombstone.path, TOMBSTONES_DIR));
+        } catch {
+          /* 已不存在 */
+        }
+      }
+      this.invalidateTombstoneCache();
+      // 立即重建缓存以刷新 sync 排除列表，否则本轮 sync 仍会跳过这些路径。
+      await this.readTombstones();
+      log.log(
+        `[ConfigRepo] processTombstones: expired ${expired.length} tombstone(s) — path recreated after deletion`,
+      );
     }
 
     if (processed > 0 || alreadyDeleted > 0 || unresolved > 0) {
