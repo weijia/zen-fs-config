@@ -194,6 +194,22 @@ if (result.groupType === 'data-sync') {
 
 `connect()` 接受与 `createConfigRepo` 相同的选项（`backendInfo`、`primaryBackendId`、`idbStoreName`、`nodeId`、`folderPath`、`cache`、`serializer`、`onConflict`、`syncPollIntervalMs`），另加 `groupType`。在 Node.js 上通过 `folderPath`（或设 `ZEN_FS_CONFIG_HOME`）开启本地磁盘持久化。
 
+## 数据组的路径语义
+
+`dataGroup.fs` 暴露的是**数据组的逻辑根**（应用数据目录），不是某一个后端的物理根。
+
+- 往组根相对路径（例如 `/struct/a.json`）写入，会同步到组内所有后端。
+- 每个后端会把同一个逻辑路径映射到自己的物理根：Gitee/GitHub 仓库根、RemoteStorage 的 `basePath`、WebDAV 目录等。
+- 后端的 `basePath` / 仓库根是**物理根**，不是所有后端共用的逻辑前缀。多个后端拥有不同的物理根是合法的；不要因为 `basePath` 不一致就判定数据组不可用。
+- 所有后端都应使用同一个组根相对路径。如果应用要在组根下划一个命名空间（例如 `app_data/folders`），那是应用层显式约定，不能从后端 `basePath` 反推。
+
+```typescript
+// dataGroup.fs 是数据组逻辑根；组内所有后端都会收到这个路径。
+await dataGroup.fs.promises.writeFile('/struct/host.json', json);
+```
+
+一个常见错误是逐个比较后端的 `basePath`，再试图算出一个“公共写入前缀”。这把逻辑组根和物理后端根混为一谈，会误拒绝本来可用的多后端数据组。
+
 ## 目录结构
 
 ```

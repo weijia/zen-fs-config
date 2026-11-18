@@ -201,6 +201,22 @@ Detection & dispatch rules:
 
 `connect()` accepts the same options as `createConfigRepo` (`backendInfo`, `primaryBackendId`, `idbStoreName`, `nodeId`, `folderPath`, `cache`, `serializer`, `onConflict`, `syncPollIntervalMs`) plus `groupType`. On Node.js, pass `folderPath` (or set `ZEN_FS_CONFIG_HOME`) to enable local disk persistence.
 
+## App data group path semantics
+
+`dataGroup.fs` exposes the **logical root of the data group** (the application's data directory). It is not a view of one backend's physical root.
+
+- A write to a group-root-relative path such as `/struct/a.json` is replicated to every backend in the group.
+- Each backend maps that same logical path into its own physical root: the Gitee/GitHub repo root, the RemoteStorage `basePath`, the WebDAV directory, etc.
+- Backend `basePath` / repo root values are **physical roots**, not a shared logical prefix. Multiple backends with different physical roots are valid; do not reject a group just because their `basePath` values differ.
+- Always use the same group-root-relative path for all backends. If the application defines a namespace inside the group (for example `app_data/folders`), that is an explicit application-level convention; do not derive it from backend `basePath`.
+
+```typescript
+// dataGroup.fs is the logical group root; all attached backends receive this path.
+await dataGroup.fs.promises.writeFile('/struct/host.json', json);
+```
+
+A common mistake is to compare every backend's `basePath` and try to compute one "common write prefix". That conflates the logical group root with physical backend roots and incorrectly rejects otherwise valid multi-backend groups.
+
 ## Directory Structure
 
 ```
