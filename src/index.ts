@@ -25,6 +25,17 @@ export type {
   LocalStoreDeletionResult,
 } from './errors';
 
+// 清除本页同步组配置（配置组 + 全部数据组的本地库 + 指定 storage 键）
+export {
+  purgeLocalSyncConfig,
+  localSyncStoreNames,
+  deleteIndexedDbStore,
+} from './local-purge';
+export type {
+  PurgeLocalSyncConfigOptions,
+  PurgeLocalSyncConfigResult,
+} from './local-purge';
+
 // Unified connect entry point — the single recommended external entry.
 // Data-sync groups are always managed by a config-sync repo (decision A / T5);
 // the standalone `createDataSyncGroup` factory is deprecated and NOT exported.
