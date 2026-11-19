@@ -1901,6 +1901,32 @@ export class ConfigRepo implements IConfigRepo {
     await this.writeVersionSidecar(path, version);
   }
 
+  /**
+   * 写仓库根级文件（`/.config/...`、`/.meta/...`、`/shared/...` 等，不是 app 载荷）。
+   *
+   * 与 `setConfig()` 的区别：`setConfig(path)` 会把路径拼成 `/${appId}${path}`，
+   * 是给应用自己的配置键用的；根级文件必须落在 cachedFS 的真实路径上，否则编辑
+   * 会写进 `/admin/.config/...` 之类的影子目录（读的地方看不到，文件"改了又没改"）。
+   *
+   * 落盘后按同一套机制记录 `.version` 边车（作者为 `appId/nodeId`），
+   * 与内部写描述符 / 元数据的行为一致。
+   */
+  async writeRepoFile(path: string, data: string | Uint8Array): Promise<void> {
+    this.assertNotDisposed();
+    const p = path.startsWith('/') ? path : `/${path}`;
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    await this.ensureDir(p);
+    await this.cachedFS.writeFile(p, bytes);
+
+    const author = `${this.appId}/${this.nodeId}`;
+    try {
+      const version = await incrementVersion(this.fullFS, p, bytes, author);
+      await this.writeVersionSidecar(p, version);
+    } catch (err) {
+      log.warn(`[ConfigRepo] writeRepoFile: version sidecar failed for ${p}:`, err);
+    }
+  }
+
   async readMetaFile<T>(path: string): Promise<T | null> {
     try {
       const raw = await this.cachedFS.readFile(path);

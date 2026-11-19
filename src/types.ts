@@ -604,6 +604,16 @@ export interface IConfigRepo {
   deleteFile(path: string): Promise<void>;
 
   /**
+   * Write a repo-root file (`/.config/...`, `/.meta/...`, `/shared/...`) at its
+   * real path and record its `.version` sidecar.
+   *
+   * Distinct from `setConfig(path)`, which prefixes `/${appId}` and is meant for
+   * app payload keys; using it for root paths writes to a shadow location
+   * (`/admin/.config/...`) that nothing reads.
+   */
+  writeRepoFile(path: string, data: string | Uint8Array): Promise<void>;
+
+  /**
    * Sync .meta/ files (backends.json) to all replica backends.
    * Called automatically by createConfigRepo() after setupSync().
    */
