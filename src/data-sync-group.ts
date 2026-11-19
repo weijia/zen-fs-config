@@ -33,6 +33,8 @@ import {
   TombstoneStore,
   VersionStore,
   ConflictStore,
+  normalizeTombstonePath,
+  purgeTombstonedTree,
   readGroupDescriptor,
   writeGroupDescriptor,
 } from './group-meta';
@@ -111,23 +113,48 @@ export class DataSyncGroup implements AppDataGroup {
    */
   async deleteFile(path: string): Promise<void> {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
-    const normalized = path.startsWith('/') ? path : `/${path}`;
-    if (normalized.startsWith(`${META_DIR}/`) || normalized.startsWith(`${CONFIG_DIR}/`)) {
+    const normalized = normalizeTombstonePath(path);
+    if (
+      normalized === META_DIR ||
+      normalized === CONFIG_DIR ||
+      normalized.startsWith(`${META_DIR}/`) ||
+      normalized.startsWith(`${CONFIG_DIR}/`)
+    ) {
       throw new Error(`Cannot delete metadata path "${normalized}"`);
     }
 
+    // 目录：一条目录墓碑代替逐文件墓碑，应用时按树清理（含隐藏占位）。
+    const isDirectory = await this.isDirectoryPath(normalized);
     const tombstone: TombstoneMeta = {
       path: normalized,
       deletedAt: Date.now(),
       deletedBy: `local:${this.groupId}`,
       confirmedBy: [`local:${this.groupId}`],
+      ...(isDirectory ? { type: 'directory' as const } : {}),
     };
     await this.tombstones.write(tombstone);
 
     for (const target of [this.localFS, ...Array.from(this.dataBackends.values()).map(b => b.instance)]) {
-      try { await target.unlink(normalized); } catch { /* already gone */ }
+      if (isDirectory) {
+        await purgeTombstonedTree(target, normalized);
+      } else {
+        try { await target.unlink(normalized); } catch { /* already gone */ }
+      }
     }
-    await this.versions.remove(normalized);
+    if (!isDirectory) await this.versions.remove(normalized);
+  }
+
+  /** stat-based directory check that tolerates backends without stat(). */
+  private async isDirectoryPath(p: string): Promise<boolean> {
+    try {
+      const st = await this.localFS.stat?.(p);
+      if (!st) return false;
+      if (typeof st.isDirectory === 'function') return st.isDirectory();
+      const mode = Number(st.mode ?? 0);
+      return mode > 0 && (mode & 0o170000) === 0o040000;
+    } catch {
+      return false;
+    }
   }
 
   listConflicts(): Promise<ConflictArchive[]> {

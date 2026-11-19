@@ -50,9 +50,17 @@ export interface VersionMeta {
 // Tombstones (Deletion Tracking)
 // ---------------------------------------------------------------------------
 
-/** Content of a tombstone file in `.meta/.deleted/`. */
+/**
+ * 墓碑目标类型。
+ * - `file`（缺省，兼容旧数据）：只删除该路径这一个文件。
+ * - `directory`：删除整个目录树。目录墓碑只需一条记录，不必为树里每个文件
+ *   各写一条；应用时按树清理（含 `.keep` / `.keep.mtime` 占位）。
+ */
+export type TombstoneType = 'file' | 'directory';
+
+/** Content of a tombstone file in `.meta/tombstones/`. */
 export interface TombstoneMeta {
-  /** The deleted file path. */
+  /** 被删除的路径（目录墓碑为目录本身，不带结尾 `/`）。 */
   path: string;
   /** Timestamp of deletion. */
   deletedAt: number;
@@ -60,6 +68,8 @@ export interface TombstoneMeta {
   deletedBy: string;
   /** Backend IDs that have confirmed the deletion (synced). */
   confirmedBy: string[];
+  /** 目标类型；缺省视为 `file`（旧版本墓碑没有该字段）。 */
+  type?: TombstoneType;
 }
 
 // ---------------------------------------------------------------------------

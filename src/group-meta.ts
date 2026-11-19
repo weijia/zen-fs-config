@@ -20,6 +20,7 @@ import type {
   GroupDescriptor,
   SyncGroupFeatures,
   TombstoneMeta,
+  TombstoneType,
   VersionMeta,
 } from './types';
 import { sha256 } from './version';
@@ -84,6 +85,72 @@ export function isTombstoneRetentionElapsed(tombstone: TombstoneMeta, now = Date
   const deletedAt = Number(tombstone.deletedAt);
   if (!Number.isFinite(deletedAt)) return true;
   return now - deletedAt >= tombstoneRetentionMs(tombstone.path);
+}
+
+/** 目录墓碑：删除目标是一整棵目录树。 */
+export function isDirectoryTombstone(tombstone: TombstoneMeta): boolean {
+  return tombstone.type === 'directory';
+}
+
+/**
+ * 墓碑的规范字节。字段顺序固定（`type` 只在目录墓碑上出现），保证：
+ * - 旧墓碑（无 `type`）重写后字节不变，不会凭空触发一轮同步；
+ * - 同一份墓碑在所有端写出的字节一致。
+ */
+export function serializeTombstone(tombstone: TombstoneMeta): string {
+  const ordered: Record<string, unknown> = {
+    path: tombstone.path,
+    deletedAt: tombstone.deletedAt,
+    deletedBy: tombstone.deletedBy,
+    confirmedBy: tombstone.confirmedBy,
+  };
+  if (tombstone.type) ordered.type = tombstone.type;
+  return JSON.stringify(ordered, null, 2);
+}
+
+/**
+ * 按树清理一个被墓碑标记的路径（本地库 / 各副本通用）。
+ *
+ * 目录不能直接 unlink（会抛 EISDIR）；隐藏的 `.keep` / `.keep.mtime` 占位在
+ * 部分后端的索引里不可见，只能按路径强删。这些占位只要残留一个，空目录就会
+ * 在下一轮拉取时复活。
+ */
+export async function purgeTombstonedTree(fs: any, targetPath: string): Promise<void> {
+  let isDir = false;
+  try {
+    const stat = await fs.stat?.(targetPath);
+    if (stat) {
+      if (typeof stat.isDirectory === 'function') isDir = stat.isDirectory();
+      else {
+        const mode = Number(stat.mode ?? 0);
+        isDir = mode > 0 && (mode & 0o170000) === 0o040000;
+      }
+    }
+  } catch {
+    isDir = false; // 不存在（或后端不支持 stat）
+  }
+  // 部分后端（或包装层）只给出权限位、不带 S_IFDIR；readdir 成功即可确认是目录。
+  if (!isDir) {
+    try { await fs.readdir(targetPath); isDir = true; } catch { isDir = false; }
+  }
+
+  if (!isDir) {
+    try { await fs.unlink(targetPath); } catch { /* already gone */ }
+    return;
+  }
+
+  for (const placeholder of [`${targetPath}/.keep`, `${targetPath}/.keep.mtime`]) {
+    try { await fs.unlink(placeholder); } catch { /* 不存在或后端不支持 */ }
+  }
+  let children: string[] = [];
+  try { children = await fs.readdir(targetPath); } catch { /* 目录可能已消失 */ }
+  for (const child of children) await purgeTombstonedTree(fs, `${targetPath}/${child}`);
+  try {
+    if (typeof fs.rmdir === 'function') await fs.rmdir(targetPath);
+    else await fs.unlink(targetPath);
+  } catch {
+    try { await fs.unlink(targetPath); } catch { /* 仍存在 */ }
+  }
 }
 /**
  * 历史归档目录。仅作为常量保留（旧数据仍在远端，按普通内容对待）：
@@ -220,16 +287,31 @@ function normalizeTombstoneRecord(value: unknown, fallbackPath?: string): Tombst
   const record = value as Record<string, unknown>;
   const rawPath = typeof record.path === 'string' ? record.path : fallbackPath;
   if (!rawPath) return null;
-  const path = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  const path = normalizeTombstonePath(rawPath);
   const confirmedBy = Array.isArray(record.confirmedBy)
     ? (record.confirmedBy as unknown[]).filter((id): id is string => typeof id === 'string')
     : [];
+  const type: TombstoneType | undefined =
+    record.type === 'directory' ? 'directory' : record.type === 'file' ? 'file' : undefined;
   return {
     path,
     deletedAt: typeof record.deletedAt === 'number' ? record.deletedAt : 0,
     deletedBy: typeof record.deletedBy === 'string' ? record.deletedBy : 'unknown',
     confirmedBy,
+    ...(type ? { type } : {}),
   };
+}
+
+/**
+ * 规范化墓碑路径：补上前导 `/`，去掉结尾 `/`。
+ *
+ * 目录墓碑记录的是目录本身（`/app/data/2026`），不能带结尾斜杠 —— 否则
+ * `encodeMetaPath()` 会编出 `app__data__2026__` 这种带空段的文件名，两个
+ * 写法不同的目录墓碑就会各存一份、互相不认。
+ */
+export function normalizeTombstonePath(rawPath: string): string {
+  const withLeading = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  return withLeading.length > 1 ? withLeading.replace(/\/+$/, '') || '/' : withLeading;
 }
 
 /**
@@ -351,6 +433,9 @@ function mergeTombstone(byPath: Map<string, TombstoneMeta>, tombstone: Tombstone
   for (const id of tombstone.confirmedBy) {
     if (!prev.confirmedBy.includes(id)) prev.confirmedBy.push(id);
   }
+  // 同一路径既有文件墓碑又有目录墓碑时，目录墓碑覆盖力更强（整棵树都删掉），
+  // 保留它，避免旧的文件墓碑把语义降级成"只删这个路径"。
+  if (isDirectoryTombstone(tombstone) && !isDirectoryTombstone(prev)) prev.type = 'directory';
 }
 
 /**
@@ -545,7 +630,7 @@ export class TombstoneStore {
 
   /** Write a tombstone. */
   async write(tombstone: TombstoneMeta): Promise<void> {
-    const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+    const bytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const p = this.pathFor(tombstone.path);
     await ensureParentDir(this.fs, p);
     await this.fs.writeFile(p, bytes);
@@ -553,7 +638,7 @@ export class TombstoneStore {
 
   /** Persist an updated tombstone (confirmations) when it still exists. */
   async save(tombstone: TombstoneMeta): Promise<void> {
-    const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+    const bytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const p = this.pathFor(tombstone.path);
     if (!(await existsSafe(this.fs, p))) return;
     await this.fs.writeFile(p, bytes);
@@ -588,9 +673,9 @@ export class TombstoneStore {
         expired.push(tombstone);
         continue;
       }
-      await this.deleteEverywhere(this.fs, tombstone.path);
+      await this.deleteEverywhere(this.fs, tombstone);
       for (const target of targets) {
-        await this.deleteEverywhere(target.fs, tombstone.path);
+        await this.deleteEverywhere(target.fs, tombstone);
       }
     }
     for (const tombstone of expired) {
@@ -623,13 +708,20 @@ export class TombstoneStore {
     }
   }
 
-  private async deleteEverywhere(fs: any, filePath: string): Promise<void> {
+  private async deleteEverywhere(fs: any, tombstone: TombstoneMeta): Promise<void> {
+    // 目录墓碑：按树清理，含隐藏的 `.keep` / `.keep.mtime` 占位。
+    // `unlink(dir)` 会抛 EISDIR，而且这些占位在部分后端不可见（exists() 为
+    // false），所以不能走"先 exists 再 unlink"的路径。
+    if (isDirectoryTombstone(tombstone)) {
+      await purgeTombstonedTree(fs, tombstone.path);
+      return;
+    }
     // `.mtime` sidecars are hidden from the backend index (GiteeFS keeps them in
     // its SHA cache only), so exists() lies and the unlink below would never run.
     // Attempt the delete unconditionally — a missing blob just throws and is ignored.
-    if (!isMtimeSidecarPath(filePath) && !(await existsSafe(fs, filePath))) return;
+    if (!isMtimeSidecarPath(tombstone.path) && !(await existsSafe(fs, tombstone.path))) return;
     try {
-      await fs.unlink(filePath);
+      await fs.unlink(tombstone.path);
     } catch {
       /* race — already gone */
     }

@@ -132,13 +132,11 @@ describe('tombstone GC safety', () => {
 
     await runTombstonePipeline(repo);
 
-    // Both the file tombstone and the `.keep` placeholders must survive:
-    // pulling the replica's leftovers back would resurrect the directory.
-    for (const target of [`/${appId}/stuck/a.txt`, `/${appId}/stuck/.keep`, `/${appId}/stuck/.keep.mtime`]) {
-      expect(
-        await exists(repo.rootFS, tombstonePath('/.meta/tombstones', target)),
-      ).toBe(true);
-    }
+    // 目录墓碑只有一条（覆盖整棵树）：副本没删干净时它必须保留，
+    // 否则副本上的残留会被下一轮同步拉回本地、把目录复活。
+    expect(
+      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/stuck`)),
+    ).toBe(true);
 
     await repo.dispose();
   });
@@ -155,16 +153,14 @@ describe('tombstone GC safety', () => {
     await repo.deleteFile(`/${appId}/clean`);
 
     // GC 现在还要求墓碑超出保留期（24h）：把 deletedAt 往前拨，模拟「已过期」。
-    const targets = [`/${appId}/clean/a.txt`, `/${appId}/clean/.keep`, `/${appId}/clean/.keep.mtime`];
-    for (const target of targets) await setTombstoneAge(repo, target, 25 * HOUR);
+    const dirTarget = `/${appId}/clean`;
+    await setTombstoneAge(repo, dirTarget, 25 * HOUR);
 
     await runTombstonePipeline(repo);
 
-    for (const target of targets) {
-      expect(
-        await exists(repo.rootFS, tombstonePath('/.meta/tombstones', target)),
-      ).toBe(false);
-    }
+    expect(
+      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', dirTarget)),
+    ).toBe(false);
 
     await repo.dispose();
   });
@@ -180,23 +176,23 @@ describe('tombstone GC safety', () => {
 
     // 第一轮：副本已确认删干净，但墓碑还很新 → 必须保留（滞后客户端还没看到它）。
     await runTombstonePipeline(repo);
-    const p = tombstonePath('/.meta/tombstones', `/${appId}/retain/a.txt`);
+    const p = tombstonePath('/.meta/tombstones', `/${appId}/retain`);
     expect(await exists(repo.rootFS, p)).toBe(true);
 
     // 保留期内（23h）仍不回收。
-    await setTombstoneAge(repo, `/${appId}/retain/a.txt`, 23 * HOUR);
+    await setTombstoneAge(repo, `/${appId}/retain`, 23 * HOUR);
     await runTombstonePipeline(repo);
     expect(await exists(repo.rootFS, p)).toBe(true);
 
     // 超过保留期（25h）后才允许 GC。
-    await setTombstoneAge(repo, `/${appId}/retain/a.txt`, 25 * HOUR);
+    await setTombstoneAge(repo, `/${appId}/retain`, 25 * HOUR);
     await runTombstonePipeline(repo);
     expect(await exists(repo.rootFS, p)).toBe(false);
 
     await repo.dispose();
   });
 
-  it('uses a short retention for .keep placeholders', async () => {
+  it('directory tombstones use the full retention window (no separate placeholder tombstones)', async () => {
     const appId = 'tomb-gc-placeholder-retention';
     const repo = await createConfigRepo(appId, { nodeId: 'n-placeholder-retention' });
     await repo.addBackend('replica-p', 'DirRemote', { label: 'tomb-gc-placeholder-retention' });
@@ -205,24 +201,23 @@ describe('tombstone GC safety', () => {
     await repo.rootFS.promises.writeFile(`/${appId}/ph/a.txt`, 'a');
     await repo.deleteFile(`/${appId}/ph`);
 
+    // 目录删除只写一条墓碑，`${path}/.keep*` 的占位墓碑不再存在。
+    const dirTombstone = tombstonePath('/.meta/tombstones', `/${appId}/ph`);
+    const placeholderTombstone = tombstonePath('/.meta/tombstones', `/${appId}/ph/.keep`);
+    expect(await exists(repo.rootFS, dirTombstone)).toBe(true);
+    expect(await exists(repo.rootFS, placeholderTombstone)).toBe(false);
+
     await runTombstonePipeline(repo);
 
-    // 占位墓碑只保留 10 分钟：拨到 11 分钟前 → 可回收。
-    for (const target of [`/${appId}/ph/.keep`, `/${appId}/ph/.keep.mtime`]) {
-      await setTombstoneAge(repo, target, 11 * 60 * 1000);
-    }
-
+    // 10 分钟（旧占位保留期）远不够：目录墓碑必须按 24h 保留。
+    await setTombstoneAge(repo, `/${appId}/ph`, 11 * 60 * 1000);
     await runTombstonePipeline(repo);
+    expect(await exists(repo.rootFS, dirTombstone)).toBe(true);
 
-    for (const target of [`/${appId}/ph/.keep`, `/${appId}/ph/.keep.mtime`]) {
-      expect(
-        await exists(repo.rootFS, tombstonePath('/.meta/tombstones', target)),
-      ).toBe(false);
-    }
-    // 数据文件墓碑仍在新保留期内 → 继续存在。
-    expect(
-      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/ph/a.txt`)),
-    ).toBe(true);
+    // 超过 24h 才允许回收。
+    await setTombstoneAge(repo, `/${appId}/ph`, 25 * HOUR);
+    await runTombstonePipeline(repo);
+    expect(await exists(repo.rootFS, dirTombstone)).toBe(false);
 
     await repo.dispose();
   });

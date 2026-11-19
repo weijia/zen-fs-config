@@ -75,6 +75,10 @@ import {
   DATA_GROUP_DEFAULT_FEATURES,
   readTombstonesFromFs,
   isTombstoneRetentionElapsed,
+  isDirectoryTombstone,
+  normalizeTombstonePath,
+  purgeTombstonedTree,
+  serializeTombstone,
   TombstoneStore,
   VersionStore,
   ConflictStore,
@@ -85,6 +89,7 @@ import {
   serializeBackendDescriptor,
 } from './canonical-json';
 import type {
+  TombstoneType,
   VersionMeta,
   SyncGroupFeatures,
   SyncGroupHandle,
@@ -157,132 +162,11 @@ async function isDirectoryPath(fs: TreeFS, absolutePath: string): Promise<boolea
   }
 }
 
-/** Collect every file path under `dir` (absolute, recursively). */
-async function collectFilesUnder(fs: TreeFS, dir: string, out: string[] = []): Promise<string[]> {
-  const entries = await fs.readdir(dir);
-  for (const entry of entries) {
-    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
-    if (await isDirectoryPath(fs, child)) {
-      await collectFilesUnder(fs, child, out);
-    } else {
-      out.push(child);
-    }
-  }
-  return out;
-}
-
-/**
- * Collect every directory path under `dir` (absolute, recursively), including
- * `dir` itself. Used to record `.keep` tombstones when deleting a tree: Git /
- * RemoteStorage keep otherwise-empty directories alive with an internal
- * `.keep` placeholder that never reaches the local primary, so it needs an
- * explicit tombstone to be removed from replicas.
- */
-async function collectDirectoriesUnder(fs: TreeFS, dir: string, out: string[] = []): Promise<string[]> {
-  out.push(dir);
-  let entries: string[];
-  try {
-    entries = await fs.readdir(dir);
-  } catch {
-    return out; // Already gone — nothing else to record
-  }
-  for (const entry of entries) {
-    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
-    if (await isDirectoryPath(fs, child)) await collectDirectoriesUnder(fs, child, out);
-  }
-  return out;
-}
-
-/** Remove a directory tree bottom-up; contained files must be gone already. */
-async function removeDirectoryTree(fs: TreeFS, dir: string): Promise<void> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(dir);
-  } catch {
-    return; // Already gone
-  }
-  for (const entry of entries) {
-    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
-    if (await isDirectoryPath(fs, child)) await removeDirectoryTree(fs, child);
-  }
-  try {
-    await fs.rmdir?.(dir);
-  } catch {
-    /* best effort — a leftover empty dir is harmless */
-  }
-}
-
 /**
  * A FS surface that can be enumerated, plus a human-readable label used when
  * its enumeration fails (local cache vs a specific replica backend).
  */
 type NamedTreeFS = { label: string; fs: TreeFS };
-
-/**
- * Collect files under `dir` from **every** surface and merge the results.
- *
- * The local primary only mirrors what this node has already seen: a directory
- * whose children live solely on a backend (e.g. archives written by an older
- * build) would otherwise be enumerated as empty, so deleting it would never
- * write per-file tombstones and the children would simply be pulled back.
- *
- * A surface whose enumeration fails is reported through `onError` and skipped;
- * it must never be silently treated as an empty directory.
- */
-async function collectFilesUnderAny(
-  surfaces: NamedTreeFS[],
-  dir: string,
-  onError: (label: string, error: unknown) => void,
-): Promise<string[]> {
-  const merged = new Set<string>();
-  for (const surface of surfaces) {
-    try {
-      for (const file of await collectFilesUnder(surface.fs, dir)) merged.add(file);
-    } catch (error) {
-      onError(surface.label, error);
-    }
-  }
-  return [...merged];
-}
-
-/**
- * Strict variant of {@link collectDirectoriesUnder}: a failing `readdir` is
- * propagated to the caller instead of being treated as "no subdirectories".
- * Paths discovered before the failure are kept in `out`.
- */
-async function collectDirectoriesUnderStrict(
-  fs: TreeFS,
-  dir: string,
-  out: string[] = [],
-): Promise<string[]> {
-  out.push(dir);
-  const entries = await fs.readdir(dir);
-  for (const entry of entries) {
-    const child = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
-    if (await isDirectoryPath(fs, child)) await collectDirectoriesUnderStrict(fs, child, out);
-  }
-  return out;
-}
-
-/** Directory-path counterpart of {@link collectFilesUnderAny} (includes `dir`). */
-async function collectDirectoriesUnderAny(
-  surfaces: NamedTreeFS[],
-  dir: string,
-  onError: (label: string, error: unknown) => void,
-): Promise<string[]> {
-  const merged = new Set<string>();
-  for (const surface of surfaces) {
-    const found: string[] = [];
-    try {
-      await collectDirectoriesUnderStrict(surface.fs, dir, found);
-    } catch (error) {
-      // Keep whatever was walked before the failure; never treat it as empty.
-      onError(surface.label, error);
-    }
-    for (const child of found) merged.add(child);
-  }
-  return [...merged];
-}
 
 /** True when `path` is a directory on at least one surface. */
 async function isDirectoryAny(surfaces: NamedTreeFS[], path: string): Promise<boolean> {
@@ -780,19 +664,22 @@ export class ConfigRepo implements IConfigRepo {
   // -----------------------------------------------------------------------
 
   /**
-   * Write the tombstone record for `filePath` under `.meta/tombstones/`.
-   * Records only metadata — it never creates the deleted file locally, and the
+   * Write the tombstone record for `path` under `.meta/tombstones/`.
+   * Records only metadata — it never creates the deleted path locally, and the
    * legacy `/.meta/.deleted/` archive is neither read nor written.
+   *
+   * `type: 'directory'` 表示这是一条目录墓碑：应用时按整棵树清理。
    */
-  private async writeTombstoneFor(filePath: string): Promise<void> {
-    const normalizedPath = filePath.startsWith('/') ? filePath : '/' + filePath;
+  private async writeTombstoneFor(path: string, type?: TombstoneType): Promise<void> {
+    const normalizedPath = normalizeTombstonePath(path);
     const tombstone: TombstoneMeta = {
       path: normalizedPath,
       deletedAt: Date.now(),
       deletedBy: this.primaryBackendId,
       confirmedBy: [this.primaryBackendId],
+      ...(type ? { type } : {}),
     };
-    const tombstoneBytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+    const tombstoneBytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const tombstonePath = tombstonePathFor(normalizedPath, TOMBSTONES_DIR);
     await this.ensureDir(tombstonePath);
     await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
@@ -804,49 +691,29 @@ export class ConfigRepo implements IConfigRepo {
    */
   async deleteFile(path: string): Promise<void> {
     this.assertNotDisposed();
-    const normalizedPath = path.startsWith('/') ? path : '/' + path;
+    const normalizedPath = normalizeTombstonePath(path);
 
-    // Directories are deleted as a tree: one tombstone per contained file.
-    // The sync layer works file-by-file, so a directory-path tombstone alone
-    // would be a no-op on backends without directory entries and the children
-    // would be resurrected on the next pull.
+    // 目录：写一条「目录墓碑」，不再为树里每个文件各写一条。
+    // 应用墓碑时按树清理（`purgePathOnBackend`），因此：
+    // - 不需要枚举目录（省掉 N 次 readdir/stat，以及 N 次后端往返）；
+    // - 远端独有的孩子也一并被清理，不会因"本地没看见"而漏删；
+    // - `.keep` / `.keep.mtime` 占位在按树清理里被显式删除，不必单独建墓碑。
     //
-    // Enumeration must span the local cache **and** every replica backend: a
-    // path may live only on a backend (the cache never saw it), and reading
-    // just the cache would silently produce "empty directory" → no tombstones
-    // → the children come straight back.
+    // 仅在任一表面（本地缓存或副本后端）上确实是目录时才走目录墓碑：路径只
+    // 以文件形式存在时（或所有表面都 stat 失败）仍按单文件墓碑处理。
     const surfaces: NamedTreeFS[] = [{ label: 'local-cache', fs: this.cachedFS }];
     for (const [id, replica] of this.replicaBackends) {
       surfaces.push({ label: id, fs: replica.instance as TreeFS });
     }
-    const onEnumerateError = (label: string, error: unknown) => {
-      const reason = (error as any)?.message ?? String(error);
-      log.warn(
-        `[ConfigRepo] deleteFile(directory): cannot enumerate "${label}" under ${normalizedPath}: ${reason}`,
-      );
-    };
 
     if (await isDirectoryAny(surfaces, normalizedPath)) {
-      const files = await collectFilesUnderAny(surfaces, normalizedPath, onEnumerateError);
-      for (const file of files) await this.deleteFile(file);
-      // Backends that cannot store empty directories keep them alive with an
-      // internal `.keep` placeholder, which readdir()/createSnapshot() hide and
-      // the local primary does not carry. Without an explicit tombstone it
-      // survives the delete and the directory reappears on the next pull.
-      //
-      // The placeholder's `<dir>/.keep.mtime` sidecar is a REAL blob (backends
-      // persist mtime as `<name>.mtime`): if only `.keep` is tombstoned, the
-      // sidecar alone keeps the directory alive in Git. It also outlives the
-      // `.keep` itself when an older build already removed the placeholder.
-      for (const dir of await collectDirectoriesUnderAny(surfaces, normalizedPath, onEnumerateError)) {
-        const keepPath = dir === '/' ? '/.keep' : `${dir}/.keep`;
-        await this.writeTombstoneFor(keepPath);
-        await this.writeTombstoneFor(`${keepPath}.mtime`);
-      }
-      await removeDirectoryTree(this.cachedFS, normalizedPath);
+      await this.writeTombstoneFor(normalizedPath, 'directory');
+      // 本地也按树清理（含隐藏占位）：目录墓碑只记录"这棵树被删了"，实际的
+      // 删除动作在本地与各副本上都要发生一次。
+      await this.purgePathOnBackend(this.cachedFS, normalizedPath);
       this.invalidateTombstoneCache();
       this.schedulePostDeleteSync();
-      log.log(`[ConfigRepo] deleteFile(directory): ${normalizedPath} (${files.length} file(s))`);
+      log.log(`[ConfigRepo] deleteFile(directory): ${normalizedPath} (single directory tombstone)`);
       return;
     }
 
@@ -940,12 +807,14 @@ export class ConfigRepo implements IConfigRepo {
     for (const tombstone of tombstones) {
       if (!tombstone.path) continue;
       add(tombstone.path);
-      // `.keep` / `.keep.mtime` 是后端用来保活空目录的占位文件，墓碑本身已经
-      // 通过上面的 add() 排除掉了。
+      // 目录墓碑的 `${path}/` 前缀是故意加的：整棵树已被删除，保留期内任何
+      // 子路径都不参与同步（否则远端残留会被逐文件拉回来）。
       //
-      // 这里**不能**再排除整个目录：目录级前缀会把该目录下的真实数据一并挡在
-      // 同步之外（表现为快照只看到寥寥几个文件、深层 data 永远传不上去，而远端
-      // 目录看起来是空的）。空目录被重建是无害的；丢数据才是致命的。
+      // 文件墓碑的 `<path>/` 前缀匹配不到任何真实路径，加与不加等价。
+      //
+      // 注意：这里**不能**为 `.keep` 占位墓碑额外排除其父目录 —— 那样会把该
+      // 目录下的真实数据一并挡在同步之外（表现为快照只看到寥寥几个文件、深层
+      // data 永远传不上去）。空目录被重建是无害的；丢数据才是致命的。
     }
   }
 
@@ -1018,7 +887,9 @@ export class ConfigRepo implements IConfigRepo {
       const isKeepPlaceholder =
         tombstone.path === '/.keep' || tombstone.path.endsWith('/.keep');
       const forceDelete = isMtimeSidecar(tombstone.path) || isKeepPlaceholder;
-      const tVersionPath = forceDelete ? null : versionPathFor(tombstone.path);
+      // 目录墓碑没有对应的版本记录；其它逻辑与文件墓碑一致（清理入口本身按树）。
+      const isDirTombstone = isDirectoryTombstone(tombstone);
+      const tVersionPath = forceDelete || isDirTombstone ? null : versionPathFor(tombstone.path);
 
       // 用户写操作撤销了删除意图：该路径在删除之后又被写入（例如 `.sync.lock`
       // 每轮删了再建）。此时必须保留文件并让墓碑过期，否则每轮 sync 都会把它删掉。
@@ -1375,7 +1246,7 @@ export class ConfigRepo implements IConfigRepo {
       // until the tombstone is eventually GC'd.
       if (changed) {
         try {
-          const bytes = new TextEncoder().encode(JSON.stringify(tombstone, null, 2));
+          const bytes = new TextEncoder().encode(serializeTombstone(tombstone));
           const tombstonePath = tombstonePathFor(tombstone.path, TOMBSTONES_DIR);
           if (await this.safeExists(this.cachedFS, tombstonePath)) {
             await this.cachedFS.writeFile(tombstonePath, bytes);
@@ -3714,13 +3585,14 @@ class AppDataGroupImpl implements AppDataGroup {
     }
   }
 
-  /** Write a tombstone for `filePath`. Records metadata only — it never creates the file. */
-  private async writeTombstoneFor(filePath: string): Promise<void> {
+  /** Write a tombstone for `path`. Records metadata only — it never creates the path. */
+  private async writeTombstoneFor(path: string, type?: TombstoneType): Promise<void> {
     await this.tombstones.write({
-      path: filePath.startsWith('/') ? filePath : `/${filePath}`,
+      path: normalizeTombstonePath(path),
       deletedAt: Date.now(),
       deletedBy: this.localBackendId,
       confirmedBy: [this.localBackendId],
+      ...(type ? { type } : {}),
     });
   }
 
@@ -3741,23 +3613,14 @@ class AppDataGroupImpl implements AppDataGroup {
       throw new Error(`Cannot delete metadata path "${normalized}"`);
     }
 
-    // Directory: tombstone every contained file, then drop the empty tree.
+    // 目录：一条目录墓碑代替逐文件墓碑。应用墓碑时由 `purgeTombstonedTree`
+    // 按树清理（本地库 + 每个后端），隐藏的 `.keep` / `.keep.mtime` 占位也在
+    // 清理范围内，因此这里不再枚举目录、也不再为每个子目录写占位墓碑。
     if (await isDirectoryPath(this.localFS, normalized)) {
-      const files = await collectFilesUnder(this.localFS, normalized);
-      for (const file of files) await this.deleteFile(file);
-      // Hidden `.keep` placeholders keep otherwise-empty directories alive on
-      // Git/RemoteStorage but never reach the local primary; tombstone them
-      // explicitly so a directory whose remote copy only has `.keep` cannot
-      // reappear on the next pull. The placeholder's `<dir>/.keep.mtime`
-      // sidecar is a real blob too — on its own it keeps the directory alive.
-      for (const dir of await collectDirectoriesUnder(this.localFS, normalized)) {
-        const keepPath = dir === '/' ? '/.keep' : `${dir}/.keep`;
-        await this.writeTombstoneFor(keepPath);
-        await this.writeTombstoneFor(`${keepPath}.mtime`);
-      }
-      await removeDirectoryTree(this.localFS, normalized);
+      await this.writeTombstoneFor(normalized, 'directory');
+      await purgeTombstonedTree(this.localFS, normalized);
       this.schedulePostDeleteSync();
-      log.log(`[AppDataGroup:${this.groupId}] deleteFile(directory): ${normalized} (${files.length} file(s))`);
+      log.log(`[AppDataGroup:${this.groupId}] deleteFile(directory): ${normalized} (single directory tombstone)`);
       return;
     }
 

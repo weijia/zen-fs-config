@@ -1,16 +1,18 @@
 /**
  * Directory deletion — both group kinds.
  *
- * A directory must be deleted as a tree: one tombstone per contained file,
- * then the empty dirs. Writing a single tombstone for the directory path
- * would be a no-op on backends without directory entries, and simply calling
- * the inner `rmdir`/`unlink` would leave replicas able to resurrect children.
+ * 目录删除只写**一条目录墓碑**（`type: "directory"`），不为树里每个文件各写
+ * 一条。应用墓碑时按树清理：递归删除子项、显式删掉隐藏的 `.keep` /
+ * `.keep.mtime` 占位，最后 rmdir，因此：
+ * - 后端上没有目录条目也不会漏删（按路径逐层清理）；
+ * - 远端独有的孩子同样被清理（不依赖本地枚举）；
+ * - `.keep` 占位不需要单独的墓碑。
  *
  * Covers both entry points used by consumers:
  * - `repo.deleteFile(dir)` / `group.deleteFile(dir)` (admin UI path)
  * - `fs.unlink(dir)` / `fs.rmdir(dir)` on the chroot views
  */
-import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { registerBackend, createBackend, type BackendInstance } from '../backend-registry';
@@ -73,12 +75,20 @@ async function mkdirp(fs: any, p: string): Promise<void> {
   }
 }
 
-function tombstonePath(dir: string, filePath: string): string {
-  return `${dir}/${encodeMetaPath(filePath)}.json`;
+function tombstonePath(dir: string, targetPath: string): string {
+  return `${dir}/${encodeMetaPath(targetPath)}.json`;
+}
+
+async function readTombstone(root: any, targetPath: string): Promise<any | null> {
+  const p = tombstonePath('/.meta/tombstones', targetPath);
+  const api = root.promises ?? root;
+  if (!(await exists(root, p))) return null;
+  const raw = await api.readFile(p);
+  return JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
 }
 
 describe('directory deletion', () => {
-  it('config-sync group: repo.deleteFile(dir) tombstones every child', async () => {
+  it('config-sync group: repo.deleteFile(dir) writes one directory tombstone', async () => {
     const appId = 'dir-del-config';
     const repo = await createConfigRepo(appId, { nodeId: 'n1' });
     const root = repo.rootFS;
@@ -93,28 +103,27 @@ describe('directory deletion', () => {
     expect(await exists(root, `/${appId}/dir/sub/a.txt`)).toBe(false);
     expect(await exists(root, `/${appId}/dir/b.txt`)).toBe(false);
 
-    for (const file of [`/${appId}/dir/sub/a.txt`, `/${appId}/dir/b.txt`]) {
-      expect(await exists(root, tombstonePath('/.meta/tombstones', file))).toBe(true);
-      // The legacy `/.meta/.deleted/` archive is no longer written.
-      expect(await exists(root, tombstonePath('/.meta/.deleted', file))).toBe(false);
-      const raw = await root.promises.readFile(tombstonePath('/.meta/tombstones', file));
-      const tombstone = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
-      expect(tombstone.path).toBe(file);
+    const tombstone = await readTombstone(root, `/${appId}/dir`);
+    expect(tombstone).not.toBeNull();
+    expect(tombstone.path).toBe(`/${appId}/dir`);
+    expect(tombstone.type).toBe('directory');
+
+    // 不再逐文件/逐 `.keep` 建墓碑。
+    for (const child of [`/${appId}/dir/sub/a.txt`, `/${appId}/dir/b.txt`]) {
+      expect(await exists(root, tombstonePath('/.meta/tombstones', child))).toBe(false);
+    }
+    for (const dir of [`/${appId}/dir`, `/${appId}/dir/sub`]) {
+      expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(false);
+      expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(false);
     }
 
-    // Every deleted directory gets a `.keep` tombstone so a hidden placeholder
-    // left on a Git backend cannot resurrect the (now empty) directory.
-    // Its `.keep.mtime` sidecar is a real blob and needs its own tombstone:
-    // alone it keeps the directory alive in Git.
-    for (const dir of [`/${appId}/dir`, `/${appId}/dir/sub`]) {
-      expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
-      expect(await exists(root, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(true);
-    }
+    // The legacy `/.meta/.deleted/` archive is no longer written.
+    expect(await exists(root, tombstonePath('/.meta/.deleted', `/${appId}/dir`))).toBe(false);
 
     await repo.dispose();
   });
 
-  it('config-sync group: deleting a directory that only has a remote .keep records a tombstone', async () => {
+  it('config-sync group: a directory whose remote copy only has .keep is removed by the directory tombstone', async () => {
     const appId = 'dir-del-keep';
     const repo = await createConfigRepo(appId, { nodeId: 'n-keep' });
     await repo.addBackend('remote-keep', 'DirRemote', { label: 'dir-del-keep' });
@@ -127,24 +136,24 @@ describe('directory deletion', () => {
     try { await replica.mkdir(`/${appId}`); } catch { /* already exists */ }
     try { await replica.mkdir(`/${appId}/only-keep`); } catch { /* already exists */ }
     await replica.writeFile(`/${appId}/only-keep/.keep`, '\n');
+    await replica.writeFile(`/${appId}/only-keep/.keep.mtime`, '{"mtime":1}');
     expect(await exists(replica, `/${appId}/only-keep/.keep`)).toBe(true);
 
     await repo.deleteFile(`/${appId}/only-keep`);
 
     expect(await exists(repo.rootFS, `/${appId}/only-keep`)).toBe(false);
-    expect(
-      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/only-keep/.keep`)),
-    ).toBe(true);
+    expect((await readTombstone(repo.rootFS, `/${appId}/only-keep`))?.type).toBe('directory');
 
-    // Processing the tombstone removes the remote placeholder, so the
-    // directory cannot be pulled back into existence.
+    // 目录墓碑按树清理：隐藏占位与目录本身一起消失，不会被拉回。
     await (repo as any).processTombstonesPublic();
     expect(await exists(replica, `/${appId}/only-keep/.keep`)).toBe(false);
+    expect(await exists(replica, `/${appId}/only-keep/.keep.mtime`)).toBe(false);
+    expect(await exists(replica, `/${appId}/only-keep`)).toBe(false);
 
     await repo.dispose();
   });
 
-  it('config-sync group: a directory that exists only on a replica is tombstoned per file', async () => {
+  it('config-sync group: a directory that exists only on a replica is removed by one tombstone', async () => {
     const appId = 'dir-del-remote-only';
     const repo = await createConfigRepo(appId, { nodeId: 'n-ro' });
     await repo.addBackend('remote-only', 'DirRemote', { label: 'dir-del-remote-only' });
@@ -163,26 +172,20 @@ describe('directory deletion', () => {
 
     await repo.deleteFile(`/${appId}/remote-only`);
 
-    for (const file of [`/${appId}/remote-only/a.txt`, `/${appId}/remote-only/nested/b.txt`]) {
-      expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
-      const raw = await repo.rootFS.promises.readFile(tombstonePath('/.meta/tombstones', file));
-      const tombstone = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
-      expect(tombstone.path).toBe(file);
-    }
-    for (const dir of [`/${appId}/remote-only`, `/${appId}/remote-only/nested`]) {
-      expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
-      expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(true);
-    }
+    const tombstone = await readTombstone(repo.rootFS, `/${appId}/remote-only`);
+    expect(tombstone?.type).toBe('directory');
+    expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/remote-only/a.txt`))).toBe(false);
 
-    // The tombstones are actionable: processing them removes the replica copy.
+    // The tombstone is actionable: processing it removes the replica tree.
     await (repo as any).processTombstonesPublic();
     expect(await exists(replica, `/${appId}/remote-only/a.txt`)).toBe(false);
     expect(await exists(replica, `/${appId}/remote-only/nested/b.txt`)).toBe(false);
+    expect(await exists(replica, `/${appId}/remote-only`)).toBe(false);
 
     await repo.dispose();
   });
 
-  it('config-sync group: a failing replica enumeration is reported, others still get tombstones', async () => {
+  it('config-sync group: a replica that cannot enumerate does not turn a directory delete into per-file tombstones', async () => {
     const appId = 'dir-del-broken-replica';
     const repo = await createConfigRepo(appId, { nodeId: 'n-broken' });
 
@@ -193,31 +196,28 @@ describe('directory deletion', () => {
     const broken = {
       readdir: async () => { throw new Error('replica unreachable'); },
       stat: async () => { throw new Error('replica unreachable'); },
-      exists: async () => false,
-      unlink: async () => { /* nothing to remove */ },
+      exists: async () => true,
+      unlink: async () => { throw new Error('replica unreachable'); },
+      rmdir: async () => { throw new Error('replica unreachable'); },
     };
     (repo as any).replicaBackends.set('broken', { instance: broken, syncable: null, pairId: 'broken' });
 
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      await mkdirp(repo.rootFS, `/${appId}/mixed`);
-      await repo.rootFS.promises.writeFile(`/${appId}/mixed/local.txt`, 'l');
-      try { await good.mkdir(`/${appId}`); } catch { /* already exists */ }
-      try { await good.mkdir(`/${appId}/mixed`); } catch { /* already exists */ }
-      await good.writeFile(`/${appId}/mixed/remote.txt`, 'r');
+    await mkdirp(repo.rootFS, `/${appId}/mixed`);
+    await repo.rootFS.promises.writeFile(`/${appId}/mixed/local.txt`, 'l');
+    try { await good.mkdir(`/${appId}`); } catch { /* already exists */ }
+    try { await good.mkdir(`/${appId}/mixed`); } catch { /* already exists */ }
+    await good.writeFile(`/${appId}/mixed/remote.txt`, 'r');
 
-      await repo.deleteFile(`/${appId}/mixed`);
+    await repo.deleteFile(`/${appId}/mixed`);
 
-      for (const file of [`/${appId}/mixed/local.txt`, `/${appId}/mixed/remote.txt`]) {
-        expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
-      }
-      // The failure is logged with the backend id, not silently swallowed.
-      expect(
-        warnSpy.mock.calls.some((call) => call.join(' ').includes('broken') && call.join(' ').includes('mixed')),
-      ).toBe(true);
-    } finally {
-      warnSpy.mockRestore();
-    }
+    // 目录墓碑只有一条，且不依赖任何副本枚举。
+    expect((await readTombstone(repo.rootFS, `/${appId}/mixed`))?.type).toBe('directory');
+    expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/mixed/local.txt`))).toBe(false);
+    expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/mixed/remote.txt`))).toBe(false);
+
+    // 清不干净的副本会让墓碑保留（不能把"清理失败"当成"已删除"）。
+    await (repo as any).processTombstonesPublic();
+    expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/mixed`))).toBe(true);
 
     await repo.dispose();
   });
@@ -232,14 +232,13 @@ describe('directory deletion', () => {
     await repo.fs.promises.rmdir('/gone');
 
     expect(await exists(repo.fs, '/gone')).toBe(false);
-    expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/gone/deep/c.txt`))).toBe(
-      true,
-    );
+    expect((await readTombstone(repo.rootFS, `/${appId}/gone`))?.type).toBe('directory');
+    expect(await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/gone/deep/c.txt`))).toBe(false);
 
     await repo.dispose();
   });
 
-  it('data group: unlink / rmdir on the chroot view tombstone every child', async () => {
+  it('data group: unlink / rmdir on the chroot view write directory tombstones', async () => {
     const repo = await createConfigRepo('dir-del-data', { nodeId: 'n3' });
     const group = await repo.createAppDataGroup('g-dir', [
       { id: 'remote-1', type: 'DirRemote', options: { label: 'dir-del-data' } },
@@ -253,14 +252,11 @@ describe('directory deletion', () => {
     await group.fs.promises.unlink('/unlinked');
 
     expect(await exists(group.fs, '/unlinked')).toBe(false);
-    for (const file of ['/unlinked/sub/a.txt', '/unlinked/b.txt']) {
-      expect(await exists(localFS, tombstonePath('/.meta/tombstones', file))).toBe(true);
-      expect(await exists(localFS, tombstonePath('/.meta/.deleted', file))).toBe(false);
-    }
-    for (const dir of ['/unlinked', '/unlinked/sub']) {
-      expect(await exists(localFS, tombstonePath('/.meta/tombstones', `${dir}/.keep`))).toBe(true);
-      expect(await exists(localFS, tombstonePath('/.meta/tombstones', `${dir}/.keep.mtime`))).toBe(true);
-    }
+    const tombstone = await readTombstone(localFS, '/unlinked');
+    expect(tombstone?.type).toBe('directory');
+    expect(tombstone?.path).toBe('/unlinked');
+    expect(await exists(localFS, tombstonePath('/.meta/tombstones', '/unlinked/sub/a.txt'))).toBe(false);
+    expect(await exists(localFS, tombstonePath('/.meta/.deleted', '/unlinked'))).toBe(false);
 
     // `fs.rmdir` goes through the same tombstone-aware path.
     await mkdirp(group.fs, '/rmdir/nested');
@@ -268,7 +264,7 @@ describe('directory deletion', () => {
     await group.fs.promises.rmdir('/rmdir');
 
     expect(await exists(group.fs, '/rmdir')).toBe(false);
-    expect(await exists(localFS, tombstonePath('/.meta/tombstones', '/rmdir/nested/c.txt'))).toBe(true);
+    expect((await readTombstone(localFS, '/rmdir'))?.type).toBe('directory');
 
     // Metadata stays hidden from the app-facing view.
     expect(await exists(group.fs, '/.meta/group.json')).toBe(false);
@@ -278,7 +274,7 @@ describe('directory deletion', () => {
     await repo.dispose();
   });
 
-  it('config-sync group: .mtime tombstones bypass exists() on replicas', async () => {
+  it('config-sync group: a directory tombstone unlinks hidden .keep sidecars even when exists() lies', async () => {
     const appId = 'dir-del-mtime';
     const repo = await createConfigRepo(appId, { nodeId: 'n-mtime' });
     await mkdirp(repo.rootFS, `/${appId}/ghost`);
@@ -287,17 +283,25 @@ describe('directory deletion', () => {
 
     // Backends like GiteeFS hide `.mtime` sidecars from their Index, so
     // exists() returns false for a blob that is still on the remote. The
-    // tombstone pass must unlink them unconditionally.
+    // directory tombstone must clean them anyway (no exists() gate).
     const deleted: string[] = [];
     const fakeReplica = {
       exists: async () => false,
+      stat: async (p: string) => {
+        if (p === `/${appId}/ghost`) return { size: 0, mode: 0o040755, isDirectory: () => true };
+        throw new Error('ENOENT');
+      },
+      readdir: async (p: string) => (p === `/${appId}/ghost` ? [] : []),
       unlink: async (p: string) => { deleted.push(p); },
+      rmdir: async (p: string) => { deleted.push(p); },
     };
     (repo as any).replicaBackends.set('fake-hidden-sidecars', { instance: fakeReplica });
 
     await (repo as any).processTombstonesPublic();
 
+    expect(deleted).toContain(`/${appId}/ghost/.keep`);
     expect(deleted).toContain(`/${appId}/ghost/.keep.mtime`);
+    expect(deleted).toContain(`/${appId}/ghost`);
     // A sidecar tombstone must not spawn a `.mtime.version` follow-up.
     expect(deleted.some((p) => p.includes('.mtime.version'))).toBe(false);
 
