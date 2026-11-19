@@ -18,6 +18,7 @@
  */
 
 import type { BackendDescriptor } from './types';
+import { repairIndexedDBStore } from './idb-repair';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -383,6 +384,17 @@ registerBackend('IndexedDB', async (options) => {
 
   const storeName = (options.storeName as string) ?? 'zen-fs-config';
   const label = (options.label as string) ?? storeName;
+
+  // StoreFS aborts its index build if one directory listing is unreadable, and
+  // then allocates ids from an incomplete index (overwriting other nodes). Clear
+  // undecodable listing slots first so the index build can complete.
+  const repaired = await repairIndexedDBStore(storeName);
+  if (repaired?.repaired) {
+    console.warn(
+      `[Backend:IndexedDB] ${storeName}: reset ${repaired.repaired} corrupted directory listing(s): ` +
+        repaired.details.map((d) => `ino ${d.key}→slot ${d.data} (${d.reason})`).join(', '),
+    );
+  }
 
   return wrapZenFSFileSystem({ backend: IndexedDB, storeName, label });
 }, {
