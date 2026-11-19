@@ -42,9 +42,10 @@ jobs:
       - name: Publish to npm
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          # 用退出码判重：`npm view` 对不存在的版本会把错误文本打到输出里，
-          # 用 grep 匹配版本号会把「version not found: 0.7.9」误判成已发布。
-          if npm view "zen-fs-config@${VERSION}" version >/dev/null 2>&1; then
+          # 不能用 `npm view` 判重：npm 12 对不存在的版本也会以 0 退出，
+          # 于是每次都走 skip 分支、npm 上永远没有新版本。
+          # 直接看 registry 的 HTTP 状态：200 已发布，404 未发布。
+          if curl -fsS "https://registry.npmjs.org/zen-fs-config/${VERSION}" -o /dev/null; then
             echo "zen-fs-config@${VERSION} already published on npm, skipping publish step"
           else
             npm publish --access public --provenance
