@@ -10,6 +10,7 @@
 
 import type { FileStat, SyncableFS } from 'zen-fs-sync';
 import type { BackendInstance } from './backend-registry';
+import { wrapGroupTypeGuard } from './group-type-guard';
 
 /**
  * Safely convert a value to Uint8Array. Works in both browser and Node.js.
@@ -129,7 +130,9 @@ export function backendToSyncableFS(backend: BackendInstance, name?: string): Sy
     syncable.backendName = (backend.constructor as any).name || 'Backend';
   }
 
-  return syncable;
+  // 身份守卫：`group-type` / `group.json` 的 kind / 数据组描述符的 groupType
+  // 一旦写入就代表组的身份，同步不允许把它改成另一个值（详见 group-type-guard）。
+  return wrapGroupTypeGuard(syncable, syncable.backendName || 'backend');
 }
 
 // ---------------------------------------------------------------------------
@@ -259,5 +262,5 @@ export function cachedFSToSyncableFS(cached: any, name?: string): SyncableFS {
   };
 
   syncable.backendName = name || 'CachedFS';
-  return syncable;
+  return wrapGroupTypeGuard(syncable, syncable.backendName);
 }

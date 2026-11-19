@@ -98,6 +98,26 @@ A **sync group** is a set of backends that synchronize with each other. There ar
 | `data-sync` | Lightweight: data backends only, direct read/write, no config meta layer |
 | absent | New empty backend; caller decides group type at creation time |
 
+**Group type is write-once, and sync may not change it**: besides the connect-time
+check (`connect()` throws when `options.groupType` disagrees with the detected
+type), every `SyncableFS` handed to the sync engine is wrapped by
+`wrapGroupTypeGuard()` (`src/group-type-guard.ts`). The guard compares the
+identity the sync write would produce with what the target side already holds and
+drops the write when they differ, so a wrongly-wired replica can never flip a
+config-sync group into a data-sync group (or the other way round). Guarded
+identity fields:
+
+| Path | Identity field | Allowed change |
+|---|---|---|
+| `.config/group-type`, `.meta/group-type` | trimmed text (`config-sync` / `data-sync`) | first write, or same value |
+| `.meta/group.json` | `kind` (`config` / `data`) | first write, or same `kind` (name/features still update freely) |
+| `.config/app-data-groups/{appId}/{id}.json` | `groupType` (`data-sync`) | first write, or same value |
+
+Blocking is deliberately non-fatal: the write is skipped, a
+`[GroupType] blocked group-type change on <side>` warning is logged once per
+distinct (side, path, from→to) signature, and the repo stays usable. Fix the
+group wiring instead of syncing the marker.
+
 ## 3. File System Structure
 
 ### 3.1 Config-Sync Group
