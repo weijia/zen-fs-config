@@ -65,6 +65,7 @@ import {
   assertValidBackendId,
   DATA_GROUP_DEFAULT_FEATURES,
   readTombstonesFromFs,
+  isTombstoneRetentionElapsed,
   TombstoneStore,
   VersionStore,
   ConflictStore,
@@ -1416,7 +1417,15 @@ export class ConfigRepo implements IConfigRepo {
     // feeding the sync engine spurious MTIME NORMALIZE churn.
     const allBackendIds = [...this.replicaBackends.keys()];
 
+    let keptByRetention = 0;
     for (const tombstone of tombstones) {
+      // 保留期内不回收。GC 的「确认」只覆盖本实例配置的副本后端，覆盖不到其它
+      // 设备/标签页里仍然留着的文件；墓碑提前消失，滞后端就会把旧文件持续推回
+      // 后端（复活），而且写回的 mtime 还可能反过来把墓碑判成「已撤销」。
+      if (!isTombstoneRetentionElapsed(tombstone)) {
+        keptByRetention++;
+        continue;
+      }
       // 不能只看历史 confirmedBy：某副本可能在上一次确认之后又把路径/占位目录
       // 带了回来。GC 前必须逐个副本复核"当前确实不存在"。
       const allConfirmed = await this.allReplicasConfirmAbsent(tombstone.path);
@@ -1440,6 +1449,9 @@ export class ConfigRepo implements IConfigRepo {
 
         log.log(`[ConfigRepo] gcTombstones: removed ${tombstonePath} (all ${allBackendIds.length} backends confirmed)`);
       }
+    }
+    if (keptByRetention > 0) {
+      log.log(`[ConfigRepo] gcTombstones: kept ${keptByRetention} tombstone(s) within retention window`);
     }
   }
 

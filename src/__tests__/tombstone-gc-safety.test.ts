@@ -100,6 +100,22 @@ async function runTombstonePipeline(repo: any): Promise<void> {
   repo.invalidateTombstoneCache();
 }
 
+/**
+ * 把某一墓碑的 `deletedAt` 往前拨，模拟「墓碑已经在保留期外」。
+ * GC 现在要求 deletedAt 距今超过保留期（文件 24h / 占位 10min）。
+ */
+async function setTombstoneAge(repo: any, target: string, ageMs: number): Promise<void> {
+  const p = tombstonePath('/.meta/tombstones', target);
+  const raw = await repo.rootFS.promises.readFile(p);
+  const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw as any);
+  const meta = JSON.parse(text);
+  meta.deletedAt = Date.now() - ageMs;
+  await repo.rootFS.promises.writeFile(p, new TextEncoder().encode(JSON.stringify(meta, null, 2)));
+  repo.invalidateTombstoneCache();
+}
+
+const HOUR = 60 * 60 * 1000;
+
 describe('tombstone GC safety', () => {
   it('keeps the tombstone when one of two replicas still holds the path', async () => {
     const appId = 'tomb-gc-stuck';
@@ -138,13 +154,75 @@ describe('tombstone GC safety', () => {
 
     await repo.deleteFile(`/${appId}/clean`);
 
+    // GC 现在还要求墓碑超出保留期（24h）：把 deletedAt 往前拨，模拟「已过期」。
+    const targets = [`/${appId}/clean/a.txt`, `/${appId}/clean/.keep`, `/${appId}/clean/.keep.mtime`];
+    for (const target of targets) await setTombstoneAge(repo, target, 25 * HOUR);
+
     await runTombstonePipeline(repo);
 
-    for (const target of [`/${appId}/clean/a.txt`, `/${appId}/clean/.keep`, `/${appId}/clean/.keep.mtime`]) {
+    for (const target of targets) {
       expect(
         await exists(repo.rootFS, tombstonePath('/.meta/tombstones', target)),
       ).toBe(false);
     }
+
+    await repo.dispose();
+  });
+
+  it('keeps a confirmed tombstone until the retention window has elapsed', async () => {
+    const appId = 'tomb-gc-retention';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-retention' });
+    await repo.addBackend('replica-r', 'DirRemote', { label: 'tomb-gc-retention' });
+
+    await mkdirp(repo.rootFS, `/${appId}/retain`);
+    await repo.rootFS.promises.writeFile(`/${appId}/retain/a.txt`, 'a');
+    await repo.deleteFile(`/${appId}/retain`);
+
+    // 第一轮：副本已确认删干净，但墓碑还很新 → 必须保留（滞后客户端还没看到它）。
+    await runTombstonePipeline(repo);
+    const p = tombstonePath('/.meta/tombstones', `/${appId}/retain/a.txt`);
+    expect(await exists(repo.rootFS, p)).toBe(true);
+
+    // 保留期内（23h）仍不回收。
+    await setTombstoneAge(repo, `/${appId}/retain/a.txt`, 23 * HOUR);
+    await runTombstonePipeline(repo);
+    expect(await exists(repo.rootFS, p)).toBe(true);
+
+    // 超过保留期（25h）后才允许 GC。
+    await setTombstoneAge(repo, `/${appId}/retain/a.txt`, 25 * HOUR);
+    await runTombstonePipeline(repo);
+    expect(await exists(repo.rootFS, p)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('uses a short retention for .keep placeholders', async () => {
+    const appId = 'tomb-gc-placeholder-retention';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-placeholder-retention' });
+    await repo.addBackend('replica-p', 'DirRemote', { label: 'tomb-gc-placeholder-retention' });
+
+    await mkdirp(repo.rootFS, `/${appId}/ph`);
+    await repo.rootFS.promises.writeFile(`/${appId}/ph/a.txt`, 'a');
+    await repo.deleteFile(`/${appId}/ph`);
+
+    await runTombstonePipeline(repo);
+
+    // 占位墓碑只保留 10 分钟：拨到 11 分钟前 → 可回收。
+    for (const target of [`/${appId}/ph/.keep`, `/${appId}/ph/.keep.mtime`]) {
+      await setTombstoneAge(repo, target, 11 * 60 * 1000);
+    }
+
+    await runTombstonePipeline(repo);
+
+    for (const target of [`/${appId}/ph/.keep`, `/${appId}/ph/.keep.mtime`]) {
+      expect(
+        await exists(repo.rootFS, tombstonePath('/.meta/tombstones', target)),
+      ).toBe(false);
+    }
+    // 数据文件墓碑仍在新保留期内 → 继续存在。
+    expect(
+      await exists(repo.rootFS, tombstonePath('/.meta/tombstones', `/${appId}/ph/a.txt`)),
+    ).toBe(true);
 
     await repo.dispose();
   });
@@ -215,7 +293,9 @@ describe('tombstone GC safety', () => {
     }
 
     expect(unlinked).toEqual([]);
-    // 数据文件仍在 → 墓碑被确认后 GC，不再每轮触发删除。
+    // 数据文件仍在 → 墓碑被确认后，超过占位保留期（10min）才 GC。
+    await setTombstoneAge(repo, sidecarPath, 11 * 60 * 1000);
+    await runTombstonePipeline(repo);
     expect(
       await exists(repo.rootFS, tombstonePath('/.meta/tombstones', sidecarPath)),
     ).toBe(false);

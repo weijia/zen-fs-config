@@ -47,6 +47,45 @@ export const TOMBSTONES_DIR = `${META_DIR}/tombstones`;
  */
 const RECREATE_AFTER_DELETE_SKEW_MS = 3000;
 /**
+ * 墓碑 GC 的最短保留期。
+ *
+ * GC 的「确认」只覆盖本实例配置的 replica 后端，覆盖不到其它设备、其它标签页
+ * 以及应用侧仍然留着的副本。墓碑一旦被提前删掉，滞后端会把自己快照里的旧文件
+ * 当成「本地新增」持续推回后端，删除就被复活了。
+ *
+ * 保留期必须长于任一客户端的一个轮询周期（pollIntervalMs 默认 30 分钟），
+ * 这里取 24 小时作为稳妥值。
+ */
+export const TOMBSTONE_RETENTION_MS = 24 * 60 * 60 * 1000;
+/**
+ * 占位类墓碑（`.keep` / `.keep.mtime` / `.mtime` 侧车）的最短保留期。
+ * 它们不承载用户数据，被提前回收最多让空目录短暂复活，下一轮 tombstone pass
+ * 仍会把它清掉，因此用较短的保留期。
+ */
+export const TOMBSTONE_PLACEHOLDER_RETENTION_MS = 10 * 60 * 1000;
+
+/** 该墓碑适用的保留期：占位类用短保留，其余用 24h。 */
+export function tombstoneRetentionMs(tombstonePath: string): number {
+  if (
+    tombstonePath.endsWith('.mtime') ||
+    tombstonePath === '/.keep' ||
+    tombstonePath.endsWith('/.keep')
+  ) {
+    return TOMBSTONE_PLACEHOLDER_RETENTION_MS;
+  }
+  return TOMBSTONE_RETENTION_MS;
+}
+
+/**
+ * 墓碑是否已经老到可以被 GC。
+ * `deletedAt` 缺失或非法（旧格式）视为已到期，避免墓碑永远滞留。
+ */
+export function isTombstoneRetentionElapsed(tombstone: TombstoneMeta, now = Date.now()): boolean {
+  const deletedAt = Number(tombstone.deletedAt);
+  if (!Number.isFinite(deletedAt)) return true;
+  return now - deletedAt >= tombstoneRetentionMs(tombstone.path);
+}
+/**
  * 历史归档目录。仅作为常量保留（旧数据仍在远端，按普通内容对待）：
  * 既不读取也不写入，删除状态只以 {@link TOMBSTONES_DIR} 为准。
  */
@@ -623,6 +662,8 @@ export class TombstoneStore {
   async gc(allBackendIds: string[], targets: TombstoneTarget[] = []): Promise<void> {
     const tombstones = await this.list();
     for (const tombstone of tombstones) {
+      // 保留期内不回收：确认只覆盖本实例的后端，滞后客户端还没看到墓碑。
+      if (!isTombstoneRetentionElapsed(tombstone)) continue;
       const allConfirmed = allBackendIds.every((id) => tombstone.confirmedBy.includes(id));
       if (!allConfirmed) continue;
       const p = this.pathFor(tombstone.path);

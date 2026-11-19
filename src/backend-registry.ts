@@ -237,7 +237,19 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
           await isolatedFS.mkdir(dir, { uid: 0, gid: 0, mode: 0o755 });
         }
       }
-      if (!(await isolatedFS.exists(path))) {
+      let currentSize = 0;
+      if (await isolatedFS.exists(path)) {
+        currentSize = (await isolatedFS.stat(path)).size;
+      } else {
+        await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
+      }
+      // zenfs' `write()` merges the new bytes into the existing blob and only
+      // grows the inode (`size = max(old, end)`), so an overwrite can leave the
+      // old tail behind — corrupt JSON for tombstones, stale bytes elsewhere —
+      // and a concurrent reader can observe a mix of old and new content.
+      // Recreate the blob so each write is self-contained.
+      if (currentSize > 0) {
+        await isolatedFS.unlink(path);
         await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
       }
       await isolatedFS.write(path, bytes, 0);
