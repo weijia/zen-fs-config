@@ -34,8 +34,8 @@ import type {
 // ---------------------------------------------------------------------------
 
 const FEATURE_ORDER = ['tombstones', 'versions', 'conflicts', 'configHost', 'appData'] as const;
-const GROUP_DESCRIPTOR_ORDER = ['schemaVersion', 'kind', 'id', 'name', 'features'] as const;
-const APP_DATA_GROUP_ORDER = ['id', 'groupType', 'name', 'features', 'backends'] as const;
+const GROUP_DESCRIPTOR_ORDER = ['schemaVersion', 'kind', 'id', 'instanceId', 'name', 'features'] as const;
+const APP_DATA_GROUP_ORDER = ['id', 'groupType', 'instanceId', 'name', 'features', 'backends'] as const;
 const BACKEND_ORDER = ['id', 'type', 'options', 'accountBackendId', 'description', 'createdAt'] as const;
 
 // ------------------------------------------------------------------------------------------------------------------------------------------

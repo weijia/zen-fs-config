@@ -274,6 +274,11 @@ export interface AppDataGroupDescriptor {
   groupType: 'data-sync';
   /** User-editable display name. `id` is the stable identifier. */
   name?: string;
+  /**
+   * 组的实例身份（见 `GroupDescriptor.instanceId`）。引导副本随它一起下发，
+   * 让新设备在连远端之前就知道该组声明的身份，避免认领到别人的仓库。
+   */
+  instanceId?: string;
   /** Capability overrides (versions/conflicts are opt-in for data groups). */
   features?: Partial<SyncGroupFeatures>;
   backends: AppDataBackendDescriptor[];
@@ -326,6 +331,14 @@ export interface GroupDescriptor {
   kind: SyncGroupKind;
   /** Group id (`config` for the config-sync group, the descriptor id otherwise). */
   id?: string;
+  /**
+   * 组的实例身份（UUID）。创建时生成一次，之后不可变。
+   *
+   * 同步边界就是它：连接任何远端之前先读对方的 `.meta/group.json`，实例身份
+   * 不一致就**不建立同步对**，因此两个不同的同步组永远不会互相同步。
+   * 缺失表示「尚未认领」的老仓库，由第一个连接的组认领并写入。
+   */
+  instanceId?: string;
   /** User-editable display name. */
   name?: string;
   features?: Partial<SyncGroupFeatures>;
@@ -354,6 +367,13 @@ export interface SyncGroupHandle {
   /** Derived, never persisted separately from the descriptor. */
   readonly features: SyncGroupFeatures;
   readonly name?: string;
+  /**
+   * 本组的实例身份（UUID）。它是同步边界：连接远端前比对对方
+   * `.meta/group.json` 的 `instanceId`，不一致就不建同步对。
+   */
+  getGroupInstanceId(): string | undefined;
+  /** 因归属其他同步组而被跳过的后端（不建同步对）。 */
+  listSkippedBackends(): { backendId: string; reason: string }[];
 
   /** Direct fs view; metadata paths (`.meta`, `.config`) are hidden. */
   readonly fs: typeof import('node:fs');

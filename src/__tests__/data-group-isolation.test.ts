@@ -127,6 +127,9 @@ describe('data group sync isolation', () => {
   });
 
   it('does not pull config-only paths from a shared remote root', async () => {
+    // 该远端根在上一用例里已被另一个组认领；这里先清掉组身份描述符，
+    // 模拟「尚未认领的老仓库」，让本组成为它的归属者，再验证拉取过滤。
+    try { await remote.unlink('/.meta/group.json'); } catch { /* absent */ }
     const repo = await createConfigRepo('isolation-app-pull', { nodeId: 'test-node' });
     const group = await repo.createAppDataGroup('isolation-pull', [
       { id: 'audit-2', type: 'AuditBackend', options: { label: 'shared-remote' } },

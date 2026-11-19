@@ -33,7 +33,14 @@ import {
   TombstoneStore,
   VersionStore,
   ConflictStore,
+  readGroupDescriptor,
+  writeGroupDescriptor,
 } from './group-meta';
+import {
+  bindRemoteGroupIdentity,
+  isValidGroupInstanceId,
+  newGroupInstanceId,
+} from './group-identity';
 import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
 
@@ -65,6 +72,10 @@ export class DataSyncGroup implements AppDataGroup {
   private localFS: BackendInstance;
   private dataBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string; desc: BackendDescriptor }> = new Map();
   private disposed = false;
+  /** 组实例身份 —— 同步边界（见 `group-identity.ts`）。 */
+  private instanceId?: string;
+  /** 因归属其他同步组而被跳过的后端 id → 原因。 */
+  private skippedBackends = new Map<string, string>();
 
   /** `.meta/` stores (deprecated standalone path keeps the same layout). */
   private tombstones: TombstoneStore;
@@ -142,6 +153,39 @@ export class DataSyncGroup implements AppDataGroup {
     return purgeKeepFiles(this.localFS, options as PurgeKeepOptions);
   }
 
+  getGroupInstanceId(): string | undefined {
+    return this.instanceId;
+  }
+
+  listSkippedBackends(): { backendId: string; reason: string }[] {
+    return Array.from(this.skippedBackends, ([backendId, reason]) => ({ backendId, reason }));
+  }
+
+  /**
+   * 读取 / 分配本组实例身份，并写入 `/.meta/group.json`。
+   * 缺失时不生成随机值：先在本地描述符里找，仍没有就生成一次并固定。
+   */
+  private async ensureIdentity(): Promise<string> {
+    if (this.instanceId) return this.instanceId;
+    let existing = null as Awaited<ReturnType<typeof readGroupDescriptor>>;
+    try {
+      existing = await readGroupDescriptor(this.localFS);
+    } catch { /* absent */ }
+    const known = isValidGroupInstanceId(existing?.instanceId) ? existing!.instanceId : undefined;
+    this.instanceId = known ?? newGroupInstanceId();
+    if (!known) {
+      await writeGroupDescriptor(this.localFS, {
+        schemaVersion: 2,
+        kind: 'data',
+        id: this.groupId,
+        instanceId: this.instanceId,
+        ...(this.name ? { name: this.name } : {}),
+        features: this.features,
+      });
+    }
+    return this.instanceId;
+  }
+
   /**
    * Add a data backend and set up bi-directional sync.
    */
@@ -158,6 +202,30 @@ export class DataSyncGroup implements AppDataGroup {
 
     log(`addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
+
+    // 同步边界：远端根属于另一个同步组 → 不建同步对。
+    try {
+      const identity = await this.ensureIdentity();
+      const state = await bindRemoteGroupIdentity(instance, {
+        kind: 'data',
+        id: this.groupId,
+        instanceId: identity,
+        ...(this.name ? { name: this.name } : {}),
+        features: this.features,
+      });
+      if (state === 'conflict') {
+        this.skippedBackends.set(id, '远端根属于另一个同步组（instanceId 不一致），已跳过该后端');
+        try { await (instance as any).dispose?.(); } catch { /* best effort */ }
+        log(`addBackend: ${id} skipped — remote root belongs to another sync group`);
+        return;
+      }
+    } catch (err) {
+      this.skippedBackends.set(id, `归属校验失败：${(err as Error)?.message ?? String(err)}`);
+      try { await (instance as any).dispose?.(); } catch { /* best effort */ }
+      log(`addBackend: ${id} skipped — ownership check failed:`, err);
+      return;
+    }
+
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
 
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);

@@ -212,6 +212,22 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
     if (changeCallback) changeCallback();
   };
 
+  // 同一路径的写入必须串行：@zenfs/core 的 StoreFS.write 会对已有 blob 的
+  // ArrayBuffer 做 `transfer()`（transfer 会 detach 原 buffer）。两个同步对
+  // 同时写同一个文件时，后一个会拿到已被前一个 detach 的 buffer，报
+  // “Cannot perform Construct on a detached ArrayBuffer”。
+  const writeQueues = new Map<string, Promise<void>>();
+  const runExclusive = async (path: string, task: () => Promise<void>): Promise<void> => {
+    const prev = writeQueues.get(path);
+    const run = (prev ?? Promise.resolve()).catch(() => undefined).then(task);
+    writeQueues.set(path, run);
+    try {
+      await run;
+    } finally {
+      if (writeQueues.get(path) === run) writeQueues.delete(path);
+    }
+  };
+
   const backend: BackendInstance = {
     async readFile(path: string, ...args: any[]): Promise<any> {
       const st = await isolatedFS.stat(path);
@@ -222,44 +238,45 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
       return buf;
     },
     async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, _options?: any): Promise<void> {
-      const bytes = data instanceof ArrayBuffer
+      // 永远拷贝一份再写：@zenfs/core 的 StoreFS.write 会直接持有传入的
+      // Uint8Array，并在后续写入时对它的 ArrayBuffer 做 `transfer()`
+      // （transfer 会 detach 原 buffer）。若调用方复用同一个 buffer 写多个
+      // 文件/多个后端，后续读取就会撞上 “detached ArrayBuffer”。
+      const source = data instanceof ArrayBuffer
         ? new Uint8Array(data)
         : data instanceof Uint8Array
           ? data
           : new TextEncoder().encode(data);
-      // Ensure parent dir exists
-      const parts = path.split('/').filter(Boolean);
-      parts.pop();
-      let dir = '';
-      for (const p of parts) {
-        dir += '/' + p;
-        if (!(await isolatedFS.exists(dir))) {
-          await isolatedFS.mkdir(dir, { uid: 0, gid: 0, mode: 0o755 });
+      const bytes = new Uint8Array(source);
+      await runExclusive(path, async () => {
+        // Ensure parent dir exists
+        const parts = path.split('/').filter(Boolean);
+        parts.pop();
+        let dir = '';
+        for (const p of parts) {
+          dir += '/' + p;
+          if (!(await isolatedFS.exists(dir))) {
+            await isolatedFS.mkdir(dir, { uid: 0, gid: 0, mode: 0o755 });
+          }
         }
-      }
-      let currentSize = 0;
-      if (await isolatedFS.exists(path)) {
-        currentSize = (await isolatedFS.stat(path)).size;
-      } else {
+        // zenfs' `write()` merges the new bytes into the existing blob and only
+        // grows the inode (`size = max(old, end)`), so an overwrite can leave the
+        // old tail behind — corrupt JSON for tombstones, stale bytes elsewhere —
+        // and a concurrent reader can observe a mix of old and new content.
+        // Recreate the inode for every write so each write is self-contained.
+        if (await isolatedFS.exists(path)) {
+          await isolatedFS.unlink(path);
+        }
         await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
-      }
-      // zenfs' `write()` merges the new bytes into the existing blob and only
-      // grows the inode (`size = max(old, end)`), so an overwrite can leave the
-      // old tail behind — corrupt JSON for tombstones, stale bytes elsewhere —
-      // and a concurrent reader can observe a mix of old and new content.
-      // Recreate the blob so each write is self-contained.
-      if (currentSize > 0) {
-        await isolatedFS.unlink(path);
-        await isolatedFS.createFile(path, { uid: 0, gid: 0, mode: 0o644 });
-      }
-      await isolatedFS.write(path, bytes, 0);
-      // touch updates local Inode metadata (size/mtime). Some backends (e.g.
-      // RemoteStorage) don't support touch and throw — that's fine since their
-      // metadata is server-managed, so we silently ignore the error.
-      // If caller provided mtime (e.g. from sync), preserve it; otherwise use now.
-      try {
-        await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: _options?.mtime ?? Date.now() });
-      } catch { /* backend doesn't support touch — metadata is server-managed */ }
+        await isolatedFS.write(path, bytes, 0);
+        // touch updates local Inode metadata (size/mtime). Some backends (e.g.
+        // RemoteStorage) don't support touch and throw — that's fine since their
+        // metadata is server-managed, so we silently ignore the error.
+        // If caller provided mtime (e.g. from sync), preserve it; otherwise use now.
+        try {
+          await isolatedFS.touch(path, { size: bytes.byteLength, mtimeMs: _options?.mtime ?? Date.now() });
+        } catch { /* backend doesn't support touch — metadata is server-managed */ }
+      });
       // 通知 sync 引擎：本地有变更
       notifyChange();
     },

@@ -284,8 +284,9 @@ describe('data-group self-description', () => {
 
     const repo2 = await createConfigRepo('selfdesc-idem', { nodeId: 'i2' });
     const group2 = await repo2.getAppDataGroup('g-idem');
-    expect(decode(await localFS.readFile('/.meta/group.json'))).toBe(groupJson);
-    expect(decode(await localFS.readFile(backendMetaFilePath('b1')))).toBe(backendJson);
+    const localFS2 = (group2 as any).localFS;
+    expect(decode(await localFS2.readFile('/.meta/group.json'))).toBe(groupJson);
+    expect(decode(await localFS2.readFile(backendMetaFilePath('b1')))).toBe(backendJson);
     expect(groupJson.includes('updatedAt')).toBe(false);
 
     await repo2.dispose();

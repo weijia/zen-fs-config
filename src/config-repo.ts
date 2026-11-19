@@ -23,6 +23,8 @@ import type {
   ConflictInfo,
   TombstoneMeta,
   SyncGroupType,
+  SyncGroupKind,
+  GroupDescriptor,
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
@@ -43,6 +45,13 @@ import {
   summarizeError,
 } from './errors';
 import { createLogger } from '@richard432/localstorage-logger';
+import {
+  bindRemoteGroupIdentity,
+  isValidGroupInstanceId,
+  newGroupInstanceId,
+  pickInstanceId,
+  type GroupIdentity,
+} from './group-identity';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
 import { purgeMtimeSidecars, isMtimeSidecar, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
@@ -518,6 +527,15 @@ export class ConfigRepo implements IConfigRepo {
   private readonly tombstoneConfirmations = new Map<string, Set<string>>();
   /** Per-backend sync state (successful pairs + connect failures). */
   private backendStates = new Map<string, BackendSyncState>();
+  /**
+   * 本组的实例身份（UUID，见 `group-identity.ts`）。
+   *
+   * 它同时是同步边界：连接任何远端副本前先比对对方 `.meta/group.json` 里的
+   * `instanceId`，不一致就不建同步对 —— 两个不同的同步组永不互相同步。
+   */
+  private instanceId?: string;
+  /** 因归属他人而被跳过的后端 id → 原因，供 UI 展示。 */
+  private skippedBackends = new Map<string, string>();
   /** Last known backend descriptors, for the synchronous unified handle API. */
   private backendDescriptorCache: AppDataBackendDescriptor[] = [];
   /**
@@ -1692,6 +1710,13 @@ export class ConfigRepo implements IConfigRepo {
       try {
         const instance = await createBackend(desc);
 
+        // 同步边界：远端根属于另一个同步组时**不建同步对**（跨组永不同步）。
+        const owner = await this.bindBackendIdentity(instance, desc.id);
+        if (owner === 'conflict') {
+          try { await instance.dispose?.(); } catch { /* best effort */ }
+          continue;
+        }
+
         // Wrap replica with CachedFileSystem when caching is enabled.
         // This avoids redundant network reads on Gitee/RemoteStorage backends
         // by caching content + revision tokens (ETag / Git blob SHA) in IndexedDB.
@@ -2516,6 +2541,88 @@ export class ConfigRepo implements IConfigRepo {
   // IConfigRepo — Group Type
   // -----------------------------------------------------------------------
 
+  /**
+   * 本组的同步身份（kind + id + 不可变 instanceId）。
+   *
+   * 首次调用时若 `.meta/group.json` 里还没有 `instanceId`（老部署），生成一个
+   * 并就地写回 —— 只写一次，之后字节相同不再落盘。
+   */
+  private async ensureGroupIdentity(kind: SyncGroupKind = 'config', id = CONFIG_GROUP_ID): Promise<GroupIdentity> {
+    let existingFeatures: GroupDescriptor['features'] | undefined;
+    if (!this.instanceId) {
+      let existing = null as Awaited<ReturnType<typeof readGroupDescriptor>>;
+      try {
+        existing = await readGroupDescriptor(this.cachedFS);
+      } catch { /* treat as absent */ }
+      const known = pickInstanceId(existing);
+      existingFeatures = existing?.features ?? CONFIG_GROUP_FEATURES;
+      this.instanceId = known ?? newGroupInstanceId();
+      if (!known) {
+        try {
+          await writeGroupDescriptor(this.cachedFS, {
+            schemaVersion: 2,
+            kind: existing?.kind ?? kind,
+            id: existing?.id ?? id,
+            instanceId: this.instanceId,
+            ...((existing?.name ?? this.name) ? { name: (existing?.name ?? this.name) as string } : {}),
+            features: existing?.features ?? CONFIG_GROUP_FEATURES,
+          });
+          log.log(`[ConfigRepo] group instanceId assigned: ${this.instanceId} (kind=${existing?.kind ?? kind})`);
+        } catch (err) {
+          log.warn('[ConfigRepo] failed to persist group instanceId:', err);
+        }
+      }
+    }
+    return {
+      kind,
+      id,
+      instanceId: this.instanceId,
+      ...(this.name ? { name: this.name } : {}),
+      ...(existingFeatures ? { features: existingFeatures } : {}),
+    };
+  }
+
+  /** 组实例身份（未初始化时先兜底生成并落盘）。 */
+  async ensureGroupInstanceId(): Promise<string> {
+    return (await this.ensureGroupIdentity()).instanceId;
+  }
+
+  /** 组实例身份（同步读取；init 之前可能为 `undefined`）。 */
+  getGroupInstanceId(): string | undefined {
+    return this.instanceId;
+  }
+
+  /**
+   * 连接远端前校验归属：属于别的组 → `conflict`（调用方必须跳过、不建同步对）。
+   * 老仓库（无 instanceId）会被本组认领。
+   */
+  private async bindBackendIdentity(
+    instance: any,
+    backendId: string,
+  ): Promise<'match' | 'claimed' | 'conflict'> {
+    try {
+      const identity = await this.ensureGroupIdentity();
+      const state = await bindRemoteGroupIdentity(instance, identity);
+      if (state === 'conflict') {
+        this.skippedBackends.set(
+          backendId,
+          `远端根属于另一个同步组（instanceId 不一致），已跳过该后端`,
+        );
+      }
+      return state;
+    } catch (err) {
+      // 读不到远端描述符（网络/权限）时不能默认放行：跳过比误合并安全。
+      log.warn(`[ConfigRepo] identity check failed for backend "${backendId}", skipping it:`, err);
+      this.skippedBackends.set(backendId, `归属校验失败：${(err as Error)?.message ?? String(err)}`);
+      return 'conflict';
+    }
+  }
+
+  /** 因归属他人而被跳过的后端（id → 原因）。 */
+  listSkippedBackends(): { backendId: string; reason: string }[] {
+    return Array.from(this.skippedBackends, ([backendId, reason]) => ({ backendId, reason }));
+  }
+
   /** Write the group-type marker file if it doesn't exist. */
   async ensureGroupType(type: SyncGroupType): Promise<void> {
     this.assertNotDisposed();
@@ -2542,10 +2649,12 @@ export class ConfigRepo implements IConfigRepo {
     // would produce needless sync churn).
     const existingDescriptor = await readGroupDescriptor(this.cachedFS);
     if (!existingDescriptor) {
+      this.instanceId = newGroupInstanceId();
       await writeGroupDescriptor(this.cachedFS, {
         schemaVersion: 2,
         kind: 'config',
         id: CONFIG_GROUP_ID,
+        instanceId: this.instanceId,
         ...(this.name ? { name: this.name } : {}),
         features: CONFIG_GROUP_FEATURES,
       });
@@ -2561,6 +2670,22 @@ export class ConfigRepo implements IConfigRepo {
         ...(name ? { name } : {}),
         features: existingDescriptor.features ?? CONFIG_GROUP_FEATURES,
       });
+    }
+    // 组实例身份：缺失（老部署）时生成一次并写进 `.meta/group.json`，之后不可变。
+    const knownInstanceId = pickInstanceId(existingDescriptor);
+    if (knownInstanceId) {
+      this.instanceId = knownInstanceId;
+    } else if (!this.instanceId) {
+      this.instanceId = newGroupInstanceId();
+      await writeGroupDescriptor(this.cachedFS, {
+        schemaVersion: 2,
+        kind: existingDescriptor?.kind ?? 'config',
+        id: existingDescriptor?.id ?? CONFIG_GROUP_ID,
+        instanceId: this.instanceId,
+        ...((existingDescriptor?.name ?? this.name) ? { name: (existingDescriptor?.name ?? this.name) as string } : {}),
+        ...(existingDescriptor?.features ? { features: existingDescriptor.features } : {}),
+      });
+      log.log(`[ConfigRepo] assigned group instanceId ${this.instanceId} (kind=${existingDescriptor?.kind ?? 'config'})`);
     }
     log.log(`[ConfigRepo] group-type set to "${type}"`);
   }
@@ -2697,6 +2822,9 @@ export class ConfigRepo implements IConfigRepo {
     // Cross-group uniqueness: no two groups may share the same remote endpoint.
     await this.assertNoSharedRemote(resolvedBackends, id);
 
+    // 新组生成一次不可变的实例身份：它同时是同步边界（见 group-identity.ts）。
+    const instanceId = newGroupInstanceId();
+
     // Create the data-sync group implementation
     const group = new AppDataGroupImpl(
       id,
@@ -2705,7 +2833,12 @@ export class ConfigRepo implements IConfigRepo {
       this.pollIntervalMs,
       this,
       // 显式新拓扑：以参数为准并写入 `.meta/backends/`。
-      { name: options.name, features: options.features, backendsAreAuthoritative: true },
+      {
+        name: options.name,
+        features: options.features,
+        backendsAreAuthoritative: true,
+        instanceId,
+      },
     );
     await group.init();
 
@@ -2715,6 +2848,7 @@ export class ConfigRepo implements IConfigRepo {
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
+      instanceId: group.getGroupInstanceId() ?? instanceId,
       ...(options.name ? { name: options.name } : {}),
       ...(options.features ? { features: options.features } : {}),
       backends: group.listDeclaredBackends(),
@@ -2742,13 +2876,19 @@ export class ConfigRepo implements IConfigRepo {
     meta?: { name?: string; features?: Partial<SyncGroupFeatures> },
   ): Promise<void> {
     this.assertNotDisposed();
-    // 保留显示名与能力位：增删后端不能把它们抹掉。
+    // 保留显示名、能力位与组实例身份：增删后端不能把它们抹掉（实例身份
+    // 一旦丢失/被换掉，远端归属校验就会误判成「别人的仓库」）。
     const existing = await this.readAppDataGroupDescriptor(id);
     const name = meta?.name ?? existing?.name;
     const features = meta?.features ?? existing?.features;
+    const liveGroup = this.appDataGroups.get(id);
+    const liveInstanceId = liveGroup?.getGroupInstanceId();
+    const instanceId = pickInstanceId(existing)
+      ?? (isValidGroupInstanceId(liveInstanceId) ? liveInstanceId : undefined);
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
+      ...(instanceId ? { instanceId } : {}),
       ...(name ? { name } : {}),
       ...(features ? { features } : {}),
       backends,
@@ -2827,6 +2967,11 @@ export class ConfigRepo implements IConfigRepo {
     const nextBackends = declared.map((b, i) =>
       i === index ? { ...candidate, options: mergedOptions } : b,
     );
+    // 换后端参数不能换掉组身份：沿用现有实例身份（否则远端归属会失效）。
+    const descriptorNow = await this.readAppDataGroupDescriptor(groupId);
+    const instanceIdFromLive = live?.getGroupInstanceId();
+    const instanceId = pickInstanceId(descriptorNow)
+      ?? (isValidGroupInstanceId(instanceIdFromLive) ? instanceIdFromLive : undefined);
 
     if (live) {
       await live.dispose();
@@ -2841,7 +2986,7 @@ export class ConfigRepo implements IConfigRepo {
         nextBackends,
         this.pollIntervalMs,
         this,
-        { backendsAreAuthoritative: true },
+        { backendsAreAuthoritative: true, ...(instanceId ? { instanceId } : {}) },
       );
       await group.init();
       await this.updateAppDataGroupDescriptor(groupId, group.listDeclaredBackends());
@@ -2857,7 +3002,7 @@ export class ConfigRepo implements IConfigRepo {
           oldBackends,
           this.pollIntervalMs,
           this,
-          { backendsAreAuthoritative: true },
+          { backendsAreAuthoritative: true, ...(instanceId ? { instanceId } : {}) },
         );
         await restored.init();
         await this.updateAppDataGroupDescriptor(groupId, restored.listDeclaredBackends());
@@ -2903,10 +3048,12 @@ export class ConfigRepo implements IConfigRepo {
       await this.writeVersionSidecar(path, version);
     }
     // Keep `.meta/group.json` in sync with the display name.
+    const identity = await this.ensureGroupIdentity();
     await writeGroupDescriptor(this.cachedFS, {
       schemaVersion: 2,
       kind: 'config',
       id: CONFIG_GROUP_ID,
+      instanceId: identity.instanceId,
       name: normalized,
       features: CONFIG_GROUP_FEATURES,
     });
@@ -3061,6 +3208,8 @@ class AppDataGroupImpl implements AppDataGroup {
     pollIntervalMs: number | undefined,
     parent: ConfigRepo,
     descriptor: Pick<AppDataGroupDescriptor, 'name' | 'features'> & {
+      /** 组实例身份（来自引导副本或本地 `.meta/group.json`）。 */
+      instanceId?: string;
       /**
        * `createAppDataGroup` / `replaceAppDataGroupBackend` 传入的是**显式新拓扑**
        * （例如同一个 groupId 被删除后用不同后端重建），此时以构造参数为准并
@@ -3072,6 +3221,7 @@ class AppDataGroupImpl implements AppDataGroup {
     this.groupId = groupId;
     this.appId = appId;
     this.name = descriptor.name;
+    this.instanceId = isValidGroupInstanceId(descriptor.instanceId) ? descriptor.instanceId : undefined;
     this.features = {
       ...DATA_GROUP_DEFAULT_FEATURES,
       ...descriptor.features,
@@ -3090,6 +3240,13 @@ class AppDataGroupImpl implements AppDataGroup {
 
   private parent: ConfigRepo;
   private _backends: AppDataBackendDescriptor[];
+  /**
+   * 组实例身份（UUID）。同步边界：远端 `.meta/group.json` 的 `instanceId`
+   * 不一致就不建同步对，因此不同同步组之间永不互相搬运数据。
+   */
+  private instanceId?: string;
+  /** 因归属他人而被跳过的后端 id → 原因。 */
+  private skippedBackends = new Map<string, string>();
   private _pollIntervalMs?: number;
   private _backendsAreAuthoritative: boolean;
   /** 引导副本（`.config/` 里的描述符）原有的能力位，用于回刷时不丢信息。 */
@@ -3202,13 +3359,69 @@ class AppDataGroupImpl implements AppDataGroup {
 
   /** Write this group's own `.meta/group.json` (idempotent: identical bytes → no write). */
   async writeOwnGroupDescriptor(): Promise<void> {
+    if (!this.instanceId) {
+      this.instanceId = newGroupInstanceId();
+      log.log(`[AppDataGroup:${this.groupId}] assigned instanceId ${this.instanceId}`);
+    }
     await writeGroupDescriptor(this.localFS, {
       schemaVersion: 2,
       kind: 'data',
       id: this.groupId,
+      instanceId: this.instanceId,
       ...(this.name ? { name: this.name } : {}),
       features: this.features,
     });
+  }
+
+  /** 本组实例身份（初始化后可用）。 */
+  getGroupInstanceId(): string | undefined {
+    return this.instanceId;
+  }
+
+  /** 因归属他人而被跳过的后端（id → 原因）。 */
+  listSkippedBackends(): { backendId: string; reason: string }[] {
+    return Array.from(this.skippedBackends, ([backendId, reason]) => ({ backendId, reason }));
+  }
+
+  /**
+   * 连接数据后端前的归属校验。
+   *
+   * - `match`：远端 `.meta/group.json` 的 `instanceId` 与本组一致 → 建同步对；
+   * - `claimed`：远端是老仓库（无身份）→ 本组认领并写入，再建同步对；
+   * - `conflict`：远端属于另一个同步组（或类型不符 / 读不到）→ 跳过，
+   *   **绝不建立同步对**，因此跨组数据不会被搬运。
+   */
+  private async checkBackendOwnership(
+    instance: any,
+    backendId: string,
+  ): Promise<'match' | 'claimed' | 'conflict'> {
+    if (!this.instanceId) {
+      this.skippedBackends.set(backendId, '本组尚未分配 instanceId，已跳过该后端');
+      return 'conflict';
+    }
+    try {
+      const state = await bindRemoteGroupIdentity(instance, {
+        kind: 'data',
+        id: this.groupId,
+        instanceId: this.instanceId,
+        ...(this.name ? { name: this.name } : {}),
+        features: this.features,
+      });
+      if (state === 'conflict') {
+        this.skippedBackends.set(
+          backendId,
+          '远端根属于另一个同步组（instanceId 不一致），已跳过该后端',
+        );
+        log.warn(
+          `[AppDataGroup:${this.groupId}] backend "${backendId}" belongs to another sync group — sync pair skipped`,
+        );
+      }
+      return state;
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] ownership check failed for "${backendId}":`, err);
+      this.skippedBackends.set(backendId, `归属校验失败：${(err as Error)?.message ?? String(err)}`);
+      return 'conflict';
+    }
   }
 
   async init(): Promise<void> {
@@ -3294,6 +3507,20 @@ class AppDataGroupImpl implements AppDataGroup {
       this._backends = this._backends ?? [];
     }
 
+    // 组实例身份：优先用引导副本声明的，其次读本地 `.meta/group.json`，
+    // 都没有（老部署）时生成一次并固定下来。
+    if (!this.instanceId) {
+      try {
+        const existing = await readGroupDescriptor(this.localFS);
+        this.instanceId = pickInstanceId(existing);
+        if (this.instanceId) {
+          log.log(`[AppDataGroup:${this.groupId}] adopted instanceId ${this.instanceId} from local group.json`);
+        }
+      } catch (err) {
+        log.warn(`[AppDataGroup:${this.groupId}] failed to read local group.json:`, err);
+      }
+    }
+
     // Unified group descriptor (`.meta/group.json`) — byte-identical launches
     // never rewrite it (no `updatedAt`, no timestamps in synced content).
     try {
@@ -3345,6 +3572,14 @@ class AppDataGroupImpl implements AppDataGroup {
     for (const desc of this._backends) {
       try {
         const instance = await createBackend({ type: desc.type, options: desc.options });
+
+        // 同步边界：这个远端根属于另一个同步组 → 跳过，不建同步对。
+        const owned = await this.checkBackendOwnership(instance, desc.id);
+        if (owned === 'conflict') {
+          try { await instance.dispose?.(); } catch { /* best effort */ }
+          continue;
+        }
+
         const syncable = backendToSyncableFS(instance, `${desc.type}(${desc.id})`);
         const pair = this.syncEngine.addPair(
           localSyncable,
@@ -3880,6 +4115,7 @@ export async function createConfigRepo(
         schemaVersion: 2,
         kind: 'config',
         id: CONFIG_GROUP_ID,
+        instanceId: newGroupInstanceId(),
         features: CONFIG_GROUP_FEATURES,
       });
     }
