@@ -133,6 +133,7 @@ export function unregisterBackend(type: string): boolean {
 export async function createBackend(
   descriptor: Pick<BackendDescriptor, 'type' | 'options'>,
 ): Promise<BackendInstance> {
+  traceCreateBackend(descriptor.type, descriptor.options);
   const factory = registry.get(descriptor.type);
   if (!factory) {
     throw new Error(
@@ -142,6 +143,22 @@ export async function createBackend(
     );
   }
   return factory(descriptor.options);
+}
+
+/** Records backend creation attempts on `globalThis.__zenfsBackendTrace` (diagnostics only). */
+function traceCreateBackend(type: string, options?: Record<string, unknown>): void {
+  const g = globalThis as any;
+  try {
+    if (!Array.isArray(g.__zenfsBackendTrace)) g.__zenfsBackendTrace = [];
+    g.__zenfsBackendTrace.push({
+      type,
+      storeName: (options as any)?.storeName ?? null,
+      registered: registry.has(type),
+      at: Date.now(),
+    });
+  } catch {
+    /* ignore */
+  }
 }
 
 export function hasBackend(type: string): boolean {
