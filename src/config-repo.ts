@@ -3071,6 +3071,15 @@ class AppDataGroupImpl implements AppDataGroup {
   private versions!: VersionStore;
   private conflicts!: ConflictStore;
   private postDeleteTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * 墓碑路径的同步排除表（与配置组同一套机制）。
+   *
+   * 保留期内的墓碑路径不参与同步：否则副本上的残留会被当作"远端内容"逐文件
+   * 拉回本地，把已删除的目录复活。数组与各同步对共享同一实例（zen-fs-sync
+   * 每次检测时实时读取 `filter.excludePrefixes`），原地更新即可生效。
+   */
+  private readonly tombstoneExcludePrefixes: string[] = [...CONFIG_ONLY_PREFIXES];
+  private readonly syncFilter: SyncFilter = { excludePrefixes: this.tombstoneExcludePrefixes };
 
   constructor(
     groupId: string,
@@ -3367,6 +3376,12 @@ class AppDataGroupImpl implements AppDataGroup {
     this.tombstones = new TombstoneStore(this.localFS, this.localBackendId);
     this.versions = new VersionStore(this.localFS, `${this.appId}/${this.groupId}`);
     this.conflicts = new ConflictStore(this.localFS, this.appId, `${this.groupId}`, this.versions);
+    // 建同步对之前先把已有墓碑路径填进排除表，避免首次同步就把残留拉回来。
+    try {
+      this.refreshSyncExclusions(await this.tombstones.list());
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] failed to load tombstones for exclusions:`, err);
+    }
 
     // `.meta/backends/` 是数据组的**权威后端定义**：优先读自身副本；目录缺失
     // （旧版本从未写过）时用配置组的引导描述符回填一次，之后一律以数据组为准。
@@ -3461,7 +3476,8 @@ class AppDataGroupImpl implements AppDataGroup {
             pollIntervalMs: this._pollIntervalMs,
             // `.meta/` is intentionally NOT excluded: tombstones, versions and
             // conflicts must sync, otherwise deletions resurrect on other devices.
-            filter: { excludePrefixes: CONFIG_ONLY_PREFIXES },
+            // 但要排除"当前墓碑指向的路径"（与配置组同一张表，实时生效）。
+            filter: this.syncFilter,
             preSyncHook: async () => {
               await this.runTombstonePass('preSync');
             },
@@ -3572,14 +3588,33 @@ class AppDataGroupImpl implements AppDataGroup {
   private async runTombstonePass(stage: string): Promise<void> {
     try {
       await this.tombstones.process(this.tombstoneTargets());
+      // 墓碑集合变了 → 同步排除表跟着更新（与配置组 refreshSyncExclusions 同规则）。
+      this.refreshSyncExclusions(await this.tombstones.list());
     } catch (err) {
       log.warn(`[AppDataGroup:${this.groupId}] ${stage} tombstone pass failed:`, err);
     }
   }
 
+  /**
+   * 把当前墓碑路径写进同步排除表（原地更新共享数组）。
+   *
+   * 目录墓碑的 `${path}/` 前缀是故意的：整棵树已删除，保留期内任何子路径都不
+   * 参与同步。注意**不能**为 `.keep` 占位排除父目录，否则真实数据会被一起挡掉。
+   */
+  private refreshSyncExclusions(tombstones: TombstoneMeta[]): void {
+    this.tombstoneExcludePrefixes.length = 0;
+    this.tombstoneExcludePrefixes.push(...CONFIG_ONLY_PREFIXES);
+    for (const tombstone of tombstones) {
+      if (!tombstone.path) continue;
+      this.tombstoneExcludePrefixes.push(tombstone.path, `${tombstone.path}/`);
+    }
+  }
+
   private async confirmTombstones(): Promise<void> {
     try {
-      await this.tombstones.confirm(this.allBackendIds());
+      // 传 targets（id + fs）：只有本轮 process() 现场核对过"确实不存在"的
+      // 目标才会被写进 confirmedBy —— 与配置组的保守语义一致。
+      await this.tombstones.confirm(this.tombstoneTargets());
     } catch (err) {
       log.warn(`[AppDataGroup:${this.groupId}] tombstone confirmations failed:`, err);
     }
@@ -3734,7 +3769,7 @@ class AppDataGroupImpl implements AppDataGroup {
         direction: SyncDirection.BiDirectional,
         conflictStrategy: 'source-wins' as any,
         pollIntervalMs: this._pollIntervalMs,
-        filter: { excludePrefixes: CONFIG_ONLY_PREFIXES },
+        filter: this.syncFilter,
         preSyncHook: async () => {
           await this.runTombstonePass('preSync');
         },

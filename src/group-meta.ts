@@ -252,6 +252,11 @@ function isMtimeSidecarPath(path: string): boolean {
   return path.endsWith('.mtime');
 }
 
+/** `.keep` / `.keep.mtime` / `*.mtime` 这类后端占位，对 `exists()` 不可见。 */
+function isHiddenPlaceholderPath(path: string): boolean {
+  return isMtimeSidecarPath(path) || path === '/.keep' || path.endsWith('/.keep');
+}
+
 /**
  * Encode a file path into a flat metadata entry name.
  * `/a/b.json` → `a__b++json`
@@ -614,6 +619,15 @@ export interface TombstoneTarget {
  * 删除状态只写在 `/.meta/tombstones/`；历史归档目录不再读写。
  */
 export class TombstoneStore {
+  /**
+   * 本轮 `process()` 真正核对过"确实不存在"的（路径 → 目标 id）。
+   *
+   * 只有出现在这里的副本才会被写进 `confirmedBy`（见 {@link confirm}），与
+   * 配置组 `ConfigRepo.updateTombstoneConfirmations` 的保守语义一致：副本删除
+   * 失败（网络、后端限制、只剩占位目录）时绝不算已确认。
+   */
+  private readonly verifiedAbsent = new Map<string, Set<string>>();
+
   constructor(
     private fs: MetaFS,
     private author: string,
@@ -668,6 +682,8 @@ export class TombstoneStore {
   async process(targets: TombstoneTarget[] = []): Promise<void> {
     const tombstones = await this.list();
     const expired: TombstoneMeta[] = [];
+    // 每轮重新核对：上一轮确认过的副本可能又被同步写回来了。
+    this.verifiedAbsent.clear();
     for (const tombstone of tombstones) {
       if (await this.wasRecreatedAfterDeletion(tombstone)) {
         expired.push(tombstone);
@@ -677,6 +693,12 @@ export class TombstoneStore {
       for (const target of targets) {
         await this.deleteEverywhere(target.fs, tombstone);
       }
+      // 删除之后再逐个目标核对"现在确实不存在"，只记下真实清干净的目标。
+      for (const target of targets) {
+        if (await this.absentOnTarget(target.fs, tombstone)) {
+          this.markVerified(tombstone.path, target.id);
+        }
+      }
     }
     for (const tombstone of expired) {
       await this.remove(tombstone);
@@ -684,6 +706,40 @@ export class TombstoneStore {
         `[TombstoneStore] expired tombstone for ${tombstone.path} — recreated after deletion`,
       );
     }
+  }
+
+  private markVerified(path: string, targetId: string): void {
+    let ids = this.verifiedAbsent.get(path);
+    if (!ids) {
+      ids = new Set<string>();
+      this.verifiedAbsent.set(path, ids);
+    }
+    ids.add(targetId);
+  }
+
+  /**
+   * 目标上该路径当前是否确实不存在。
+   *
+   * `.mtime` 侧车与 `.keep` 占位对部分后端不可见（`exists()` 恒为 false），这类
+   * 路径只能相信本轮 unlink 没有报错，因此按"不可见即可信"处理（与配置组的
+   * `allReplicasConfirmAbsent` 一致）。
+   */
+  private async absentOnTarget(fs: any, tombstone: TombstoneMeta): Promise<boolean> {
+    if (!isDirectoryTombstone(tombstone) && isHiddenPlaceholderPath(tombstone.path)) {
+      return true;
+    }
+    try {
+      const stat = await fs.stat?.(tombstone.path);
+      if (stat) return false; // 还在
+    } catch {
+      /* stat 不可用或不存在，下面再用 exists 兜底 */
+    }
+    try {
+      if (typeof fs.exists === 'function') return !(await fs.exists(tombstone.path));
+    } catch {
+      /* ignore */
+    }
+    return true;
   }
 
   /**
@@ -727,17 +783,28 @@ export class TombstoneStore {
     }
   }
 
-  /** Add the given backend ids to every tombstone's confirmation set. */
-  async confirm(backendIds: string[]): Promise<number> {
+  /**
+   * 把本轮真正核对过"确实不存在"的目标写进墓碑的 `confirmedBy`。
+   *
+   * 旧实现把传入的后端 id 无条件写入，等于"跑过一轮就算所有副本都清干净了"；
+   * 副本删除失败时墓碑仍会被 GC，下一轮同步再把残留拉回本地。现在只确认
+   * {@link process} 中现场核对通过的目标（与配置组语义一致），并支持只传 id
+   * 的旧调用方式（此时沿用同一份核对结果）。
+   */
+  async confirm(targets: TombstoneTarget[] | string[]): Promise<number> {
+    const isTargetList = (value: TombstoneTarget[] | string[]): value is TombstoneTarget[] =>
+      value.length > 0 && typeof (value[0] as any) === 'object';
+    const ids = isTargetList(targets) ? targets.map((t) => t.id) : targets;
     const tombstones = await this.list();
     let modified = 0;
     for (const tombstone of tombstones) {
+      const verified = this.verifiedAbsent.get(tombstone.path);
       let changed = false;
-      for (const id of backendIds) {
-        if (!tombstone.confirmedBy.includes(id)) {
-          tombstone.confirmedBy.push(id);
-          changed = true;
-        }
+      for (const id of ids) {
+        if (tombstone.confirmedBy.includes(id)) continue;
+        if (!verified?.has(id)) continue; // 没核对通过 → 保守：不确认
+        tombstone.confirmedBy.push(id);
+        changed = true;
       }
       if (!changed) continue;
       try {
@@ -758,6 +825,16 @@ export class TombstoneStore {
       if (!isTombstoneRetentionElapsed(tombstone)) continue;
       const allConfirmed = allBackendIds.every((id) => tombstone.confirmedBy.includes(id));
       if (!allConfirmed) continue;
+      // 与配置组一致：不能只看历史 confirmedBy —— 某个副本可能在上次确认之后
+      // 又把残留带了回来，GC 前必须现场复核"当前确实不存在"。
+      let stillAbsent = true;
+      for (const target of targets) {
+        if (!(await this.absentOnTarget(target.fs, tombstone))) {
+          stillAbsent = false;
+          break;
+        }
+      }
+      if (!stillAbsent) continue;
       const p = this.pathFor(tombstone.path);
       if (await existsSafe(this.fs, p)) {
         try {

@@ -131,6 +131,69 @@ describe('directory tombstones', () => {
     }
   });
 
+  it('does not confirm a target whose purge failed (conservative, same as config group)', async () => {
+    const local = await createBackend({ type: 'InMemory', options: { label: 'confirm-local' } });
+    const good = await createBackend({ type: 'InMemory', options: { label: 'confirm-good' } });
+    const stuck = await createBackend({ type: 'InMemory', options: { label: 'confirm-stuck' } });
+
+    for (const fs of [local, good, stuck]) {
+      await fs.mkdir('/data/old/sub', { recursive: true } as any).catch(() => undefined);
+      await fs.writeFile('/data/old/a.txt', 'a');
+      await fs.writeFile('/data/old/sub/b.txt', 'b');
+    }
+    // 模拟一个"删除永远失败"的副本（网络 / 后端权限）。
+    stuck.unlink = async () => {
+      throw Object.assign(new Error('EACCES: denied'), { code: 'EACCES' });
+    };
+    stuck.rmdir = async () => {
+      throw Object.assign(new Error('EACCES: denied'), { code: 'EACCES' });
+    };
+
+    const store = new TombstoneStore(local, 'local:g');
+    await store.write({ ...dirTombstone, path: '/data/old', deletedAt: Date.now() });
+
+    const targets = [
+      { id: 'good', fs: good },
+      { id: 'stuck', fs: stuck },
+    ];
+    await store.process(targets);
+    await store.confirm(targets);
+
+    const tombstone = (await store.list())[0];
+    expect(tombstone.confirmedBy).toContain('good');
+    expect(tombstone.confirmedBy).not.toContain('stuck');
+    expect(await stuck.exists('/data/old/a.txt')).toBe(true);
+  });
+
+  it('gc re-checks each target and keeps the tombstone when a copy came back', async () => {
+    const local = await createBackend({ type: 'InMemory', options: { label: 'gc-local' } });
+    const target = await createBackend({ type: 'InMemory', options: { label: 'gc-target' } });
+
+    for (const fs of [local, target]) {
+      await fs.mkdir('/data/old/sub', { recursive: true } as any).catch(() => undefined);
+      await fs.writeFile('/data/old/a.txt', 'a');
+    }
+
+    const store = new TombstoneStore(local, 'local:g');
+    await store.write({ ...dirTombstone, path: '/data/old', deletedAt: Date.now() });
+
+    const targets = [{ id: 'target', fs: target }];
+    await store.process(targets);
+    await store.confirm(targets);
+    expect((await store.list())[0].confirmedBy).toContain('target');
+
+    // 超出保留期（把 deletedAt 往前拨 25h），但副本又把残留带了回来。
+    const p = `${TOMBSTONES_DIR}/${encodeMetaPath('/data/old')}.json`;
+    const raw = await local.readFile(p);
+    const aged = JSON.parse(new TextDecoder().decode(raw as any));
+    await local.writeFile(p, JSON.stringify({ ...aged, deletedAt: Date.now() - 25 * 60 * 60 * 1000 }, null, 2));
+    await target.writeFile('/data/old/a.txt', 'a');
+
+    await store.gc(['target'], targets);
+
+    expect(await local.exists(p)).toBe(true);
+  });
+
   it('TombstoneStore.process leaves a recreated directory alone (delete intent revoked)', () => {
     // 目录在删除之后被再次写入 → mtime 更新 → 墓碑过期，不再整树删除。
     // 这里只校验判定函数对目录墓碑的输入形态没问题（type 不参与判定）。
