@@ -29,6 +29,17 @@ export interface ChrootOptions {
    * without excluding them from sync (hiding ≠ not syncing).
    */
   hiddenPrefixes?: string[];
+  /**
+   * Absolute paths (relative to the inner FS) that are **visible but read-only**.
+   * Reads/lists work normally; writes (`writeFile`/`mkdir`/`unlink`/`rmdir`/
+   * `rename`) are rejected with `EPERM`.
+   *
+   * Used for sync bookkeeping that must never be edited through a view: the
+   * tombstone ledger (`tombstones` decides whether a delete propagates, so
+   * removing a record resurrects files on replicas), version/conflict sidecars,
+   * and the immutable group identity (`group.json`).
+   */
+  readOnlyPrefixes?: string[];
   /** Called after a successful writeFile, e.g. to record a version entry. */
   onWrite?: (path: string, data: any) => Promise<void> | void;
   /**
@@ -74,6 +85,14 @@ function makeEnoent(userPath: string): any {
   return err;
 }
 
+function makeEperm(userPath: string): any {
+  const err = new Error(
+    `EPERM: '${userPath}' is read-only (sync metadata; use the group/backend API)`,
+  ) as any;
+  err.code = 'EPERM';
+  return err;
+}
+
 /**
  * Create a chroot-isolated fs-like object.
  *
@@ -84,6 +103,9 @@ function makeEnoent(userPath: string): any {
 export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOptions = {}) {
   const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
   const hiddenPrefixes = (options.hiddenPrefixes ?? []).map((p) =>
+    p.startsWith('/') ? p.replace(/\/+$/, '') : `/${p}`.replace(/\/+$/, ''),
+  );
+  const readOnlyPrefixes = (options.readOnlyPrefixes ?? []).map((p) =>
     p.startsWith('/') ? p.replace(/\/+$/, '') : `/${p}`.replace(/\/+$/, ''),
   );
 
@@ -103,6 +125,20 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     return absolute;
   }
 
+  /** Visible-but-read-only paths: readable, never writable through this view. */
+  function isReadOnly(absolutePath: string): boolean {
+    return readOnlyPrefixes.some(
+      (prefix) => absolutePath === prefix || absolutePath.startsWith(`${prefix}/`),
+    );
+  }
+
+  /** Resolve a write target: hidden → ENOENT, read-only → EPERM. */
+  function writable(path: string): string {
+    const absolute = visible(path);
+    if (isReadOnly(absolute)) throw makeEperm(path);
+    return absolute;
+  }
+
   // -----------------------------------------------------------------------
   // promises API (primary)
   // -----------------------------------------------------------------------
@@ -113,7 +149,7 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     },
 
     async writeFile(path: string, data: string | Uint8Array, writeOptions?: any): Promise<void> {
-      const target = visible(path);
+      const target = writable(path);
       await ensureParentDir(target);
       await inner.writeFile(target, data, writeOptions);
       if (options.onWrite) await options.onWrite(path, data);
@@ -145,17 +181,17 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     },
 
     async mkdir(path: string, mkdirOptions?: any): Promise<void> {
-      return inner.mkdir(visible(path), mkdirOptions);
+      return inner.mkdir(writable(path), mkdirOptions);
     },
 
     async unlink(path: string): Promise<void> {
-      const target = visible(path);
+      const target = writable(path);
       if (options.onUnlink) return options.onUnlink(target);
       return inner.unlink(target);
     },
 
     async rmdir(path: string): Promise<void> {
-      const target = visible(path);
+      const target = writable(path);
       // A tombstone-aware view deletes the whole tree (per-file tombstones),
       // otherwise falling back to the plain inner rmdir would bypass deletion
       // bookkeeping and let replicas resurrect the children.
@@ -165,7 +201,7 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     },
 
     async rename(oldPath: string, newPath: string): Promise<void> {
-      return inner.rename?.(visible(oldPath), visible(newPath));
+      return inner.rename?.(writable(oldPath), writable(newPath));
     },
 
     async exists(path: string): Promise<boolean> {

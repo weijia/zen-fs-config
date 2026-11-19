@@ -62,6 +62,8 @@ import {
   CONFLICTS_DIR,
   LEGACY_CONFLICTS_DIR,
   TOMBSTONES_DIR,
+  LEGACY_TOMBSTONES_DIR,
+  VERSIONS_DIR,
   META_BACKENDS_DIR,
   encodeMetaPath,
   ensureParentDir,
@@ -214,7 +216,7 @@ function normalizeGroupName(value: unknown): string {
  *
  * 注意：`.meta/` 不再整体排除。`.meta/tombstones`、`.meta/versions`、
  * `.meta/conflicts` 属于通用同步元数据，必须允许跨设备同步，否则删除会在
- * 其他设备复活。数据组视图通过 `hiddenPrefixes` 隐藏这些目录（隐藏 ≠ 不同步）。
+ * 其他设备复活；数据组视图让它们可见但对写入只读（见 AppDataGroupImpl.init）。
  */
 const CONFIG_ONLY_PREFIXES = [CONFIG_DIR, NODES_DIR, SHARED_DIR];
 
@@ -3485,13 +3487,29 @@ class AppDataGroupImpl implements AppDataGroup {
       log.warn(`[AppDataGroup:${this.groupId}] failed to write .meta/group.json:`, err);
     }
 
-    // The app-facing view hides metadata (hiding ≠ not syncing): `.meta/` is
-    // synced so tombstones/versions/conflicts reach other devices, but the app
-    // must not read or write it directly. Writes record versions when enabled;
-    // unlink goes through the tombstone-aware deleteFile.
+    // The app-facing view no longer hides `.meta/` wholesale — tools (and
+    // debug UI) need to read `.meta/backends`, `.meta/group.json` etc. Instead
+    // it is **visible but guarded**:
+    //   · `.config/` stays hidden (config-sync territory, never data content),
+    //   · the sync ledgers (`tombstones` / `versions` / `conflicts`) and the
+    //     immutable group identity are read-only, because editing them is
+    //     semantic damage: dropping a tombstone resurrects deleted files on
+    //     replicas, forging one deletes other devices' files.
+    // Deletes still go through the tombstone-aware path (onUnlink/onRmdir),
+    // and writes to normal data record versions when the feature is on.
     this.fs = createChrootFS(this.localFS, '/', {
-      hiddenPrefixes: [META_DIR, CONFIG_DIR],
+      hiddenPrefixes: [CONFIG_DIR],
+      readOnlyPrefixes: [
+        TOMBSTONES_DIR,
+        LEGACY_TOMBSTONES_DIR,
+        VERSIONS_DIR,
+        CONFLICTS_DIR,
+        LEGACY_CONFLICTS_DIR,
+        GROUP_DESCRIPTOR_FILE,
+      ],
       onWrite: async (path, data) => {
+        // Sync bookkeeping carries no versions; only user data does.
+        if (path.startsWith(`${META_DIR}/`) || path === META_DIR) return;
         // 写回已删除的路径 = 撤销删除意图：先清墓碑（含被删祖先目录），再记版本。
         await this.clearTombstonesForWrite(path);
         await this.recordVersion(path, data);

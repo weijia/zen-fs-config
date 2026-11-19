@@ -266,8 +266,8 @@ describe('directory deletion', () => {
     expect(await exists(group.fs, '/rmdir')).toBe(false);
     expect((await readTombstone(localFS, '/rmdir'))?.type).toBe('directory');
 
-    // Metadata stays hidden from the app-facing view.
-    expect(await exists(group.fs, '/.meta/group.json')).toBe(false);
+    // Metadata is visible but guarded: `.meta/group.json` reads, `.config` stays hidden.
+    expect(await exists(group.fs, '/.meta/group.json')).toBe(true);
     expect(await exists(group.fs, '/.config')).toBe(false);
 
     await group.dispose();

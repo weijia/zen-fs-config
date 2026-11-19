@@ -90,19 +90,36 @@ async function exists(fs: any, path: string): Promise<boolean> {
 }
 
 describe('data group sync isolation', () => {
-  it('hides metadata from the data-group fs and never pushes config-only paths', async () => {
+  it('exposes .meta read-only for ledgers while keeping .config hidden', async () => {
     const repo = await createConfigRepo('isolation-app', { nodeId: 'test-node' });
     const group = await repo.createAppDataGroup('isolation-group', [
       { id: 'audit-1', type: 'AuditBackend', options: { label: 'shared-remote' } },
     ]);
 
-    // `.meta/` 与 `.config/` 属于视图隐藏区域：应用不得直接读写
-    await expect(
-      group.fs.promises.writeFile('/.meta/config-marker.txt', 'config'),
-    ).rejects.toThrow();
+    // `.config/` 仍属配置组领域：视图里不存在
     await expect(
       group.fs.promises.writeFile('/.config/config-marker.txt', 'config'),
     ).rejects.toThrow();
+
+    // `.meta/` 可见：组描述符与后端声明都能读到
+    const metaEntries = await group.fs.promises.readdir('/.meta');
+    expect(metaEntries).toContain('group.json');
+    expect(metaEntries).toContain('backends');
+
+    // 账本只读：墓碑 / 版本 / 冲突 / 组身份一个都不许写
+    for (const target of [
+      '/.meta/tombstones/forged.json',
+      '/.meta/versions/forged.json',
+      '/.meta/conflicts/forged.json',
+      '/.meta/group.json',
+      '/.meta/.deleted/forged.json',
+      '/.meta/.conflicts/forged.json',
+    ]) {
+      await expect(group.fs.promises.writeFile(target, '{"forged":true}'))
+        .rejects.toThrow(/read-only|EPERM/);
+    }
+    // 删除同样被拒（否则等于删账本）
+    await expect(group.fs.promises.unlink('/.meta/tombstones')).rejects.toThrow(/read-only|EPERM/);
 
     // 配置专属（未隐藏但被 filter 排除）：可以写，但不会同步到数据组远端
     await group.fs.promises.mkdir('/nodes', { recursive: true });
@@ -118,7 +135,6 @@ describe('data group sync isolation', () => {
     // 数据内容照常上传（不破坏原有的上传能力）
     expect(await exists(remote, '/struct/data.txt')).toBe(true);
     // 配置内容一个都不许出现在数据组远端
-    expect(await exists(remote, '/.meta/config-marker.txt')).toBe(false);
     expect(await exists(remote, '/.config/config-marker.txt')).toBe(false);
     expect(await exists(remote, '/nodes/n1.txt')).toBe(false);
     expect(await exists(remote, '/shared/s1.txt')).toBe(false);

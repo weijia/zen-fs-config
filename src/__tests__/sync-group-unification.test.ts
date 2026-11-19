@@ -152,7 +152,7 @@ describe('config-sync group layout', () => {
 });
 
 describe('data-sync group capabilities', () => {
-  it('writes .meta/group.json, records versions, and hides metadata from fs', async () => {
+  it('writes .meta/group.json, records versions, and keeps ledgers read-only in fs', async () => {
     const repo = await createConfigRepo('unify-data-meta', { nodeId: 'n4' });
     const group = await repo.createAppDataGroup(
       'g-meta',
@@ -165,9 +165,13 @@ describe('data-sync group capabilities', () => {
     expect(group.features.tombstones).toBe(true);
     expect(group.features.versions).toBe(true);
 
+    // `.meta/group.json` 可见（工具需要读实例身份），但不可改
+    const descriptor = await group.fs.promises.readFile('/.meta/group.json', 'utf-8');
+    expect(JSON.parse(String(descriptor)).instanceId).toBeTruthy();
     await expect(
-      group.fs.promises.readFile('/.meta/group.json'),
-    ).rejects.toThrow();
+      group.fs.promises.writeFile('/.meta/group.json', '{"id":"hijack"}'),
+    ).rejects.toThrow(/read-only|EPERM/);
+    // `.config/` 仍属配置组领域：视图里不存在
     await expect(
       group.fs.promises.readFile('/.config/group-type'),
     ).rejects.toThrow();

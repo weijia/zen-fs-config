@@ -385,7 +385,12 @@ export interface SyncGroupHandle {
   /** 因归属其他同步组而被跳过的后端（不建同步对）。 */
   listSkippedBackends(): { backendId: string; reason: string }[];
 
-  /** Direct fs view; metadata paths (`.meta`, `.config`) are hidden. */
+  /**
+   * Direct fs view of the group root. `.config/` is hidden (config-sync
+   * territory); sync bookkeeping under `.meta/` (tombstones / versions /
+   * conflicts / group.json) is visible but read-only — writes there fail with
+   * `EPERM`. Everything else, including `.meta/backends/`, is normal data.
+   */
   readonly fs: typeof import('node:fs');
 
   // --- sync lifecycle ---
