@@ -824,6 +824,44 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * 写入成功即撤销该路径（及其被删祖先目录）上的墓碑。
+   *
+   * 墓碑表达的是「删除意图」，而同一路径被重新写入是更强的意图。只靠
+   * `isPathRecreatedAfterTombstone` 的 mtime 判定要等到下一轮 tombstone pass 才
+   * 解除排除表：这段窗口里新写入既进不了同步，又可能在 process 里被再删一次。
+   * 因此在写入路径上即时撤销，并立即刷新排除表。
+   */
+  private async clearTombstonesForWrite(filePath: string): Promise<void> {
+    let tombstones: TombstoneMeta[];
+    try {
+      tombstones = await this.readTombstones();
+    } catch {
+      return;
+    }
+    const normalized = normalizeTombstonePath(filePath);
+    const affected = tombstones.filter((t) => {
+      if (!t.path) return false;
+      if (t.path === normalized) return true;
+      // 祖先目录墓碑：写入其子路径意味着该子树被重新建立，整树删除不再成立。
+      return isDirectoryTombstone(t) && normalized.startsWith(`${t.path}/`);
+    });
+    if (affected.length === 0) return;
+
+    for (const tombstone of affected) {
+      try {
+        await this.cachedFS.unlink(tombstonePathFor(tombstone.path, TOMBSTONES_DIR));
+      } catch {
+        /* 墓碑已不存在 —— 结果等价 */
+      }
+    }
+    this.invalidateTombstoneCache();
+    await this.readTombstones();
+    log.log(
+      `[ConfigRepo] cleared ${affected.length} tombstone(s) on write: ${normalized}`,
+    );
+  }
+
+  /**
    * 判定墓碑目标路径是否在删除之后被重新创建。
    *
    * 墓碑表达的是「删除意图」，但删除之后同一路径完全可能被再次写入。同步类工具
@@ -1727,6 +1765,9 @@ export class ConfigRepo implements IConfigRepo {
     await this.ensureDir(fullPath);
     await this.cachedFS.writeFile(fullPath, bytes);
 
+    // 重新写入即撤销该路径（或其所在被删目录）的墓碑，再记版本。
+    await this.clearTombstonesForWrite(fullPath);
+
     const author = `${this.appId}/${this.nodeId}`;
     const version = await incrementVersion(this.fullFS, fullPath, bytes, author);
     await this.writeVersionSidecar(fullPath, version);
@@ -1917,6 +1958,9 @@ export class ConfigRepo implements IConfigRepo {
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
     await this.ensureDir(p);
     await this.cachedFS.writeFile(p, bytes);
+
+    // 重新写入即撤销该路径（或其所在被删目录）的墓碑，再记版本。
+    await this.clearTombstonesForWrite(p);
 
     const author = `${this.appId}/${this.nodeId}`;
     try {
@@ -3447,7 +3491,11 @@ class AppDataGroupImpl implements AppDataGroup {
     // unlink goes through the tombstone-aware deleteFile.
     this.fs = createChrootFS(this.localFS, '/', {
       hiddenPrefixes: [META_DIR, CONFIG_DIR],
-      onWrite: (path, data) => this.recordVersion(path, data),
+      onWrite: async (path, data) => {
+        // 写回已删除的路径 = 撤销删除意图：先清墓碑（含被删祖先目录），再记版本。
+        await this.clearTombstonesForWrite(path);
+        await this.recordVersion(path, data);
+      },
       onUnlink: (path) => this.deleteFile(path),
       onRmdir: (path) => this.deleteFile(path),
     });
@@ -3633,6 +3681,36 @@ class AppDataGroupImpl implements AppDataGroup {
     for (const tombstone of tombstones) {
       if (!tombstone.path) continue;
       this.tombstoneExcludePrefixes.push(tombstone.path, `${tombstone.path}/`);
+    }
+  }
+
+  /**
+   * 写入成功即撤销该路径（及其被删祖先目录）上的墓碑。
+   *
+   * 与配置组同一语义：墓碑是删除意图，重新写入是更强的意图；只靠 mtime 判定
+   * 要等下一轮 tombstone pass 才解除排除，期间写入既不参与同步又可能被再删。
+   */
+  private async clearTombstonesForWrite(filePath: string): Promise<void> {
+    try {
+      const tombstones = await this.tombstones.list();
+      const normalized = normalizeTombstonePath(filePath);
+      const affected = tombstones.filter((t) => {
+        if (!t.path) return false;
+        if (t.path === normalized) return true;
+        return isDirectoryTombstone(t) && normalized.startsWith(`${t.path}/`);
+      });
+      if (affected.length === 0) return;
+
+      for (const tombstone of affected) await this.tombstones.remove(tombstone);
+      this.refreshSyncExclusions(await this.tombstones.list());
+      log.log(
+        `[AppDataGroup:${this.groupId}] cleared ${affected.length} tombstone(s) on write: ${normalized}`,
+      );
+    } catch (err) {
+      log.warn(
+        `[AppDataGroup:${this.groupId}] clear tombstones on write failed for ${filePath}:`,
+        err,
+      );
     }
   }
 

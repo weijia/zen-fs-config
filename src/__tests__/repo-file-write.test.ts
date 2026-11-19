@@ -11,6 +11,7 @@ import path from 'node:path';
 import { registerBackend, createBackend } from '../backend-registry';
 import { createConfigRepo } from '../config-repo';
 import { versionPathFor } from '../version';
+import { encodeMetaPath } from '../group-meta';
 
 const localStores = new Map<string, any>();
 
@@ -76,6 +77,62 @@ describe('writeRepoFile', () => {
     await repo.writeRepoFile(target, '{"a":2}');
     const meta2 = JSON.parse(await readText(repo.rootFS, sidecar));
     expect(meta2.version).toBeGreaterThan(meta.version);
+
+    await repo.dispose();
+  });
+
+  it('重写已删除的文件路径会撤销墓碑（不再被排除表挡住）', async () => {
+    const appId = 'repo-file-revive';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-revive' });
+    const target = '/shared/revive.txt';
+    const tombstone = `/.meta/tombstones/${encodeMetaPath(target)}.json`;
+
+    await repo.writeRepoFile(target, 'v1');
+    await repo.deleteFile(target);
+    expect(await exists(repo.rootFS, tombstone)).toBe(true);
+    expect(await exists(repo.rootFS, target)).toBe(false);
+
+    await repo.writeRepoFile(target, 'v2');
+    expect(await readText(repo.rootFS, target)).toBe('v2');
+    expect(await exists(repo.rootFS, tombstone)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('写入被删目录的子路径会撤销祖先目录墓碑', async () => {
+    const appId = 'repo-file-revive-dir';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-revive-dir' });
+    const dir = '/shared/tree';
+    const tombstone = `/.meta/tombstones/${encodeMetaPath(dir)}.json`;
+
+    await repo.writeRepoFile(`${dir}/a.txt`, 'a');
+    await repo.deleteFile(dir);
+    expect(await exists(repo.rootFS, tombstone)).toBe(true);
+
+    await repo.writeRepoFile(`${dir}/b.txt`, 'b');
+    expect(await readText(repo.rootFS, `${dir}/b.txt`)).toBe('b');
+    expect(await exists(repo.rootFS, tombstone)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('数据组组 fs 写入同样撤销墓碑', async () => {
+    const appId = 'repo-file-adg';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-adg' });
+    const group = await repo.createAppDataGroup('g-revive', [
+      { id: 'b-1', type: 'InMemory', options: { label: 'g-revive' } },
+    ]);
+    const target = '/data/revive.txt';
+
+    await group.fs.promises.writeFile(target, 'v1');
+    await group.fs.promises.unlink(target);
+    const before = await (group as any).tombstones.list();
+    expect(before.some((t: any) => t.path === target)).toBe(true);
+
+    await group.fs.promises.writeFile(target, 'v2');
+    const after = await (group as any).tombstones.list();
+    expect(after.some((t: any) => t.path === target)).toBe(false);
+    expect(await group.fs.promises.readFile(target, 'utf-8')).toBe('v2');
 
     await repo.dispose();
   });
