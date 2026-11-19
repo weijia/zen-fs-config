@@ -58,6 +58,21 @@ function idb(): any {
   return (globalThis as any).indexedDB;
 }
 
+/**
+ * Diagnostics sink. Every repair attempt appends one entry per phase to
+ * `globalThis.__zenfsIdbRepair` so the browser console / page scripts can tell
+ * whether the repair ran at all (and where it bailed out).
+ */
+function traceLog(): Array<Record<string, unknown>> | null {
+  const g = globalThis as any;
+  try {
+    if (!Array.isArray(g.__zenfsIdbRepair)) g.__zenfsIdbRepair = [];
+    return g.__zenfsIdbRepair as Array<Record<string, unknown>>;
+  } catch {
+    return null;
+  }
+}
+
 function openDB(name: string): Promise<any | null> {
   const factory = idb();
   if (!factory) return Promise.resolve(null);
@@ -129,15 +144,28 @@ function isDirectoryInode(bytes: Uint8Array, key: number): number | null {
  * it is a no-op when nothing is corrupted, and it never creates a database.
  */
 export async function repairIndexedDBStore(storeName: string): Promise<RepairResult | null> {
-  if (!idb()) return null;
+  const trace = traceLog();
+  const note = (phase: string, extra?: Record<string, unknown>) => {
+    if (!trace) return;
+    trace.push({ store: storeName, phase, at: Date.now(), ...(extra ?? {}) });
+  };
+  note('start');
+  if (!idb()) {
+    note('skip: no indexedDB');
+    return null;
+  }
 
   const db = await openDB(storeName);
-  if (!db) return null;
+  if (!db) {
+    note('skip: db not opened');
+    return null;
+  }
 
   const objectStoreName: string | undefined = Array.from(
     db.objectStoreNames as ArrayLike<string>,
   )[0];
   if (!objectStoreName) {
+    note('skip: no object store');
     db.close?.();
     return null;
   }
@@ -145,6 +173,13 @@ export async function repairIndexedDBStore(storeName: string): Promise<RepairRes
   const result: RepairResult = { scanned: 0, repaired: 0, details: [] };
   try {
     const tx = db.transaction(objectStoreName, 'readwrite');
+    // Attach the completion handlers before awaiting anything: a transaction can
+    // finish (and fire these events) while the awaited request promises settle.
+    const done = new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
     const store = tx.objectStore(objectStoreName);
     const keys = await request<number[]>(store.getAllKeys());
     const values = await request<any[]>(store.getAll());
@@ -175,12 +210,10 @@ export async function repairIndexedDBStore(storeName: string): Promise<RepairRes
       await request(store.put(new TextEncoder().encode('{}'), dataSlot));
     }
 
-    await new Promise<void>((resolve, reject) => {
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
-    });
-  } catch {
+    await done;
+    note('done', { scanned: result.scanned, repaired: result.repaired });
+  } catch (err) {
+    note('error', { message: err instanceof Error ? `${err.name}: ${err.message}` : String(err) });
     try {
       db.close?.();
     } catch {
