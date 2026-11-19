@@ -42,7 +42,9 @@ jobs:
       - name: Publish to npm
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          if npm view "zen-fs-config@${VERSION}" version 2>/dev/null | grep -q "${VERSION}"; then
+          # 用退出码判重：`npm view` 对不存在的版本会把错误文本打到输出里，
+          # 用 grep 匹配版本号会把「version not found: 0.7.9」误判成已发布。
+          if npm view "zen-fs-config@${VERSION}" version >/dev/null 2>&1; then
             echo "zen-fs-config@${VERSION} already published on npm, skipping publish step"
           else
             npm publish --access public --provenance
