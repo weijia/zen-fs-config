@@ -40,6 +40,14 @@ export interface ChrootOptions {
    * and the immutable group identity (`group.json`).
    */
   readOnlyPrefixes?: string[];
+  /**
+   * Absolute paths that stay writable **only after an explicit confirmation**.
+   * A plain write rejects with `ECONFIRM`; retrying with `{ confirm: true }`
+   * (3rd argument of `writeFile`, 2nd of `unlink`/`rmdir`/`mkdir`) goes through.
+   * Used for `.meta/group.json`: editing it changes the group identity, so tools
+   * may do it deliberately (after warning the user), never by accident.
+   */
+  confirmPrefixes?: string[];
   /** Called after a successful writeFile, e.g. to record a version entry. */
   onWrite?: (path: string, data: any) => Promise<void> | void;
   /**
@@ -93,6 +101,14 @@ function makeEperm(userPath: string): any {
   return err;
 }
 
+function makeEconfirm(userPath: string): any {
+  const err = new Error(
+    `ECONFIRM: '${userPath}' changes sync metadata — retry with { confirm: true } after warning the user`,
+  ) as any;
+  err.code = 'ECONFIRM';
+  return err;
+}
+
 /**
  * Create a chroot-isolated fs-like object.
  *
@@ -106,6 +122,9 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     p.startsWith('/') ? p.replace(/\/+$/, '') : `/${p}`.replace(/\/+$/, ''),
   );
   const readOnlyPrefixes = (options.readOnlyPrefixes ?? []).map((p) =>
+    p.startsWith('/') ? p.replace(/\/+$/, '') : `/${p}`.replace(/\/+$/, ''),
+  );
+  const confirmPrefixes = (options.confirmPrefixes ?? []).map((p) =>
     p.startsWith('/') ? p.replace(/\/+$/, '') : `/${p}`.replace(/\/+$/, ''),
   );
 
@@ -132,10 +151,21 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     );
   }
 
-  /** Resolve a write target: hidden → ENOENT, read-only → EPERM. */
-  function writable(path: string): string {
+  /** Writable only after an explicit `{ confirm: true }` (dangerous, but allowed). */
+  function needsConfirm(absolutePath: string): boolean {
+    return confirmPrefixes.some(
+      (prefix) => absolutePath === prefix || absolutePath.startsWith(`${prefix}/`),
+    );
+  }
+
+  /**
+   * Resolve a write target: hidden → ENOENT, read-only → EPERM,
+   * confirm-only without `{ confirm: true }` → ECONFIRM.
+   */
+  function writable(path: string, writeOptions?: any): string {
     const absolute = visible(path);
     if (isReadOnly(absolute)) throw makeEperm(path);
+    if (needsConfirm(absolute) && writeOptions?.confirm !== true) throw makeEconfirm(path);
     return absolute;
   }
 
@@ -149,7 +179,7 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     },
 
     async writeFile(path: string, data: string | Uint8Array, writeOptions?: any): Promise<void> {
-      const target = writable(path);
+      const target = writable(path, writeOptions);
       await ensureParentDir(target);
       await inner.writeFile(target, data, writeOptions);
       if (options.onWrite) await options.onWrite(path, data);
@@ -181,17 +211,17 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
     },
 
     async mkdir(path: string, mkdirOptions?: any): Promise<void> {
-      return inner.mkdir(writable(path), mkdirOptions);
+      return inner.mkdir(writable(path, mkdirOptions), mkdirOptions);
     },
 
-    async unlink(path: string): Promise<void> {
-      const target = writable(path);
+    async unlink(path: string, unlinkOptions?: any): Promise<void> {
+      const target = writable(path, unlinkOptions);
       if (options.onUnlink) return options.onUnlink(target);
       return inner.unlink(target);
     },
 
-    async rmdir(path: string): Promise<void> {
-      const target = writable(path);
+    async rmdir(path: string, rmdirOptions?: any): Promise<void> {
+      const target = writable(path, rmdirOptions);
       // A tombstone-aware view deletes the whole tree (per-file tombstones),
       // otherwise falling back to the plain inner rmdir would bypass deletion
       // bookkeeping and let replicas resurrect the children.
@@ -200,8 +230,8 @@ export function createChrootFS(inner: AsyncFS, root: string, options: ChrootOpti
       return inner.rmdir?.(target);
     },
 
-    async rename(oldPath: string, newPath: string): Promise<void> {
-      return inner.rename?.(writable(oldPath), writable(newPath));
+    async rename(oldPath: string, newPath: string, renameOptions?: any): Promise<void> {
+      return inner.rename?.(writable(oldPath, renameOptions), writable(newPath, renameOptions));
     },
 
     async exists(path: string): Promise<boolean> {

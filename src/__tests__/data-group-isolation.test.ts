@@ -106,12 +106,11 @@ describe('data group sync isolation', () => {
     expect(metaEntries).toContain('group.json');
     expect(metaEntries).toContain('backends');
 
-    // 账本只读：墓碑 / 版本 / 冲突 / 组身份一个都不许写
+    // 账本只读：墓碑 / 版本 / 冲突一个都不许写
     for (const target of [
       '/.meta/tombstones/forged.json',
       '/.meta/versions/forged.json',
       '/.meta/conflicts/forged.json',
-      '/.meta/group.json',
       '/.meta/.deleted/forged.json',
       '/.meta/.conflicts/forged.json',
     ]) {
@@ -120,6 +119,14 @@ describe('data group sync isolation', () => {
     }
     // 删除同样被拒（否则等于删账本）
     await expect(group.fs.promises.unlink('/.meta/tombstones')).rejects.toThrow(/read-only|EPERM/);
+
+    // 组身份可以改，但必须先确认（ECONFIRM），确认后放行
+    await expect(group.fs.promises.writeFile('/.meta/group.json', '{"id":"hijack"}'))
+      .rejects.toThrow(/ECONFIRM|confirm/);
+    const originalDescriptor = await group.fs.promises.readFile('/.meta/group.json', 'utf-8');
+    await expect(
+      (group.fs.promises as any).writeFile('/.meta/group.json', originalDescriptor, { confirm: true }),
+    ).resolves.toBeUndefined();
 
     // 配置专属（未隐藏但被 filter 排除）：可以写，但不会同步到数据组远端
     await group.fs.promises.mkdir('/nodes', { recursive: true });

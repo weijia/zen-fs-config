@@ -3491,10 +3491,9 @@ class AppDataGroupImpl implements AppDataGroup {
     // debug UI) need to read `.meta/backends`, `.meta/group.json` etc. Instead
     // it is **visible but guarded**:
     //   · `.config/` stays hidden (config-sync territory, never data content),
-    //   · the sync ledgers (`tombstones` / `versions` / `conflicts`) and the
-    //     immutable group identity are read-only, because editing them is
-    //     semantic damage: dropping a tombstone resurrects deleted files on
-    //     replicas, forging one deletes other devices' files.
+    //   · the sync ledgers (`tombstones` / `versions` / `conflicts`) are read-only,
+    //   · `.meta/group.json` (group identity) is writable only with an explicit
+    //     `{ confirm: true }` — tools may edit it after warning the user.
     // Deletes still go through the tombstone-aware path (onUnlink/onRmdir),
     // and writes to normal data record versions when the feature is on.
     this.fs = createChrootFS(this.localFS, '/', {
@@ -3505,8 +3504,8 @@ class AppDataGroupImpl implements AppDataGroup {
         VERSIONS_DIR,
         CONFLICTS_DIR,
         LEGACY_CONFLICTS_DIR,
-        GROUP_DESCRIPTOR_FILE,
       ],
+      confirmPrefixes: [GROUP_DESCRIPTOR_FILE],
       onWrite: async (path, data) => {
         // Sync bookkeeping carries no versions; only user data does.
         if (path.startsWith(`${META_DIR}/`) || path === META_DIR) return;

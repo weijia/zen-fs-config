@@ -165,12 +165,15 @@ describe('data-sync group capabilities', () => {
     expect(group.features.tombstones).toBe(true);
     expect(group.features.versions).toBe(true);
 
-    // `.meta/group.json` 可见（工具需要读实例身份），但不可改
+    // `.meta/group.json` 可见（工具需要读实例身份）；改写必须先确认
     const descriptor = await group.fs.promises.readFile('/.meta/group.json', 'utf-8');
     expect(JSON.parse(String(descriptor)).instanceId).toBeTruthy();
     await expect(
       group.fs.promises.writeFile('/.meta/group.json', '{"id":"hijack"}'),
-    ).rejects.toThrow(/read-only|EPERM/);
+    ).rejects.toThrow(/ECONFIRM|confirm/);
+    await expect(
+      (group.fs.promises as any).writeFile('/.meta/group.json', descriptor, { confirm: true }),
+    ).resolves.toBeUndefined();
     // `.config/` 仍属配置组领域：视图里不存在
     await expect(
       group.fs.promises.readFile('/.config/group-type'),
