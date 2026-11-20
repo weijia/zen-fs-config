@@ -125,6 +125,14 @@ describe('data group sync isolation', () => {
     await expect(group.fs.promises.unlink('/.meta/.deleted/legacy.json')).resolves.toBeUndefined();
     await expect(group.fs.promises.unlink('/.meta/.deleted')).resolves.toBeUndefined();
 
+    // 旧版数据组镜像（/.meta/app-data-groups）同理：新布局只写
+    // /.config/app-data-groups/，这份镜像纯属历史残留，也应允许清理。
+    await group.fs.promises.mkdir('/.meta/app-data-groups');
+    await group.fs.promises.mkdir('/.meta/app-data-groups/mirror-app');
+    await group.fs.promises.writeFile('/.meta/app-data-groups/mirror-app/g.json', '{"id":"g"}');
+    await expect(group.fs.promises.unlink('/.meta/app-data-groups/mirror-app/g.json')).resolves.toBeUndefined();
+    await expect(group.fs.promises.unlink('/.meta/app-data-groups')).resolves.toBeUndefined();
+
     // 组身份可以改，但必须先确认（ECONFIRM），确认后放行
     await expect(group.fs.promises.writeFile('/.meta/group.json', '{"id":"hijack"}'))
       .rejects.toThrow(/ECONFIRM|confirm/);

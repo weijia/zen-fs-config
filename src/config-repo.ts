@@ -100,6 +100,8 @@ import {
   TOMBSTONES_DIR,
   LEGACY_TOMBSTONES_DIR,
   VERSIONS_DIR,
+  LEGACY_APP_DATA_GROUPS_DIR,
+  isDeletableLegacyMetaPath,
   META_BACKENDS_DIR,
   encodeMetaPath,
   ensureParentDir,
@@ -156,7 +158,6 @@ const BACKENDS_DIR = META_BACKENDS_DIR;
  */
 const LEGACY_BACKENDS_DIR = `${CONFIG_DIR}/backends`;
 const APP_DATA_GROUPS_DIR = `${CONFIG_DIR}/app-data-groups`;
-const LEGACY_APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`;
 // Display metadata (name) for the config-sync group itself. Separate file so
 // renaming never touches backend/sync configuration.
 const CONFIG_SYNC_GROUP_FILE = `${CONFIG_DIR}/config-sync-group.json`;
@@ -165,23 +166,8 @@ const GROUP_NAME_MAX_LENGTH = 40;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
 
-/**
- * 旧版归档目录（`/.meta/.deleted`、`/.meta/.conflicts`）。
- *
- * 删除账本迁到 `/.meta/tombstones/`、冲突记录迁到 `/.meta/conflicts/` 之后，
- * 这两处就不再被任何代码读写；留在那里的只是历史残留。因此它们不再列入
- * 「元数据不可删」的范围 —— 否则用户永远清不掉一批已经死掉的文件。
- * 现行账本（`tombstones` / `versions` / `conflicts`）、后端清单
- * （`/.meta/backends/`）和组身份（`/.meta/group.json`）仍然一律禁删。
- */
-function isDeletableLegacyMetaPath(path: string): boolean {
-  return (
-    path === LEGACY_TOMBSTONES_DIR ||
-    path.startsWith(`${LEGACY_TOMBSTONES_DIR}/`) ||
-    path === LEGACY_CONFLICTS_DIR ||
-    path.startsWith(`${LEGACY_CONFLICTS_DIR}/`)
-  );
-}
+// 旧版归档目录与旧版数据组镜像的「可删」判定统一放在 group-meta.ts：
+// 配置组与数据组共用同一套白名单，避免两处各写一份、再慢慢走偏。
 
 /** Fixed group id of the config-sync group. */
 export const CONFIG_GROUP_ID = 'config';

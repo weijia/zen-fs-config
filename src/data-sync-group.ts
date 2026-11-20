@@ -38,6 +38,7 @@ import {
   META_DIR,
   TombstoneStore,
   VersionStore,
+  isDeletableLegacyMetaPath,
   ConflictStore,
   normalizeTombstonePath,
   purgeTombstonedTree,
@@ -123,8 +124,8 @@ export class DataSyncGroup implements AppDataGroup {
     if (
       normalized === META_DIR ||
       normalized === CONFIG_DIR ||
-      normalized.startsWith(`${META_DIR}/`) ||
-      normalized.startsWith(`${CONFIG_DIR}/`)
+      normalized.startsWith(`${CONFIG_DIR}/`) ||
+      (normalized.startsWith(`${META_DIR}/`) && !isDeletableLegacyMetaPath(normalized))
     ) {
       throw new Error(`Cannot delete metadata path "${normalized}"`);
     }

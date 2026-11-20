@@ -160,7 +160,27 @@ export const LEGACY_TOMBSTONES_DIR = `${META_DIR}/.deleted`;
 export const VERSIONS_DIR = `${META_DIR}/versions`;
 export const CONFLICTS_DIR = `${META_DIR}/conflicts`;
 export const LEGACY_CONFLICTS_DIR = `${META_DIR}/.conflicts`;
+/** 旧版数据组镜像目录；自 0.7.x 起只写 `/.config/app-data-groups/`。 */
+export const LEGACY_APP_DATA_GROUPS_DIR = `${META_DIR}/app-data-groups`;
 export const CONFIG_DIR = '/.config';
+
+/**
+ * 是否属于「可以当普通残留清掉」的旧版元数据路径。
+ *
+ * 删除账本迁到 `/.meta/tombstones/`、冲突记录迁到 `/.meta/conflicts/`、数据组
+ * 描述符迁到 `/.config/app-data-groups/` 之后，`/.meta/.deleted`、
+ * `/.meta/.conflicts`、`/.meta/app-data-groups` 这三处不再被写入，留在里面的
+ * 只是历史残留 —— 允许用户清理，否则永远删不掉一批已经死掉的文件。
+ *
+ * 现行账本（tombstones / versions / conflicts）、后端清单（`/.meta/backends/`）
+ * 和组身份（`/.meta/group.json`）**不在此列**，仍然一律禁删。
+ */
+export function isDeletableLegacyMetaPath(path: string): boolean {
+  for (const dir of [LEGACY_TOMBSTONES_DIR, LEGACY_CONFLICTS_DIR, LEGACY_APP_DATA_GROUPS_DIR]) {
+    if (path === dir || path.startsWith(`${dir}/`)) return true;
+  }
+  return false;
+}
 
 /** Default features for a data-sync group: tombstones on, versions/conflicts opt-in. */
 export const DATA_GROUP_DEFAULT_FEATURES: SyncGroupFeatures = {
