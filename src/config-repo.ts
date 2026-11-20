@@ -4738,16 +4738,27 @@ export async function createConfigRepo(
   // -------------------------------------------------------------------
   // Step 2b: Write group-type = "config-sync" (new `.config/` layout)
   // -------------------------------------------------------------------
-  // 先看这个根自己的声明：`.meta/group.json` 是身份，标记只是它的缓存。
-  // 已经声明成数据组的根，不能被任何客户端顺手盖章成配置组 —— 那正是
-  // 「标记 config-sync + 描述符 kind=data」这种自相矛盾状态的来源。
+  // 先看这个根自己的声明。本地主根永远是本应用的配置组存储，所以这里的
+  // `kind=data` 只可能是「别的组把它的 .meta/group.json 同步过来了」造成的
+  // 污染（线上 admin 就是这么被一台数据组根覆盖的）。这种情况就地纠正回
+  // config，并保留已有 instanceId；真正的拒绝放在「把某个远端根接进配置组」
+  // 的地方（Step 5b / addBackend），那才是会污染远端的分支。
   const declaredIdentity = await readGroupDescriptor(primaryInstance);
   if (declaredIdentity?.kind === 'data') {
-    throw new Error(
-      '[createConfigRepo] 该远端根的 .meta/group.json 声明为数据组'
-      + `（kind=data · id=${declaredIdentity.id ?? '?'}）——拒绝在这里初始化配置组。`
-      + '要给数据组换专属远端根，或在配置组侧解除对该根的绑定。',
+    log.warn(
+      `[createConfigRepo] local primary carries a data-group descriptor (id=${declaredIdentity.id ?? '?'}) —`
+      + ' rewriting it back to kind=config (its .meta/group.json was overwritten by sync)',
     );
+    await writeGroupDescriptor(primaryInstance, {
+      schemaVersion: 2,
+      kind: 'config',
+      id: CONFIG_GROUP_ID,
+      // 被污染的 instanceId 属于那个数据组，不能当成自己的身份继续用；
+      // 重新分配一个，界面上的「实例 ID 不一致」会提示用户拍板统一。
+      instanceId: newGroupInstanceId(),
+      ...(declaredIdentity.name ? { name: declaredIdentity.name } : {}),
+      features: CONFIG_GROUP_FEATURES,
+    });
   }
   try {
     const groupTypeBytes = new TextEncoder().encode('config-sync');

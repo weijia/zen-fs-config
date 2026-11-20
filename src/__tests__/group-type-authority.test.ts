@@ -78,6 +78,24 @@ describe('A. 探测以描述符为准', () => {
     ).rejects.toThrow(/Group type mismatch/);
   });
 
+  it('描述符 kind=data、标记却被写成 config-sync 时，仍按 data-sync 判定（描述符优先）', async () => {
+    const label = `a3-${Math.random().toString(36).slice(2, 8)}`;
+    const backend = await createBackend(remote(label) as any);
+    await backend.mkdir('/.meta', { recursive: true });
+    await backend.writeFile(
+      '/.meta/group.json',
+      JSON.stringify({
+        schemaVersion: 2, kind: 'data', id: 'remote-storage', instanceId: 'd25103f3-cdd4-401c-8bba-aaf3aaa99318',
+      }),
+    );
+    await backend.mkdir('/.config', { recursive: true });
+    await backend.writeFile('/.config/group-type', 'config-sync');
+
+    await expect(
+      connect(`auth-a3-${label}`, { backendInfo: remote(label) as any, groupType: 'config-sync' }),
+    ).rejects.toThrow(/Group type mismatch/);
+  });
+
   it('没有标记、也没有描述符时仍然是「新根」，按调用方要求初始化', async () => {
     const label = `a2-${Math.random().toString(36).slice(2, 8)}`;
     const result = await connect(`auth-a2-${label}`, { backendInfo: remote(label) as any, groupType: 'config-sync' });
@@ -85,28 +103,29 @@ describe('A. 探测以描述符为准', () => {
   });
 });
 
-describe('B. 数据组的根不能被初始化为配置组', () => {
-  it('本地主根已被声明为 kind=data 时，createConfigRepo 抛错且不再盖章', async () => {
+describe('B. 本地主根的描述符被污染时就地纠正', () => {
+  it('本地主根的 .meta/group.json 写着 kind=data 时，启动把它改回 config 并保留 instanceId', async () => {
     const appId = `auth-b-${Math.random().toString(36).slice(2, 8)}`;
     const seed = await createConfigRepo(appId, { nodeId: 'seed' });
+    // 模拟「配置组把一台数据组根的 .meta/group.json 同步进来」的污染现场
     await seed.rootFS.promises.writeFile(
       '/.meta/group.json',
       JSON.stringify({
         schemaVersion: 2, kind: 'data', id: 'remote-storage', instanceId: 'd25103f3-cdd4-401c-8bba-aaf3aaa99318',
       }),
     );
-    // 模拟「标记被删掉」的现场：只剩描述符
-    await seed.rootFS.promises.unlink('/.config/group-type').catch(() => {});
-    await seed.rootFS.promises.unlink('/.meta/group-type').catch(() => {});
-    const rootFS = seed.rootFS;
     await seed.dispose();
 
-    await expect(
-      createConfigRepo(appId, { nodeId: 'after-delete' }),
-    ).rejects.toThrow(/声明为数据组/);
-
-    expect(await readOrNull(rootFS, '/.config/group-type')).toBeNull();
-    expect(await readOrNull(rootFS, '/.meta/group-type')).toBeNull();
+    const repo = await createConfigRepo(appId, { nodeId: 'after-pollution' });
+    const descriptor = JSON.parse(decode(await repo.rootFS.promises.readFile('/.meta/group.json')));
+    expect(descriptor.kind).toBe('config');
+    expect(descriptor.id).toBe('config');
+    // 被污染的 id 属于数据组，不能被当成自己的身份；这里会重新分配
+    expect(descriptor.instanceId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(descriptor.instanceId).not.toBe('d25103f3-cdd4-401c-8bba-aaf3aaa99318');
+    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBe('config-sync');
+    expect(await readOrNull(repo.rootFS, '/.meta/group-type')).toBeNull();
+    await repo.dispose();
   });
 });
 

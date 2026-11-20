@@ -79,12 +79,23 @@ async function detectGroupTypeDetailed(
   }
 
   try {
+    // `.meta/group.json` 的 kind 是这个根的身份声明；标记文件只是缓存，
+    // 可能是别的组同步过来的残留（远端根被误接进配置组时就会出现）。
+    // 所以先认描述符，再退到标记。
+    if (remote?.kind === 'data') {
+      log('detectGroupType: .meta/group.json declares kind=data → data-sync');
+      return { groupType: 'data-sync', remote };
+    }
+    if (remote?.kind === 'config') {
+      log('detectGroupType: .meta/group.json declares kind=config → config-sync');
+      return { groupType: 'config-sync', remote };
+    }
     for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
       try {
         const raw = await tempBackend.readFile(path, 'utf-8');
         const groupType = (raw as string).trim() as SyncGroupType;
         if (groupType === 'config-sync' || groupType === 'data-sync') {
-          log(`detectGroupType: detected "${groupType}" at ${path}`);
+          log(`detectGroupType: detected "${groupType}" at ${path} (no descriptor)`);
           return { groupType, remote };
         }
         log(`detectGroupType: unknown group-type value "${groupType}" at ${path}, treating as null`);
@@ -92,16 +103,6 @@ async function detectGroupTypeDetailed(
       } catch {
         // Try the next layout.
       }
-    }
-    // 标记文件是「缓存」，不是唯一真相：缺了标记不代表这是新根。
-    // `.meta/group.json` 里已经写明的 kind 才是这个根的身份声明。
-    if (remote?.kind === 'data') {
-      log('detectGroupType: no marker, but .meta/group.json declares kind=data → data-sync');
-      return { groupType: 'data-sync', remote };
-    }
-    if (remote?.kind === 'config') {
-      log('detectGroupType: no marker, but .meta/group.json declares kind=config → config-sync');
-      return { groupType: 'config-sync', remote };
     }
     log(`detectGroupType: no group-type file and no descriptor kind (new backend)`);
     return { groupType: null, remote };
