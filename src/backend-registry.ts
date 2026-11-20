@@ -252,7 +252,18 @@ export async function wrapZenFSFileSystem(config: any): Promise<BackendInstance>
       const size = st.size;
       const buf = new Uint8Array(size);
       await isolatedFS.read(path, buf, 0, size);
-      if (args[0] === 'utf-8') return new TextDecoder().decode(buf);
+      // 兼容三种调用形态：'utf-8' / 'utf8' / { encoding }。只认 'utf-8' 会让
+      // 传 'utf8' 的调用方拿到 Uint8Array（JSON.parse 直接抛错，且静默跳过），
+      // onenav 文件浏览器就踩过这个坑。
+      const enc =
+        typeof args[0] === 'string'
+          ? args[0]
+          : args[0] && typeof args[0] === 'object'
+            ? args[0].encoding
+            : undefined;
+      if (enc === 'utf-8' || enc === 'utf8' || enc === 'UTF-8') {
+        return new TextDecoder().decode(buf);
+      }
       return buf;
     },
     async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, _options?: any): Promise<void> {
