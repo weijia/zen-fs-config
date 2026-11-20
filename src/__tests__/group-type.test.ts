@@ -44,9 +44,10 @@ describe('group-type detection and management', () => {
     // Create a ConfigRepo directly with this backend to test getGroupType on empty backend
     // Actually, just use the repo's rootFS to check the file doesn't exist before ensureGroupType
     const repo = await createConfigRepo('test-app-gt4', { nodeId: 'test-node' });
-    // The rootFS can read /.meta/group-type
-    const exists = await (repo.rootFS.promises as any).exists('/.meta/group-type');
+    // 0.7.18: 只有新布局标记，legacy `.meta/group-type` 不再生成
+    const exists = await (repo.rootFS.promises as any).exists('/.config/group-type');
     expect(exists).toBe(true);
+    expect(await (repo.rootFS.promises as any).exists('/.meta/group-type')).toBe(false);
     await repo.dispose();
   });
 

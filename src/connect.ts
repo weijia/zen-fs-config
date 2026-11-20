@@ -93,7 +93,17 @@ async function detectGroupTypeDetailed(
         // Try the next layout.
       }
     }
-    log(`detectGroupType: no group-type file found (new backend)`);
+    // 标记文件是「缓存」，不是唯一真相：缺了标记不代表这是新根。
+    // `.meta/group.json` 里已经写明的 kind 才是这个根的身份声明。
+    if (remote?.kind === 'data') {
+      log('detectGroupType: no marker, but .meta/group.json declares kind=data → data-sync');
+      return { groupType: 'data-sync', remote };
+    }
+    if (remote?.kind === 'config') {
+      log('detectGroupType: no marker, but .meta/group.json declares kind=config → config-sync');
+      return { groupType: 'config-sync', remote };
+    }
+    log(`detectGroupType: no group-type file and no descriptor kind (new backend)`);
     return { groupType: null, remote };
   } finally {
     // Dispose the temporary backend

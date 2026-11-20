@@ -90,8 +90,8 @@ describe('config-sync group layout', () => {
     expect(descriptor.features.configHost).toBe(true);
 
     expect(decode(await repo.rootFS.promises.readFile('/.config/group-type'))).toBe('config-sync');
-    // Legacy mirror kept for one release cycle.
-    expect(decode(await repo.rootFS.promises.readFile('/.meta/group-type'))).toBe('config-sync');
+    // 0.7.18: legacy `.meta/group-type` 不再生成（见 group-type-authority.test.ts）
+    expect(await exists(repo.rootFS, '/.meta/group-type')).toBe(false);
 
     await repo.addBackend('cfg-b1', 'UnifyRemote', { label: 'cfg-b1' });
     // Backend descriptors live in `.meta/backends/` only — `.config/backends/`

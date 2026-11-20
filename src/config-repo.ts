@@ -2843,10 +2843,10 @@ export class ConfigRepo implements IConfigRepo {
       }
     }
     const bytes = new TextEncoder().encode(type);
-    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
-      if (await this.safeExists(this.cachedFS, path)) continue;
-      await this.ensureDir(path);
-      await this.cachedFS.writeFile(path, bytes);
+    // 只写新布局标记；legacy `.meta/group-type` 不再生成（读了它只作兼容）。
+    if (!(await this.safeExists(this.cachedFS, GROUP_TYPE_FILE))) {
+      await this.ensureDir(GROUP_TYPE_FILE);
+      await this.cachedFS.writeFile(GROUP_TYPE_FILE, bytes);
     }
     // Unified group descriptor (`.meta/group.json`) — written once, for both
     // kinds. Renames update it explicitly; launches must not rewrite it (that
@@ -4726,21 +4726,33 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 2b: Write group-type = "config-sync" (new `.config/` + legacy mirror)
+  // Step 2b: Write group-type = "config-sync" (new `.config/` layout)
   // -------------------------------------------------------------------
+  // 先看这个根自己的声明：`.meta/group.json` 是身份，标记只是它的缓存。
+  // 已经声明成数据组的根，不能被任何客户端顺手盖章成配置组 —— 那正是
+  // 「标记 config-sync + 描述符 kind=data」这种自相矛盾状态的来源。
+  const declaredIdentity = await readGroupDescriptor(primaryInstance);
+  if (declaredIdentity?.kind === 'data') {
+    throw new Error(
+      '[createConfigRepo] 该远端根的 .meta/group.json 声明为数据组'
+      + `（kind=data · id=${declaredIdentity.id ?? '?'}）——拒绝在这里初始化配置组。`
+      + '要给数据组换专属远端根，或在配置组侧解除对该根的绑定。',
+    );
+  }
   try {
     const groupTypeBytes = new TextEncoder().encode('config-sync');
-    for (const path of [`${CONFIG_DIR}/group-type`, `${META_DIR}/group-type`]) {
-      try {
-        await primaryInstance.readFile(path);
-      } catch {
-        await ensureParentDir(primaryInstance, path);
-        await primaryInstance.writeFile(path, groupTypeBytes);
-        log.log(`[createConfigRepo] group-type set to "config-sync" at ${path}`);
-      }
+    // 只写新布局 `.config/group-type`；legacy `.meta/group-type` 不再补写，
+    // 否则删掉一个还会有另一个「复活」，两个标记永远互相打架。
+    const markerPath = `${CONFIG_DIR}/group-type`;
+    try {
+      await primaryInstance.readFile(markerPath);
+    } catch {
+      await ensureParentDir(primaryInstance, markerPath);
+      await primaryInstance.writeFile(markerPath, groupTypeBytes);
+      log.log(`[createConfigRepo] group-type set to "config-sync" at ${markerPath}`);
     }
     // Unified descriptor (`.meta/group.json`) — shared by both group kinds.
-    if (!(await readGroupDescriptor(primaryInstance))) {
+    if (!declaredIdentity) {
       await writeGroupDescriptor(primaryInstance, {
         schemaVersion: 2,
         kind: 'config',
