@@ -84,16 +84,23 @@ describe('config-sync group layout', () => {
   it('writes .meta/group.json and config metadata under .config/ (with legacy mirrors)', async () => {
     const repo = await createConfigRepo('unify-config-layout', { nodeId: 'n1' });
 
-    const descriptor = JSON.parse(decode(await repo.rootFS.promises.readFile('/.meta/group.json')));
-    expect(descriptor.kind).toBe('config');
-    expect(descriptor.id).toBe('config');
-    expect(descriptor.features.configHost).toBe(true);
+    // 初始化不预置身份：一个后端都没接时 `.meta/group.json` 不落盘
+    expect(await exists(repo.rootFS, '/.meta/group.json')).toBe(false);
 
     expect(decode(await repo.rootFS.promises.readFile('/.config/group-type'))).toBe('config-sync');
     // 0.7.18: legacy `.meta/group-type` 不再生成（见 group-type-authority.test.ts）
     expect(await exists(repo.rootFS, '/.meta/group-type')).toBe(false);
 
     await repo.addBackend('cfg-b1', 'UnifyRemote', { label: 'cfg-b1' });
+    // 只登记后端不等于「已确定身份」——身份在真正需要时才落盘
+    expect(await exists(repo.rootFS, '/.meta/group.json')).toBe(false);
+    const instanceId = await (repo as any).ensureGroupInstanceId();
+    const descriptor = JSON.parse(decode(await repo.rootFS.promises.readFile('/.meta/group.json')));
+    expect(descriptor.kind).toBe('config');
+    expect(descriptor.id).toBe('config');
+    expect(descriptor.instanceId).toBe(instanceId);
+    expect(descriptor.features.configHost).toBe(true);
+
     // Backend descriptors live in `.meta/backends/` only — `.config/backends/`
     // is no longer read or written.
     expect(await exists(repo.rootFS, '/.meta/backends/cfg-b1.json')).toBe(true);
@@ -266,6 +273,35 @@ describe('data-sync group capabilities', () => {
 
     const keep = await group.purgeKeepFiles();
     expect(keep.failed).toEqual([]);
+
+    await repo.dispose();
+  });
+});
+
+describe('identity file is never content-synced', () => {
+  it('配置组与数据组的同步过滤器都固定排除 /.meta/group.json', async () => {
+    const repo = await createConfigRepo('unify-excl-filter', { nodeId: 'f1' });
+    expect((repo as any).syncFilter.excludePrefixes).toContain('/.meta/group.json');
+
+    const group = await repo.createAppDataGroup('g-excl-filter', []);
+    expect((group as any).syncFilter.excludePrefixes).toContain('/.meta/group.json');
+    await repo.dispose();
+  });
+
+  it('接入后端后同步不会把本地 .meta/group.json 推到副本', async () => {
+    const label = `excl-${Math.random().toString(36).slice(2, 8)}`;
+    const repo = await createConfigRepo(`unify-excl-${label}`, { nodeId: 'e1' });
+    await (repo as any).ensureGroupInstanceId();
+    await mkdirp(repo.rootFS, '/data');
+    await repo.rootFS.promises.writeFile('/data/note.txt', 'hello');
+
+    await repo.addBackend('cfg-excl', 'UnifyRemote', { label });
+
+    const remote = remotes.get(label)!;
+    // 普通内容照常同步
+    expect(await exists(remote as any, '/data/note.txt')).toBe(true);
+    // 身份文件不动 —— 否则身份就成了「谁最后写谁赢」
+    expect(await exists(remote as any, '/.meta/group.json')).toBe(false);
 
     await repo.dispose();
   });

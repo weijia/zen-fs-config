@@ -120,9 +120,9 @@ describe('B. 本地主根的描述符被污染时就地纠正', () => {
     const descriptor = JSON.parse(decode(await repo.rootFS.promises.readFile('/.meta/group.json')));
     expect(descriptor.kind).toBe('config');
     expect(descriptor.id).toBe('config');
-    // 被污染的 id 属于数据组，不能被当成自己的身份；这里会重新分配
-    expect(descriptor.instanceId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    expect(descriptor.instanceId).not.toBe('d25103f3-cdd4-401c-8bba-aaf3aaa99318');
+    // 只纠正 kind/id：instanceId 属于身份，换身份必须由用户拍板，
+    // 初始化阶段不得顺手派生新 UUID（那会给远端根引入第三个值）。
+    expect(descriptor.instanceId).toBe('d25103f3-cdd4-401c-8bba-aaf3aaa99318');
     expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBe('config-sync');
     expect(await readOrNull(repo.rootFS, '/.meta/group-type')).toBeNull();
     await repo.dispose();

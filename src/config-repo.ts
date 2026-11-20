@@ -444,7 +444,17 @@ export class ConfigRepo implements IConfigRepo {
    * 这些路径改由 processTombstones 主动删除，直到所有副本确认不存在、
    * 墓碑被 GC 之后才恢复同步。
    */
-  private readonly tombstoneExcludePrefixes: string[] = [];
+  /**
+   * 永不参与内容同步的元数据路径。
+   *
+   * `.meta/group.json` 是同步身份（kind/id/instanceId）的载体，只在身份流程里写：
+   * 建同步对时读它、认领/对齐时写它。一旦让普通内容同步（按 mtime 双向）
+   * 也去搬这个文件，身份就成了"谁最后写谁赢"——两台设备各持一个实例 ID 时会
+   * 互相覆盖，远端根的 instanceId 便会反复变化，且全程绕开 claim / 冲突判定。
+   * 所以这里固定排除，刷新墓碑排除表时也不得清掉。
+   */
+  private static readonly PERMANENT_SYNC_EXCLUSIONS = [GROUP_DESCRIPTOR_FILE];
+  private readonly tombstoneExcludePrefixes: string[] = [...ConfigRepo.PERMANENT_SYNC_EXCLUSIONS];
   private readonly syncFilter: SyncFilter = { excludePrefixes: this.tombstoneExcludePrefixes };
   /**
    * 本轮 processTombstones 中，各副本对墓碑路径"已确认不存在"的结果。
@@ -849,7 +859,8 @@ export class ConfigRepo implements IConfigRepo {
    * `filter.excludePrefixes`），所以这里原地更新即可生效。
    */
   private refreshSyncExclusions(tombstones: TombstoneMeta[]): void {
-    this.tombstoneExcludePrefixes.length = 0;
+    // 只清墓碑部分：永久排除项（身份文件）必须保留，否则身份会重新进入内容同步。
+    this.tombstoneExcludePrefixes.length = ConfigRepo.PERMANENT_SYNC_EXCLUSIONS.length;
     const add = (target: string) => {
       this.tombstoneExcludePrefixes.push(target, `${target}/`);
     };
@@ -3432,8 +3443,12 @@ class AppDataGroupImpl implements AppDataGroup {
    * 保留期内的墓碑路径不参与同步：否则副本上的残留会被当作"远端内容"逐文件
    * 拉回本地，把已删除的目录复活。数组与各同步对共享同一实例（zen-fs-sync
    * 每次检测时实时读取 `filter.excludePrefixes`），原地更新即可生效。
+   *
+   * 除墓碑外还固定排除 `.meta/group.json`：它是本组的同步身份，只允许身份流程
+   * 写入；让普通内容同步搬它，等于让"谁最后写谁赢"决定组身份。
    */
-  private readonly tombstoneExcludePrefixes: string[] = [...CONFIG_ONLY_PREFIXES];
+  private static readonly PERMANENT_SYNC_EXCLUSIONS = [...CONFIG_ONLY_PREFIXES, GROUP_DESCRIPTOR_FILE];
+  private readonly tombstoneExcludePrefixes: string[] = [...AppDataGroupImpl.PERMANENT_SYNC_EXCLUSIONS];
   private readonly syncFilter: SyncFilter = { excludePrefixes: this.tombstoneExcludePrefixes };
 
   constructor(
@@ -4317,8 +4332,7 @@ class AppDataGroupImpl implements AppDataGroup {
    * 参与同步。注意**不能**为 `.keep` 占位排除父目录，否则真实数据会被一起挡掉。
    */
   private refreshSyncExclusions(tombstones: TombstoneMeta[]): void {
-    this.tombstoneExcludePrefixes.length = 0;
-    this.tombstoneExcludePrefixes.push(...CONFIG_ONLY_PREFIXES);
+    this.tombstoneExcludePrefixes.length = AppDataGroupImpl.PERMANENT_SYNC_EXCLUSIONS.length;
     for (const tombstone of tombstones) {
       if (!tombstone.path) continue;
       this.tombstoneExcludePrefixes.push(tombstone.path, `${tombstone.path}/`);
@@ -4756,9 +4770,11 @@ export async function createConfigRepo(
       schemaVersion: 2,
       kind: 'config',
       id: CONFIG_GROUP_ID,
-      // 被污染的 instanceId 属于那个数据组，不能当成自己的身份继续用；
-      // 重新分配一个，界面上的「实例 ID 不一致」会提示用户拍板统一。
-      instanceId: newGroupInstanceId(),
+      // 只纠正 kind/id，instanceId 原样保留：换身份必须由用户拍板，
+      // 初始化阶段不得顺手派生新 UUID（那会给远端根引入第三个值）。
+      ...(isValidGroupInstanceId(declaredIdentity.instanceId)
+        ? { instanceId: declaredIdentity.instanceId }
+        : {}),
       ...(declaredIdentity.name ? { name: declaredIdentity.name } : {}),
       features: CONFIG_GROUP_FEATURES,
     });
@@ -4776,15 +4792,10 @@ export async function createConfigRepo(
       log.log(`[createConfigRepo] group-type set to "config-sync" at ${markerPath}`);
     }
     // Unified descriptor (`.meta/group.json`) — shared by both group kinds.
-    if (!declaredIdentity) {
-      await writeGroupDescriptor(primaryInstance, {
-        schemaVersion: 2,
-        kind: 'config',
-        id: CONFIG_GROUP_ID,
-        instanceId: newGroupInstanceId(),
-        features: CONFIG_GROUP_FEATURES,
-      });
-    }
+    // 初始化**不预置身份**：本组还一个后端都没接时不该凭空派生一个 instanceId，
+    // 否则新设备 / 清过本地库的客户端一打开就带着一个随机身份，同步上去后会把
+    // 远端根的身份顶掉。身份在「接入第一个后端」「用户显式设置」「沿用远端已有
+    // 身份」时才由 ensureGroupIdentity / 身份流程写入。
     // 旧布局遗留的 `.meta/group-type` 必须主动清掉：描述符已经写好了，
     // 这枚标记既是冗余，又会被配置组同步推回各个远端根（线上那台
     // golf-admin 根上「删了又复活」的 config-sync 就是它）。
