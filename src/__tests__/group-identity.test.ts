@@ -13,6 +13,8 @@ import { createConfigRepo } from '../config-repo';
 import { readGroupDescriptor, writeGroupDescriptor } from '../group-meta';
 import {
   bindRemoteGroupIdentity,
+  bindRemoteGroupIdentityDetailed,
+  resolveRemoteIdentity,
   isValidGroupInstanceId,
   newGroupInstanceId,
 } from '../group-identity';
@@ -136,6 +138,107 @@ describe('bindRemoteGroupIdentity', () => {
     const identity = { kind: 'data' as const, id: 'g1', instanceId: newGroupInstanceId() };
     expect(await bindRemoteGroupIdentity(remote, identity)).toBe('conflict');
     expect((await readGroupDescriptor(remote))?.instanceId).toBeUndefined();
+  });
+});
+
+describe('bindRemoteGroupIdentityDetailed — 冲突原因细分', () => {
+  it('kind 不同 → kind-mismatch，两侧身份都带回来', async () => {
+    const remote: any = await freshRemote('detail-kind');
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'config', id: 'config', instanceId: newGroupInstanceId(),
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await bindRemoteGroupIdentityDetailed(remote, identity);
+    expect(result.state).toBe('conflict');
+    expect(result.conflict).toBe('kind-mismatch');
+    expect(result.remote?.kind).toBe('config');
+    expect(result.local.id).toBe('remote-storage');
+  });
+
+  it('kind 相同但组 id 不同 → id-mismatch（同一根被另一个逻辑组占用）', async () => {
+    const remote: any = await freshRemote('detail-id');
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'data', id: 'default', instanceId: newGroupInstanceId(),
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await bindRemoteGroupIdentityDetailed(remote, identity);
+    expect(result.state).toBe('conflict');
+    expect(result.conflict).toBe('id-mismatch');
+  });
+
+  it('kind 与 id 都相同、只有实例身份不同 → instance-mismatch（可无损对齐）', async () => {
+    const remote: any = await freshRemote('detail-instance');
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'data', id: 'remote-storage', instanceId: newGroupInstanceId(),
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await bindRemoteGroupIdentityDetailed(remote, identity);
+    expect(result.state).toBe('conflict');
+    expect(result.conflict).toBe('instance-mismatch');
+    expect(result.remote?.id).toBe('remote-storage');
+  });
+
+  it('远端描述符读不到 → unreadable，不当作空仓库', async () => {
+    const remote: any = await freshRemote('detail-unreadable');
+    // 让 readFile 全部失败，模拟网络/权限问题
+    const broken = {
+      readFile: async () => { throw new Error('network down'); },
+      readdir: async () => [],
+    };
+    const identity = { kind: 'data' as const, id: 'g1', instanceId: newGroupInstanceId() };
+    const result = await bindRemoteGroupIdentityDetailed(broken as any, identity);
+    expect(result.state).toBe('conflict');
+    expect(result.conflict).toBe('unreadable');
+    expect(result.unreadable).toBe(true);
+  });
+});
+
+describe('resolveRemoteIdentity — 用户确认后的对齐', () => {
+  it('adopt-remote-instance：kind 与 id 相同时返回远端实例身份', async () => {
+    const remote: any = await freshRemote('adopt-ok');
+    const remoteInstanceId = newGroupInstanceId();
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'data', id: 'remote-storage', instanceId: remoteInstanceId,
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await resolveRemoteIdentity(remote, identity, 'adopt-remote-instance');
+    expect(result.ok).toBe(true);
+    expect(result.instanceId).toBe(remoteInstanceId);
+  });
+
+  it('adopt-remote-instance：组 id 不同时拒绝（不把别的逻辑组的根认成自己的）', async () => {
+    const remote: any = await freshRemote('adopt-id-diff');
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'data', id: 'default', instanceId: newGroupInstanceId(),
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await resolveRemoteIdentity(remote, identity, 'adopt-remote-instance');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('组 id');
+  });
+
+  it('rewrite-remote-identity：kind 相同则把远端改写成本组身份', async () => {
+    const remote: any = await freshRemote('rewrite-ok');
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'data', id: 'default', instanceId: newGroupInstanceId(),
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await resolveRemoteIdentity(remote, identity, 'rewrite-remote-identity');
+    expect(result.ok).toBe(true);
+    const desc = await readGroupDescriptor(remote);
+    expect(desc?.id).toBe('remote-storage');
+    expect(desc?.instanceId).toBe(identity.instanceId);
+  });
+
+  it('rewrite-remote-identity：kind 不同时拒绝改写', async () => {
+    const remote: any = await freshRemote('rewrite-kind-diff');
+    await writeGroupDescriptor(remote, {
+      schemaVersion: 2, kind: 'config', id: 'config', instanceId: newGroupInstanceId(),
+    });
+    const identity = { kind: 'data' as const, id: 'remote-storage', instanceId: newGroupInstanceId() };
+    const result = await resolveRemoteIdentity(remote, identity, 'rewrite-remote-identity');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('kind');
   });
 });
 

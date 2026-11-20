@@ -20,6 +20,9 @@ import type {
   ConflictArchive,
   SyncGroupFeatures,
   TombstoneMeta,
+  BackendConflictInfo,
+  BackendConflictResolution,
+  BackendConflictResolutionResult,
 } from './types';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, type BackendInstance } from './backend-registry';
@@ -186,6 +189,29 @@ export class DataSyncGroup implements AppDataGroup {
 
   listSkippedBackends(): { backendId: string; reason: string }[] {
     return Array.from(this.skippedBackends, ([backendId, reason]) => ({ backendId, reason }));
+  }
+
+  /** 已弃用的独立数据组：只保留兼容实现，不提供冲突对齐动作。 */
+  listBackendConflicts(): BackendConflictInfo[] {
+    return Array.from(this.skippedBackends, ([backendId, reason]) => ({
+      backendId,
+      reason,
+      remote: null,
+      local: { kind: 'data', id: this.groupId, instanceId: this.instanceId },
+      canAdoptRemoteInstance: false,
+      canRewriteRemoteIdentity: false,
+    }));
+  }
+
+  async resolveBackendConflict(
+    _backendId: string,
+    mode: BackendConflictResolution,
+  ): Promise<BackendConflictResolutionResult> {
+    return {
+      mode,
+      ok: false,
+      reason: '独立的 createDataSyncGroup 已弃用：请通过配置组（IConfigRepo）管理数据组后再对齐身份',
+    };
   }
 
   /**

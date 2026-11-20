@@ -370,6 +370,52 @@ export interface GroupDescriptor {
  *     `/nodes`、`/shared`。
  * 两个能力位互不蕴含。
  */
+/** 归属冲突的细分原因。 */
+export type BackendConflictReason =
+  | 'kind-mismatch'
+  | 'id-mismatch'
+  | 'instance-mismatch'
+  | 'unreadable'
+  | 'claim-failed';
+
+/**
+ * 一个后端与远端根归属冲突的完整信息。
+ *
+ * `kind` / `id` / `instanceId` 三者用途不同，必须同时展示：
+ *   - `kind`：组类型（config / data）；
+ *   - `id`：组 id（同时决定本地库名与引导副本路径）；
+ *   - `instanceId`：组实例身份（UUID，判定“这个远端根归谁”）。
+ */
+export interface BackendConflictInfo {
+  backendId: string;
+  /** 一句话原因（已含两侧身份摘要，可直接展示）。 */
+  reason: string;
+  conflict?: BackendConflictReason;
+  /** 远端根的现状；空仓库或读不到时为 null。 */
+  remote: { kind?: SyncGroupKind; id?: string; instanceId?: string; name?: string } | null;
+  /** 本组身份。 */
+  local: { kind: SyncGroupKind; id: string; instanceId?: string };
+  /** 允许“只把本地 instanceId 对齐到远端”（要求 kind 与 id 都相同）。 */
+  canAdoptRemoteInstance: boolean;
+  /** 允许“把远端 group.json 改写成本组身份”（要求 kind 相同；会影响共享该根的副本）。 */
+  canRewriteRemoteIdentity: boolean;
+  unreadable?: boolean;
+  error?: string;
+}
+
+/** 用户确认后的冲突解决动作。 */
+export type BackendConflictResolution =
+  | 'adopt-remote-instance'
+  | 'rewrite-remote-identity';
+
+export interface BackendConflictResolutionResult {
+  mode: BackendConflictResolution;
+  ok: boolean;
+  reason?: string;
+  /** adopt-remote-instance 成功后应落盘的本地 instanceId。 */
+  instanceId?: string;
+}
+
 export interface SyncGroupHandle {
   readonly groupId: string;
   readonly appId: string;
@@ -384,6 +430,19 @@ export interface SyncGroupHandle {
   getGroupInstanceId(): string | undefined;
   /** 因归属其他同步组而被跳过的后端（不建同步对）。 */
   listSkippedBackends(): { backendId: string; reason: string }[];
+  /**
+   * 归属冲突的完整信息（含两侧 kind / id / instanceId 与可执行的对齐动作）。
+   * UI 应展示这些字段让用户判断，而不是只给一句“不一致”。
+   */
+  listBackendConflicts(): BackendConflictInfo[];
+  /**
+   * 用户确认后解决某个后端的归属冲突。
+   * 调用方负责二次确认，并在成功后重新连接/刷新（本组实例需要重新 init）。
+   */
+  resolveBackendConflict(
+    backendId: string,
+    mode: BackendConflictResolution,
+  ): Promise<BackendConflictResolutionResult>;
 
   /**
    * Direct fs view of the group root. `.config/` is hidden (config-sync

@@ -17,6 +17,15 @@ import type {
 import { createConfigRepo } from './config-repo';
 import { createBackend } from './backend-registry';
 import { createLogger } from './logger';
+import { readGroupDescriptor } from './group-meta';
+import {
+  isValidGroupInstanceId,
+  summarizeIdentity,
+  type RemoteIdentitySnapshot,
+} from './group-identity';
+
+const isInstanceIdLike = (value: unknown): value is string =>
+  typeof value === 'string' && isValidGroupInstanceId(value);
 
 const log = createLogger('connect');
 
@@ -33,10 +42,41 @@ async function detectGroupType(
   type: string,
   options: Record<string, unknown>,
 ): Promise<SyncGroupType | null> {
+  const detail = await detectGroupTypeDetailed(type, options);
+  return detail.groupType;
+}
+
+/**
+ * 类型探测的详细版：同时读远端 `.meta/group.json`，把「这个根到底被谁占了」
+ * （kind / id / instanceId）带回来，供错误信息与界面直接展示。
+ */
+async function detectGroupTypeDetailed(
+  type: string,
+  options: Record<string, unknown>,
+): Promise<{ groupType: SyncGroupType | null; remote: RemoteIdentitySnapshot | null }> {
   log(`detectGroupType: connecting to ${type}...`);
 
   // Create a temporary backend instance to read group-type
   const tempBackend = await createBackend({ type, options });
+
+  let remote: RemoteIdentitySnapshot | null = null;
+  try {
+    try {
+      const descriptor = await readGroupDescriptor(tempBackend);
+      if (descriptor) {
+        remote = {
+          kind: descriptor.kind,
+          id: descriptor.id,
+          instanceId: isInstanceIdLike(descriptor.instanceId) ? descriptor.instanceId : undefined,
+          ...(descriptor.name ? { name: descriptor.name } : {}),
+        };
+      }
+    } catch {
+      /* 读不到描述符不影响类型探测，但信息就是缺的，UI 会看到无描述符 */
+    }
+  } finally {
+    /* dispose 在下面的 finally 统一做 */
+  }
 
   try {
     for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
@@ -45,16 +85,16 @@ async function detectGroupType(
         const groupType = (raw as string).trim() as SyncGroupType;
         if (groupType === 'config-sync' || groupType === 'data-sync') {
           log(`detectGroupType: detected "${groupType}" at ${path}`);
-          return groupType;
+          return { groupType, remote };
         }
         log(`detectGroupType: unknown group-type value "${groupType}" at ${path}, treating as null`);
-        return null;
+        return { groupType: null, remote };
       } catch {
         // Try the next layout.
       }
     }
     log(`detectGroupType: no group-type file found (new backend)`);
-    return null;
+    return { groupType: null, remote };
   } finally {
     // Dispose the temporary backend
     if (tempBackend?.dispose) {
@@ -139,14 +179,19 @@ export async function connect(
   // Case 2: backendInfo provided — detect group type from remote
   // -----------------------------------------------------------------
   const { type, options: backendOptions } = options.backendInfo;
-  const detectedType = await detectGroupType(type, backendOptions);
+  const detected = await detectGroupTypeDetailed(type, backendOptions);
+  const detectedType = detected.groupType;
 
   let groupType: SyncGroupType;
   if (detectedType) {
     // Remote backend already has a group-type
     if (options.groupType && options.groupType !== detectedType) {
+      const remoteText = summarizeIdentity(detected.remote);
+      const advice = detectedType === 'config-sync'
+        ? '该远端根已被一个配置组占用：请给数据组换一个专属的远端根，或在配置组侧解除对该根的绑定'
+        : '该远端根已被一个数据组占用：请给配置组换一个远端根，或删除那个数据组后端';
       throw new Error(
-        `Group type mismatch: remote backend is "${detectedType}" but options.groupType is "${options.groupType}"`,
+        `Group type mismatch: 远端标记为 "${detectedType}"（${remoteText}），本端要求 "${options.groupType}"。${advice}`,
       );
     }
     groupType = detectedType;

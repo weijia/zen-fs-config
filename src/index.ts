@@ -36,6 +36,26 @@ export type {
   PurgeLocalSyncConfigResult,
 } from './local-purge';
 
+// 组身份（同步边界）：冲突详情与用户确认后的对齐动作
+export {
+  bindRemoteGroupIdentity,
+  bindRemoteGroupIdentityDetailed,
+  resolveRemoteIdentity,
+  summarizeIdentity,
+  shortInstanceId,
+  newGroupInstanceId,
+  isValidGroupInstanceId,
+} from './group-identity';
+export type {
+  GroupIdentity,
+  IdentityBindingResult,
+  IdentityConflictReason,
+  IdentityResolutionMode,
+  IdentityResolutionResult,
+  RemoteIdentitySnapshot,
+  RemoteIdentityState,
+} from './group-identity';
+
 // Unified connect entry point — the single recommended external entry.
 // Data-sync groups are always managed by a config-sync repo (decision A / T5);
 // the standalone `createDataSyncGroup` factory is deprecated and NOT exported.
@@ -107,6 +127,10 @@ export type {
   BackendSyncState,
   ConnectOptions,
   ConnectResult,
+  BackendConflictReason,
+  BackendConflictInfo,
+  BackendConflictResolution,
+  BackendConflictResolutionResult,
 } from './types';
 
 // Re-export SyncResult and SyncPairStatus from zen-fs-sync for convenience

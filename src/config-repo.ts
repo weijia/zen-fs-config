@@ -31,6 +31,9 @@ import type {
   ConfigSyncGroupDescriptor,
   BackendSyncState,
   CacheOptions,
+  BackendConflictInfo,
+  BackendConflictResolution,
+  BackendConflictResolutionResult,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
@@ -46,13 +49,42 @@ import {
 } from './errors';
 import { createLogger } from '@richard432/localstorage-logger';
 import {
-  bindRemoteGroupIdentity,
+  bindRemoteGroupIdentityDetailed,
   isValidGroupInstanceId,
   newGroupInstanceId,
   pickInstanceId,
+  resolveRemoteIdentity,
+  summarizeIdentity,
   type GroupIdentity,
+  type IdentityResolutionMode,
+  type IdentityResolutionResult,
 } from './group-identity';
 import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
+
+/** 把归属校验结果翻译成一句含两侧身份的可展示文案。 */
+function describeConflict(result: {
+  conflict?: string;
+  remote: { kind?: string; id?: string; instanceId?: string } | null;
+  local: { kind?: string; id?: string; instanceId?: string };
+  error?: string;
+}): string {
+  const remote = summarizeIdentity(result.remote);
+  const local = summarizeIdentity(result.local);
+  switch (result.conflict) {
+    case 'kind-mismatch':
+      return `组类型不一致：远端 ${remote}，本组 ${local}。该远端根已被另一类组占用，已跳过该后端`;
+    case 'id-mismatch':
+      return `组 id 不一致：远端 ${remote}，本组 ${local}。同一远端根被另一个逻辑组占用，已跳过该后端`;
+    case 'instance-mismatch':
+      return `实例身份不一致：远端 ${remote}，本组 ${local}。已跳过该后端（确认后可在界面上对齐）`;
+    case 'unreadable':
+      return `远端 group.json 读不到（${result.error ?? '未知错误'}），无法判断归属，已跳过该后端`;
+    case 'claim-failed':
+      return `认领远端根失败（${result.error ?? '未知错误'}），已跳过该后端`;
+    default:
+      return `远端根归属冲突：远端 ${remote}，本组 ${local}`;
+  }
+}
 import { purgeMtimeSidecars, isMtimeSidecar, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
 import { migrateVersionSidecars, type VersionMigrationResult } from './version-migration';
@@ -422,6 +454,8 @@ export class ConfigRepo implements IConfigRepo {
   private instanceId?: string;
   /** 因归属他人而被跳过的后端 id → 原因，供 UI 展示。 */
   private skippedBackends = new Map<string, string>();
+  /** 归属冲突的完整信息（两侧 kind / id / instanceId + 可执行动作）。 */
+  private backendConflicts = new Map<string, BackendConflictInfo>();
   /** Last known backend descriptors, for the synchronous unified handle API. */
   private backendDescriptorCache: AppDataBackendDescriptor[] = [];
   /**
@@ -2545,18 +2579,41 @@ export class ConfigRepo implements IConfigRepo {
   ): Promise<'match' | 'claimed' | 'conflict'> {
     try {
       const identity = await this.ensureGroupIdentity();
-      const state = await bindRemoteGroupIdentity(instance, identity);
-      if (state === 'conflict') {
-        this.skippedBackends.set(
+      const result = await bindRemoteGroupIdentityDetailed(instance, identity);
+      if (result.state === 'conflict') {
+        this.skippedBackends.set(backendId, describeConflict(result));
+        this.backendConflicts.set(backendId, {
           backendId,
-          `远端根属于另一个同步组（instanceId 不一致），已跳过该后端`,
-        );
+          reason: describeConflict(result),
+          ...(result.conflict ? { conflict: result.conflict } : {}),
+          remote: result.remote,
+          local: { kind: identity.kind, id: identity.id, instanceId: identity.instanceId },
+          canAdoptRemoteInstance:
+            !!result.remote?.instanceId
+            && result.remote.kind === identity.kind
+            && result.remote.id === identity.id,
+          canRewriteRemoteIdentity: result.remote ? result.remote.kind === identity.kind : false,
+          ...(result.unreadable ? { unreadable: true } : {}),
+          ...(result.error ? { error: result.error } : {}),
+        });
+      } else {
+        this.skippedBackends.delete(backendId);
+        this.backendConflicts.delete(backendId);
       }
-      return state;
+      return result.state;
     } catch (err) {
       // 读不到远端描述符（网络/权限）时不能默认放行：跳过比误合并安全。
       log.warn(`[ConfigRepo] identity check failed for backend "${backendId}", skipping it:`, err);
-      this.skippedBackends.set(backendId, `归属校验失败：${(err as Error)?.message ?? String(err)}`);
+      const message = (err as Error)?.message ?? String(err);
+      this.skippedBackends.set(backendId, `归属校验失败：${message}`);
+      this.backendConflicts.set(backendId, {
+        backendId,
+        reason: `归属校验失败：${message}`,
+        remote: null,
+        local: { kind: 'config', id: CONFIG_GROUP_ID, instanceId: this.instanceId },
+        canAdoptRemoteInstance: false,
+        canRewriteRemoteIdentity: false,
+      });
       return 'conflict';
     }
   }
@@ -2564,6 +2621,55 @@ export class ConfigRepo implements IConfigRepo {
   /** 因归属他人而被跳过的后端（id → 原因）。 */
   listSkippedBackends(): { backendId: string; reason: string }[] {
     return Array.from(this.skippedBackends, ([backendId, reason]) => ({ backendId, reason }));
+  }
+
+  /** 归属冲突的完整信息（配置组也会被别的组占用同一个根）。 */
+  listBackendConflicts(): BackendConflictInfo[] {
+    return Array.from(this.backendConflicts.values());
+  }
+
+  /** 用户确认后解决配置组某个后端的归属冲突。 */
+  async resolveBackendConflict(
+    backendId: string,
+    mode: BackendConflictResolution,
+  ): Promise<BackendConflictResolutionResult> {
+    const identity = await this.ensureGroupIdentity();
+    const desc = (this.backendDescriptorCache ?? []).find((b) => b.id === backendId);
+    if (!desc) {
+      return { mode, ok: false, reason: `找不到后端 ${backendId}（可能已被删除）` };
+    }
+    let instance: any;
+    try {
+      instance = await createBackend({ type: desc.type, options: desc.options });
+    } catch (err) {
+      return { mode, ok: false, reason: `创建后端失败：${(err as Error)?.message ?? String(err)}` };
+    }
+    try {
+      const result = await resolveRemoteIdentity(instance, identity, mode);
+      if (!result.ok) return { mode, ok: false, ...(result.reason ? { reason: result.reason } : {}) };
+      if (mode === 'adopt-remote-instance' && result.instanceId) {
+        this.instanceId = result.instanceId;
+        try {
+          await writeGroupDescriptor(this.cachedFS, {
+            schemaVersion: 2,
+            kind: identity.kind,
+            id: identity.id,
+            instanceId: this.instanceId,
+            ...(this.name ? { name: this.name } : {}),
+            features: CONFIG_GROUP_FEATURES,
+          });
+        } catch (err) {
+          log.warn('[ConfigRepo] failed to persist adopted instanceId:', err);
+        }
+      }
+      this.backendConflicts.delete(backendId);
+      this.skippedBackends.delete(backendId);
+      return { mode, ok: true, ...(result.instanceId ? { instanceId: result.instanceId } : {}) };
+    } catch (err) {
+      return { mode, ok: false, reason: `对齐失败：${(err as Error)?.message ?? String(err)}` };
+    } finally {
+      try { await instance.dispose?.(); } catch { /* best effort */ }
+    }
   }
 
   /** Write the group-type marker file if it doesn't exist. */
@@ -2816,18 +2922,20 @@ export class ConfigRepo implements IConfigRepo {
   async updateAppDataGroupDescriptor(
     id: string,
     backends: AppDataBackendDescriptor[],
-    meta?: { name?: string; features?: Partial<SyncGroupFeatures> },
+    meta?: { name?: string; features?: Partial<SyncGroupFeatures>; instanceId?: string },
   ): Promise<void> {
     this.assertNotDisposed();
     // 保留显示名、能力位与组实例身份：增删后端不能把它们抹掉（实例身份
     // 一旦丢失/被换掉，远端归属校验就会误判成「别人的仓库」）。
+    // 唯一例外是 meta.instanceId：用户确认「采用远端身份」后要显式覆盖。
     const existing = await this.readAppDataGroupDescriptor(id);
     const name = meta?.name ?? existing?.name;
     const features = meta?.features ?? existing?.features;
     const liveGroup = this.appDataGroups.get(id);
     const liveInstanceId = liveGroup?.getGroupInstanceId();
-    const instanceId = pickInstanceId(existing)
-      ?? (isValidGroupInstanceId(liveInstanceId) ? liveInstanceId : undefined);
+    const instanceId = isValidGroupInstanceId(meta?.instanceId)
+      ? meta!.instanceId
+      : pickInstanceId(existing) ?? (isValidGroupInstanceId(liveInstanceId) ? liveInstanceId : undefined);
     const descriptor: AppDataGroupDescriptor = {
       id,
       groupType: 'data-sync',
@@ -3199,6 +3307,8 @@ class AppDataGroupImpl implements AppDataGroup {
   private instanceId?: string;
   /** 因归属他人而被跳过的后端 id → 原因。 */
   private skippedBackends = new Map<string, string>();
+  /** 归属冲突的完整信息（两侧 kind / id / instanceId + 可执行动作）。 */
+  private backendConflicts = new Map<string, BackendConflictInfo>();
   private _pollIntervalMs?: number;
   private _backendsAreAuthoritative: boolean;
   /** 引导副本（`.config/` 里的描述符）原有的能力位，用于回刷时不丢信息。 */
@@ -3349,30 +3459,131 @@ class AppDataGroupImpl implements AppDataGroup {
   ): Promise<'match' | 'claimed' | 'conflict'> {
     if (!this.instanceId) {
       this.skippedBackends.set(backendId, '本组尚未分配 instanceId，已跳过该后端');
+      this.backendConflicts.set(backendId, {
+        backendId,
+        reason: '本组尚未分配 instanceId，已跳过该后端',
+        remote: null,
+        local: { kind: 'data', id: this.groupId, instanceId: undefined },
+        canAdoptRemoteInstance: false,
+        canRewriteRemoteIdentity: false,
+      });
       return 'conflict';
     }
     try {
-      const state = await bindRemoteGroupIdentity(instance, {
+      const identity: GroupIdentity = {
         kind: 'data',
         id: this.groupId,
         instanceId: this.instanceId,
         ...(this.name ? { name: this.name } : {}),
         features: this.features,
-      });
-      if (state === 'conflict') {
-        this.skippedBackends.set(
+      };
+      const result = await bindRemoteGroupIdentityDetailed(instance, identity);
+      if (result.state === 'conflict') {
+        this.skippedBackends.set(backendId, describeConflict(result));
+        this.backendConflicts.set(backendId, {
           backendId,
-          '远端根属于另一个同步组（instanceId 不一致），已跳过该后端',
-        );
+          reason: describeConflict(result),
+          ...(result.conflict ? { conflict: result.conflict } : {}),
+          remote: result.remote,
+          local: { kind: 'data', id: this.groupId, instanceId: this.instanceId },
+          // 只对齐 instanceId：要求 kind 与 id 都相同（同一个逻辑组，只有身份不同）。
+          canAdoptRemoteInstance:
+            !!result.remote?.instanceId
+            && result.remote.kind === 'data'
+            && result.remote.id === this.groupId,
+          // 改写远端：要求 kind 相同（组 id 不同才需要它，代价是动了共享的远端根）。
+          canRewriteRemoteIdentity: result.remote ? result.remote.kind === 'data' : false,
+          ...(result.unreadable ? { unreadable: true } : {}),
+          ...(result.error ? { error: result.error } : {}),
+        });
         log.warn(
           `[AppDataGroup:${this.groupId}] backend "${backendId}" belongs to another sync group — sync pair skipped`,
         );
+      } else {
+        this.skippedBackends.delete(backendId);
+        this.backendConflicts.delete(backendId);
       }
-      return state;
+      return result.state;
     } catch (err) {
       log.warn(`[AppDataGroup:${this.groupId}] ownership check failed for "${backendId}":`, err);
-      this.skippedBackends.set(backendId, `归属校验失败：${(err as Error)?.message ?? String(err)}`);
+      const message = (err as Error)?.message ?? String(err);
+      this.skippedBackends.set(backendId, `归属校验失败：${message}`);
+      this.backendConflicts.set(backendId, {
+        backendId,
+        reason: `归属校验失败：${message}`,
+        remote: null,
+        local: { kind: 'data', id: this.groupId, instanceId: this.instanceId },
+        canAdoptRemoteInstance: false,
+        canRewriteRemoteIdentity: false,
+      });
       return 'conflict';
+    }
+  }
+
+  /** 归属冲突的完整信息（UI 直接展示两侧身份，不用猜）。 */
+  listBackendConflicts(): BackendConflictInfo[] {
+    return Array.from(this.backendConflicts.values());
+  }
+
+  /**
+   * 用户确认后解决归属冲突。
+   *
+   * - `adopt-remote-instance`：只把本地 instanceId 对齐成远端值（本地库名、
+   *   引导副本路径都不变），随后重写 `.meta/group.json` 与引导副本。
+   * - `rewrite-remote-identity`：把远端 `group.json` 改写成本组的 kind/id/
+   *   instanceId。会影响到共享该远端根的其它副本，调用方必须先警告用户。
+   *
+   * 成功后冲突记录被移除；调用方应重新连接（本组需要重新 init 才能建对）。
+   */
+  async resolveBackendConflict(
+    backendId: string,
+    mode: BackendConflictResolution,
+  ): Promise<BackendConflictResolutionResult> {
+    if (!this.instanceId) {
+      return { mode, ok: false, reason: '本组尚未分配 instanceId，无法对齐' };
+    }
+    const desc = this._backends?.find((b) => b.id === backendId);
+    if (!desc) {
+      return { mode, ok: false, reason: `找不到后端 ${backendId}（可能已被删除）` };
+    }
+    let instance: any;
+    try {
+      instance = await createBackend({ type: desc.type, options: desc.options });
+    } catch (err) {
+      return { mode, ok: false, reason: `创建后端失败：${(err as Error)?.message ?? String(err)}` };
+    }
+    try {
+      const identity: GroupIdentity = {
+        kind: 'data',
+        id: this.groupId,
+        instanceId: this.instanceId,
+        ...(this.name ? { name: this.name } : {}),
+        features: this.features,
+      };
+      const result: IdentityResolutionResult = await resolveRemoteIdentity(instance, identity, mode);
+      if (!result.ok) return { mode, ok: false, ...(result.reason ? { reason: result.reason } : {}) };
+
+      if (mode === 'adopt-remote-instance' && result.instanceId) {
+        this.instanceId = result.instanceId;
+        // 本地记录：`.meta/group.json` + 引导副本（后者决定新页面/新标签认到什么身份）。
+        await this.writeOwnGroupDescriptor();
+        try {
+          await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends ?? [], {
+            name: this.name,
+            features: this._declaredFeatures,
+            instanceId: this.instanceId,
+          });
+        } catch (err) {
+          log.warn(`[AppDataGroup:${this.groupId}] failed to update bootstrap descriptor instanceId:`, err);
+        }
+      }
+      this.backendConflicts.delete(backendId);
+      this.skippedBackends.delete(backendId);
+      return { mode, ok: true, ...(result.instanceId ? { instanceId: result.instanceId } : {}) };
+    } catch (err) {
+      return { mode, ok: false, reason: `对齐失败：${(err as Error)?.message ?? String(err)}` };
+    } finally {
+      try { await instance.dispose?.(); } catch { /* best effort */ }
     }
   }
 

@@ -501,6 +501,38 @@ export async function readGroupDescriptor(fs: MetaFS): Promise<GroupDescriptor |
   return rest as GroupDescriptor;
 }
 
+/** 该错误是否表示“文件不存在”（而不是网络/权限失败）。 */
+export function isNotFoundError(err: unknown): boolean {
+  const e = err as { code?: string; name?: string; errno?: number; message?: string } | null;
+  if (!e) return false;
+  if (e.code === 'ENOENT' || e.code === 'ENOTDIR' || e.name === 'NotFoundError' || e.errno === -2) return true;
+  return /no such file|not found|不存在/i.test(String(e.message ?? ''));
+}
+
+/**
+ * 严格版读取：**只**把「文件不存在」当作 null，其它错误（网络 / 权限 / 解码）
+ * 一律抛出。
+ *
+ * 归属校验必须用它——否则「远端读不到」会被当成「空仓库」进而尝试认领，
+ * 把小故障误当成新仓库。
+ */
+export async function readGroupDescriptorStrict(fs: MetaFS): Promise<GroupDescriptor | null> {
+  let raw: string;
+  try {
+    raw = new TextDecoder().decode(toBytes(await fs.readFile(GROUP_DESCRIPTOR_FILE)));
+  } catch (err) {
+    if (isNotFoundError(err)) return null;
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(raw) as GroupDescriptor & { updatedAt?: number };
+    const { updatedAt: _ignored, ...rest } = parsed;
+    return rest as GroupDescriptor;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Write `.meta/group.json`.
  *
