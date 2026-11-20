@@ -113,7 +113,12 @@ export interface IdentityBindingResult {
   error?: string;
 }
 
-/** `kind=config · id=config · 实例 ID 665532a0…` 这类一行摘要。 */
+/**
+ * `kind=config · id=config · 实例 ID 665532a0-…` 这类一行摘要。
+ *
+ * 实例 ID **给完整 UUID**：界面上要靠它区分「是同一个还是另一个」，
+ * 截成前 8 位反而让人没法核对（`…` 也容易被误当成「同一个」）。
+ */
 export function summarizeIdentity(
   identity: { kind?: string; id?: string; instanceId?: string } | null | undefined,
 ): string {
@@ -121,7 +126,7 @@ export function summarizeIdentity(
   const parts = [
     `kind=${identity.kind ?? '?'}`,
     `id=${identity.id ?? '?'}`,
-    `实例 ID=${identity.instanceId ? shortInstanceId(identity.instanceId) : '（无）'}`,
+    `实例 ID=${identity.instanceId ?? '（无）'}`,
   ];
   return parts.join(' · ');
 }
