@@ -131,6 +131,11 @@ export type {
   BackendConflictInfo,
   BackendConflictResolution,
   BackendConflictResolutionResult,
+  IdentityCandidateSource,
+  IdentityCandidate,
+  SetGroupInstanceIdOptions,
+  SetGroupInstanceIdResult,
+  GroupInstanceIdRootResult,
 } from './types';
 
 // Re-export SyncResult and SyncPairStatus from zen-fs-sync for convenience

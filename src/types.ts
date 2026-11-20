@@ -416,6 +416,51 @@ export interface BackendConflictResolutionResult {
   instanceId?: string;
 }
 
+/** `instanceId` 的候选来源：本地描述符 / 共享引导副本 / 某个远端根。 */
+export type IdentityCandidateSource = 'local' | 'bootstrap' | 'remote';
+
+/**
+ * 一条身份候选。同一值可能被多个根持有，用 `rootCount` 表示。
+ * 界面必须把它们全部列出，由用户决定本组最终使用哪个值。
+ */
+export interface IdentityCandidate {
+  source: IdentityCandidateSource;
+  /** 远端候选对应的后端 id（local / bootstrap 无此字段）。 */
+  backendId?: string;
+  instanceId: string;
+  /** 持有该值的根数量（local / bootstrap 为 1）。 */
+  rootCount: number;
+  /** 该值所属的 kind / id；与本组不一致的候选已在收集阶段被排除。 */
+  kind?: SyncGroupKind;
+  id?: string;
+}
+
+/** 用户决定本组实例身份时的选项。 */
+export interface SetGroupInstanceIdOptions {
+  /**
+   * 同时把本组所有 `kind` / `id` 相同的远端根统一成该值（默认 false）。
+   * 这是唯一会改写远端 `group.json` 的路径，必须由用户确认后调用。
+   */
+  rewriteRoots?: boolean;
+}
+
+/** 逐个远端根的写回结果。 */
+export interface GroupInstanceIdRootResult {
+  backendId: string;
+  ok: boolean;
+  /** 该根原本的 instanceId（用于如实汇报“从什么改成什么”）。 */
+  before?: string;
+  reason?: string;
+}
+
+export interface SetGroupInstanceIdResult {
+  ok: boolean;
+  instanceId?: string;
+  reason?: string;
+  /** 各根的处理结果（`rewriteRoots: true` 时逐条返回）。 */
+  roots: GroupInstanceIdRootResult[];
+}
+
 export interface SyncGroupHandle {
   readonly groupId: string;
   readonly appId: string;
@@ -443,6 +488,24 @@ export interface SyncGroupHandle {
     backendId: string,
     mode: BackendConflictResolution,
   ): Promise<BackendConflictResolutionResult>;
+  /**
+   * 本组 `instanceId` 的全部候选（本地 / 引导副本 / 每个远端根）。
+   * 不一致时界面必须让用户挑一个，不允许代码静默择一。
+   */
+  getIdentityCandidates(): IdentityCandidate[];
+  /**
+   * 候选之间是否互相矛盾（需要用户在界面上拍板）。
+   * 可选：老版本实现可能没有这个方法，调用方按候选去重自行判断。
+   */
+  isIdentityUnsettled?(): boolean;
+  /**
+   * 用户确认后的唯一写入口：把本组身份设成指定值。
+   * `rewriteRoots: true` 时一并把本组所有 kind/id 相同的根统一成该值。
+   */
+  setGroupInstanceId(
+    instanceId: string,
+    options?: SetGroupInstanceIdOptions,
+  ): Promise<SetGroupInstanceIdResult>;
 
   /**
    * Direct fs view of the group root. `.config/` is hidden (config-sync

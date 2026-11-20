@@ -23,6 +23,9 @@ import type {
   BackendConflictInfo,
   BackendConflictResolution,
   BackendConflictResolutionResult,
+  IdentityCandidate,
+  SetGroupInstanceIdOptions,
+  SetGroupInstanceIdResult,
 } from './types';
 import { backendToSyncableFS } from './adapters';
 import { createBackend, type BackendInstance } from './backend-registry';
@@ -212,6 +215,32 @@ export class DataSyncGroup implements AppDataGroup {
       ok: false,
       reason: '独立的 createDataSyncGroup 已弃用：请通过配置组（IConfigRepo）管理数据组后再对齐身份',
     };
+  }
+
+  /** 已弃用路径：独立数据组只在本地描述符里有一个候选，没有人群对齐能力。 */
+  getIdentityCandidates(): IdentityCandidate[] {
+    if (!this.instanceId) return [];
+    return [{ source: 'local', instanceId: this.instanceId, rootCount: 1, kind: 'data', id: this.groupId }];
+  }
+
+  /** 已弃用路径：只写本地 `group.json`，不改写任何远端根。 */
+  async setGroupInstanceId(
+    instanceId: string,
+    _options: SetGroupInstanceIdOptions = {},
+  ): Promise<SetGroupInstanceIdResult> {
+    if (!isValidGroupInstanceId(instanceId)) {
+      return { ok: false, reason: '不是合法的 UUID v4', roots: [] };
+    }
+    this.instanceId = instanceId;
+    await writeGroupDescriptor(this.localFS, {
+      schemaVersion: 2,
+      kind: 'data',
+      id: this.groupId,
+      instanceId,
+      ...(this.name ? { name: this.name } : {}),
+      features: this.features,
+    });
+    return { ok: true, instanceId, roots: [] };
   }
 
   /**

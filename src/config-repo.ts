@@ -34,6 +34,10 @@ import type {
   BackendConflictInfo,
   BackendConflictResolution,
   BackendConflictResolutionResult,
+  IdentityCandidate,
+  SetGroupInstanceIdOptions,
+  SetGroupInstanceIdResult,
+  GroupInstanceIdRootResult,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
@@ -100,6 +104,7 @@ import {
   encodeMetaPath,
   ensureParentDir,
   readGroupDescriptor,
+  readGroupDescriptorStrict,
   writeGroupDescriptor,
   readBackendMetaDescriptors,
   writeBackendMetaDescriptor,
@@ -452,6 +457,10 @@ export class ConfigRepo implements IConfigRepo {
    * `instanceId`，不一致就不建同步对 —— 两个不同的同步组永不互相同步。
    */
   private instanceId?: string;
+  /** 配置组身份的候选（本地 + 每个后端根），供界面展示。 */
+  private identityCandidates: IdentityCandidate[] = [];
+  /** 候选互相矛盾：需要用户裁决，绝不由库层自动择一。 */
+  private configIdentityUnsettled = false;
   /** 因归属他人而被跳过的后端 id → 原因，供 UI 展示。 */
   private skippedBackends = new Map<string, string>();
   /** 归属冲突的完整信息（两侧 kind / id / instanceId + 可执行动作）。 */
@@ -2533,8 +2542,26 @@ export class ConfigRepo implements IConfigRepo {
       } catch { /* treat as absent */ }
       const known = pickInstanceId(existing);
       existingFeatures = existing?.features ?? CONFIG_GROUP_FEATURES;
-      this.instanceId = known ?? newGroupInstanceId();
-      if (!known) {
+
+      if (known) {
+        this.instanceId = known;
+      } else {
+        // 本地没有身份 → **先只读收集**各已注册后端根上的 `group.json`，
+        // 只有全部为空时才生成一次（见 GROUP-IDENTITY-INIT §3）。
+        const collected = await this.collectConfigIdentityCandidates(kind, id);
+        this.identityCandidates = collected.candidates;
+        const distinct = collected.distinct;
+        this.instanceId = distinct[0] ?? newGroupInstanceId();
+        this.configIdentityUnsettled = distinct.length > 1;
+        if (this.configIdentityUnsettled) {
+          log.warn(
+            `[ConfigRepo] config group identity candidates disagree (${distinct.join(' / ')}) — ` +
+              `using ${this.instanceId} provisionally, NOT rewriting any root, waiting for the user to decide`,
+          );
+        }
+        if (!distinct.length) {
+          log.log(`[ConfigRepo] no identity anywhere (local/remote all empty) — generated ${this.instanceId}`);
+        }
         try {
           await writeGroupDescriptor(this.cachedFS, {
             schemaVersion: 2,
@@ -2550,6 +2577,11 @@ export class ConfigRepo implements IConfigRepo {
         }
       }
     }
+    if (!this.identityCandidates.length && this.instanceId) {
+      this.identityCandidates = [
+        { source: 'local', instanceId: this.instanceId, rootCount: 1, kind, id },
+      ];
+    }
     return {
       kind,
       id,
@@ -2557,6 +2589,50 @@ export class ConfigRepo implements IConfigRepo {
       ...(this.name ? { name: this.name } : {}),
       ...(existingFeatures ? { features: existingFeatures } : {}),
     };
+  }
+
+  /**
+   * 只读收集配置组身份的候选：本地描述符 + 每个已注册后端根的 `group.json`。
+   * 只看 `kind` / `id` 与本组一致的根；读失败的根不参与裁决（不猜）。
+   */
+  private async collectConfigIdentityCandidates(
+    kind: SyncGroupKind,
+    id: string,
+  ): Promise<{ candidates: IdentityCandidate[]; distinct: string[] }> {
+    const candidates: IdentityCandidate[] = [];
+    let local: string | undefined;
+    try {
+      local = pickInstanceId(await readGroupDescriptor(this.cachedFS));
+    } catch { /* 读不到就当没有 */ }
+    if (local) {
+      candidates.push({ source: 'local', instanceId: local, rootCount: 1, kind, id });
+    }
+
+    for (const desc of this.backendDescriptorCache ?? []) {
+      let inst: any;
+      try {
+        inst = await createBackend({ type: desc.type, options: desc.options });
+      } catch {
+        continue;
+      }
+      try {
+        const remote = await readGroupDescriptorStrict(inst);
+        if (!remote || remote.kind !== kind || remote.id !== id) continue;
+        const value = pickInstanceId(remote);
+        if (!value) continue;
+        candidates.push({ source: 'remote', backendId: desc.id, instanceId: value, rootCount: 1, kind, id });
+      } catch {
+        /* 读不到：不参与裁决 */
+      } finally {
+        try { await inst.dispose?.(); } catch { /* best effort */ }
+      }
+    }
+
+    const distinct = Array.from(new Set(candidates.map((c) => c.instanceId)));
+    for (const c of candidates) {
+      c.rootCount = candidates.filter((x) => x.instanceId === c.instanceId).length;
+    }
+    return { candidates, distinct };
   }
 
   /** 组实例身份（未初始化时先兜底生成并落盘）。 */
@@ -2567,6 +2643,85 @@ export class ConfigRepo implements IConfigRepo {
   /** 组实例身份（同步读取；init 之前可能为 `undefined`）。 */
   getGroupInstanceId(): string | undefined {
     return this.instanceId;
+  }
+
+  /** 配置组的身份候选：本地描述符 + 已注册后端根上的值。 */
+  getIdentityCandidates(): IdentityCandidate[] {
+    if (this.identityCandidates.length > 0) return this.identityCandidates.map((c) => ({ ...c }));
+    if (!this.instanceId) return [];
+    return [{ source: 'local', instanceId: this.instanceId, rootCount: 1, kind: 'config', id: CONFIG_GROUP_ID }];
+  }
+
+  /** 候选是否互相矛盾（界面据此要求用户拍板）。 */
+  isIdentityUnsettled(): boolean {
+    return this.configIdentityUnsettled;
+  }
+
+  /**
+   * 用户确认后的唯一写入口（配置组）。
+   * `rewriteRoots` 为真时把每个副本根的 `/meta/group.json` 统一成该值。
+   */
+  async setGroupInstanceId(
+    instanceId: string,
+    options: SetGroupInstanceIdOptions = {},
+  ): Promise<SetGroupInstanceIdResult> {
+    const roots: GroupInstanceIdRootResult[] = [];
+    if (!isValidGroupInstanceId(instanceId)) {
+      return { ok: false, reason: '不是合法的 UUID v4', roots };
+    }
+    const previous = this.instanceId;
+    this.instanceId = instanceId;
+    try {
+      await writeGroupDescriptor(this.cachedFS, {
+        schemaVersion: 2,
+        kind: 'config',
+        id: CONFIG_GROUP_ID,
+        instanceId,
+        ...(this.name ? { name: this.name } : {}),
+        features: CONFIG_GROUP_FEATURES,
+      });
+    } catch (err) {
+      this.instanceId = previous;
+      return { ok: false, reason: `写本地 .meta/group.json 失败：${(err as Error)?.message ?? String(err)}`, roots };
+    }
+    this.configIdentityUnsettled = false;
+
+    if (options.rewriteRoots) {
+      for (const [id, replica] of this.replicaBackends) {
+        const fs = replica.instance;
+        if (!fs) continue;
+        try {
+          let remote: GroupDescriptor | null = null;
+          try {
+            remote = await readGroupDescriptorStrict(fs);
+          } catch (err) {
+            roots.push({ backendId: id, ok: false, reason: `读远端失败：${(err as Error)?.message ?? String(err)}` });
+            continue;
+          }
+          if (remote && remote.kind !== 'config') {
+            roots.push({ backendId: id, ok: false, reason: `远端是另一个类型（kind=${remote.kind}），不改写` });
+            continue;
+          }
+          const before = pickInstanceId(remote);
+          if (before === instanceId) {
+            roots.push({ backendId: id, ok: true, ...(before ? { before } : {}) });
+            continue;
+          }
+          await writeGroupDescriptor(fs, {
+            schemaVersion: 2,
+            kind: 'config',
+            id: CONFIG_GROUP_ID,
+            instanceId,
+            ...(this.name ? { name: this.name } : {}),
+            features: CONFIG_GROUP_FEATURES,
+          });
+          roots.push({ backendId: id, ok: true, ...(before ? { before } : {}) });
+        } catch (err) {
+          roots.push({ backendId: id, ok: false, reason: `写远端失败：${(err as Error)?.message ?? String(err)}` });
+        }
+      }
+    }
+    return { ok: true, instanceId, roots };
   }
 
   /**
@@ -2871,8 +3026,10 @@ export class ConfigRepo implements IConfigRepo {
     // Cross-group uniqueness: no two groups may share the same remote endpoint.
     await this.assertNoSharedRemote(resolvedBackends, id);
 
-    // 新组生成一次不可变的实例身份：它同时是同步边界（见 group-identity.ts）。
-    const instanceId = newGroupInstanceId();
+    // 新建组**不再无条件生成**实例身份：已有登记（引导副本）时沿用它的值，
+    // 否则留空交给 init() 的「先读后定」流程（见 GROUP-IDENTITY-INIT.zh-CN.md）。
+    const registered = await this.readAppDataGroupDescriptor(id).catch(() => null);
+    const instanceId = pickInstanceId(registered) ?? undefined;
 
     // Create the data-sync group implementation
     const group = new AppDataGroupImpl(
@@ -3232,6 +3389,14 @@ export class ConfigRepo implements IConfigRepo {
  * Uses a separate IndexedDB store (or InMemory in Node.js) as local primary,
  * with bi-directional sync to each registered data backend.
  */
+/** 阶段 1 的产物：后端实例 + 已读到的远端 `group.json`（`null` = 空仓库）。 */
+interface PreparedDataBackend {
+  desc: AppDataBackendDescriptor;
+  instance: any;
+  remote: GroupDescriptor | null;
+  readError?: string;
+}
+
 class AppDataGroupImpl implements AppDataGroup {
   readonly groupId: string;
   readonly appId: string;
@@ -3282,6 +3447,7 @@ class AppDataGroupImpl implements AppDataGroup {
     this.appId = appId;
     this.name = descriptor.name;
     this.instanceId = isValidGroupInstanceId(descriptor.instanceId) ? descriptor.instanceId : undefined;
+    this.bootstrapInstanceId = this.instanceId;
     this.features = {
       ...DATA_GROUP_DEFAULT_FEATURES,
       ...descriptor.features,
@@ -3305,6 +3471,17 @@ class AppDataGroupImpl implements AppDataGroup {
    * 不一致就不建同步对，因此不同同步组之间永不互相搬运数据。
    */
   private instanceId?: string;
+  /** 引导副本（配置组 `.config/app-data-groups/...`）里登记的实例身份。 */
+  private bootstrapInstanceId?: string;
+  /** 本地 `.meta/group.json` 里已有的实例身份。 */
+  private localInstanceId?: string;
+  /**
+   * 身份候选（本地 / 引导副本 / 每个远端根）。
+   * 只有全部为空时才允许生成新 UUID；互相矛盾时只记录候选，不静默择一。
+   */
+  private identityCandidates: IdentityCandidate[] = [];
+  /** 候选之间存在分歧：界面必须让用户决定，代码不做选择。 */
+  private identityUnsettled = false;
   /** 因归属他人而被跳过的后端 id → 原因。 */
   private skippedBackends = new Map<string, string>();
   /** 归属冲突的完整信息（两侧 kind / id / instanceId + 可执行动作）。 */
@@ -3421,15 +3598,13 @@ class AppDataGroupImpl implements AppDataGroup {
 
   /** Write this group's own `.meta/group.json` (idempotent: identical bytes → no write). */
   async writeOwnGroupDescriptor(): Promise<void> {
-    if (!this.instanceId) {
-      this.instanceId = newGroupInstanceId();
-      log.log(`[AppDataGroup:${this.groupId}] assigned instanceId ${this.instanceId}`);
-    }
+    // 没有身份时**不要**顺手生成一个：空组（还没配任何后端）不需要身份，
+    // 提前落一个随机 UUID 反而会让“首次接入一个已有身份的远端根”变成冲突。
     await writeGroupDescriptor(this.localFS, {
       schemaVersion: 2,
       kind: 'data',
       id: this.groupId,
-      instanceId: this.instanceId,
+      ...(this.instanceId ? { instanceId: this.instanceId } : {}),
       ...(this.name ? { name: this.name } : {}),
       features: this.features,
     });
@@ -3456,7 +3631,25 @@ class AppDataGroupImpl implements AppDataGroup {
   private async checkBackendOwnership(
     instance: any,
     backendId: string,
+    prefetched?: GroupDescriptor | null,
+    readError?: string,
   ): Promise<'match' | 'claimed' | 'conflict'> {
+    if (readError) {
+      const reason = `远端 group.json 读不到：${readError}`;
+      this.skippedBackends.set(backendId, reason);
+      this.backendConflicts.set(backendId, {
+        backendId,
+        reason,
+        conflict: 'unreadable',
+        remote: null,
+        local: { kind: 'data', id: this.groupId, instanceId: this.instanceId },
+        canAdoptRemoteInstance: false,
+        canRewriteRemoteIdentity: false,
+        unreadable: true,
+        error: readError,
+      });
+      return 'conflict';
+    }
     if (!this.instanceId) {
       this.skippedBackends.set(backendId, '本组尚未分配 instanceId，已跳过该后端');
       this.backendConflicts.set(backendId, {
@@ -3477,7 +3670,7 @@ class AppDataGroupImpl implements AppDataGroup {
         ...(this.name ? { name: this.name } : {}),
         features: this.features,
       };
-      const result = await bindRemoteGroupIdentityDetailed(instance, identity);
+      const result = await bindRemoteGroupIdentityDetailed(instance, identity, prefetched);
       if (result.state === 'conflict') {
         this.skippedBackends.set(backendId, describeConflict(result));
         this.backendConflicts.set(backendId, {
@@ -3523,6 +3716,185 @@ class AppDataGroupImpl implements AppDataGroup {
   /** 归属冲突的完整信息（UI 直接展示两侧身份，不用猜）。 */
   listBackendConflicts(): BackendConflictInfo[] {
     return Array.from(this.backendConflicts.values());
+  }
+
+  /**
+   * 阶段 2–3：把候选摊开，再决定本组身份。
+   *
+   * 硬边界（`kind` 不同 / `id` 不同 / 读不到）不参与裁决；已有身份按
+   * 「引导副本 > 本地描述符」沿用；只有**全部候选为空**时才生成一次 UUID；
+   * 候选互相矛盾时只标 `identityUnsettled`，绝不自动择一、也不改写任何远端。
+   */
+  private finalizeIdentity(prepared: PreparedDataBackend[]): void {
+    const candidates: IdentityCandidate[] = [];
+    const remoteCounts = new Map<string, number>();
+
+    for (const p of prepared) {
+      const remote = p.remote;
+      if (!remote || remote.kind !== 'data' || remote.id !== this.groupId) continue;
+      const value = pickInstanceId(remote);
+      if (!value) continue;
+      remoteCounts.set(value, (remoteCounts.get(value) ?? 0) + 1);
+      candidates.push({
+        source: 'remote',
+        backendId: p.desc.id,
+        instanceId: value,
+        rootCount: 1,
+        kind: remote.kind,
+        id: remote.id,
+      });
+    }
+
+    if (this.bootstrapInstanceId) {
+      candidates.unshift({
+        source: 'bootstrap',
+        instanceId: this.bootstrapInstanceId,
+        rootCount: 1,
+        kind: 'data',
+        id: this.groupId,
+      });
+    }
+    if (this.localInstanceId && this.localInstanceId !== this.bootstrapInstanceId) {
+      candidates.splice(this.bootstrapInstanceId ? 1 : 0, 0, {
+        source: 'local',
+        instanceId: this.localInstanceId,
+        rootCount: 1,
+        kind: 'data',
+        id: this.groupId,
+      });
+    }
+    for (const c of candidates) {
+      c.rootCount = Math.max(1, remoteCounts.get(c.instanceId) ?? 0);
+    }
+    this.identityCandidates = candidates;
+
+    const distinct = Array.from(new Set(candidates.map((c) => c.instanceId)));
+
+    if (!this.instanceId) {
+      const provisional = this.bootstrapInstanceId ?? this.localInstanceId ?? distinct[0];
+      if (provisional) {
+        this.instanceId = provisional;
+      } else if (prepared.length > 0) {
+        // 有远端根（哪怕全为空）才需要身份去认领它们 —— 生成一次。
+        this.instanceId = newGroupInstanceId();
+        log.log(
+          `[AppDataGroup:${this.groupId}] no identity anywhere (local / bootstrap / remote all empty) — generated ${this.instanceId}`,
+        );
+      } else {
+        // 一个后端都没有：身份无意义，先不设；首个后端加入时再决定。
+        log.log(`[AppDataGroup:${this.groupId}] no backends configured — instanceId left unset`);
+      }
+    }
+
+    this.identityUnsettled =
+      distinct.length > 1 || (distinct.length === 1 && !!this.instanceId && distinct[0] !== this.instanceId);
+    if (this.identityUnsettled) {
+      log.warn(
+        `[AppDataGroup:${this.groupId}] identity candidates disagree (${distinct.join(' / ')}; ` +
+          `this group uses ${this.instanceId}) — NOT auto-picking, waiting for the user to decide`,
+      );
+    }
+  }
+
+  /** 本组身份的全部候选（含每个远端根）。 */
+  getIdentityCandidates(): IdentityCandidate[] {
+    return this.identityCandidates.map((c) => ({ ...c }));
+  }
+
+  /** 候选之间是否互相矛盾（界面据此提示“请选择实例 ID”）。 */
+  isIdentityUnsettled(): boolean {
+    return this.identityUnsettled;
+  }
+
+  /**
+   * 用户确认后的唯一写入口：把本组身份设成指定值。
+   *
+   * 只由用户触发（界面二次确认）。`rewriteRoots` 为真时，一并把本组所有
+   * `kind` / `id` 相同的远端根统一成该值，并逐根回报结果；`kind` / `id` 不同
+   * 的根一律不改写。
+   */
+  async setGroupInstanceId(
+    instanceId: string,
+    options: SetGroupInstanceIdOptions = {},
+  ): Promise<SetGroupInstanceIdResult> {
+    const roots: GroupInstanceIdRootResult[] = [];
+    if (!isValidGroupInstanceId(instanceId)) {
+      return { ok: false, reason: '不是合法的 UUID v4', roots };
+    }
+
+    this.instanceId = instanceId;
+    this.identityUnsettled = false;
+    try {
+      await this.writeOwnGroupDescriptor();
+    } catch (err) {
+      const reason = (err as Error)?.message ?? String(err);
+      return { ok: false, reason: `写本地 .meta/group.json 失败：${reason}`, roots };
+    }
+    try {
+      await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends ?? [], {
+        name: this.name,
+        features: this._declaredFeatures,
+        instanceId,
+      });
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] failed to update bootstrap descriptor instanceId:`, err);
+    }
+
+    if (options.rewriteRoots) {
+      for (const desc of this._backends ?? []) {
+        let inst: any;
+        try {
+          inst = await createBackend({ type: desc.type, options: desc.options });
+        } catch (err) {
+          roots.push({ backendId: desc.id, ok: false, reason: `创建后端失败：${(err as Error)?.message ?? String(err)}` });
+          continue;
+        }
+        try {
+          let remote: GroupDescriptor | null = null;
+          try {
+            remote = await readGroupDescriptorStrict(inst);
+          } catch (err) {
+            roots.push({ backendId: desc.id, ok: false, reason: `读远端失败：${(err as Error)?.message ?? String(err)}` });
+            continue;
+          }
+          if (remote && (remote.kind !== 'data' || remote.id !== this.groupId)) {
+            roots.push({
+              backendId: desc.id,
+              ok: false,
+              reason: `远端是另一个组（kind=${remote.kind} id=${remote.id}），不改写`,
+            });
+            continue;
+          }
+          const before = pickInstanceId(remote);
+          if (before === instanceId) {
+            roots.push({ backendId: desc.id, ok: true, ...(before ? { before } : {}) });
+            continue;
+          }
+          await writeGroupDescriptor(inst, {
+            schemaVersion: 2,
+            kind: 'data',
+            id: this.groupId,
+            instanceId,
+            ...(this.name ? { name: this.name } : {}),
+            features: this.features,
+          });
+          roots.push({ backendId: desc.id, ok: true, ...(before ? { before } : {}) });
+          log.log(`[AppDataGroup:${this.groupId}] root "${desc.id}" identity rewritten to ${instanceId}`);
+        } catch (err) {
+          roots.push({ backendId: desc.id, ok: false, reason: `写远端失败：${(err as Error)?.message ?? String(err)}` });
+        } finally {
+          try { await inst.dispose?.(); } catch { /* best effort */ }
+        }
+      }
+    }
+
+    for (const [id, c] of Array.from(this.backendConflicts.entries())) {
+      if (c.remote?.instanceId === instanceId) {
+        this.backendConflicts.delete(id);
+        this.skippedBackends.delete(id);
+      }
+    }
+    return { ok: true, instanceId, roots };
   }
 
   /**
@@ -3676,26 +4048,20 @@ class AppDataGroupImpl implements AppDataGroup {
       this._backends = this._backends ?? [];
     }
 
-    // 组实例身份：优先用引导副本声明的，其次读本地 `.meta/group.json`，
-    // 都没有（老部署）时生成一次并固定下来。
-    if (!this.instanceId) {
-      try {
-        const existing = await readGroupDescriptor(this.localFS);
-        this.instanceId = pickInstanceId(existing);
-        if (this.instanceId) {
-          log.log(`[AppDataGroup:${this.groupId}] adopted instanceId ${this.instanceId} from local group.json`);
-        }
-      } catch (err) {
-        log.warn(`[AppDataGroup:${this.groupId}] failed to read local group.json:`, err);
-      }
-    }
-
-    // Unified group descriptor (`.meta/group.json`) — byte-identical launches
-    // never rewrite it (no `updatedAt`, no timestamps in synced content).
+    // 身份收集（只读，不落盘）：本地 `.meta/group.json` 里的值只是候选之一。
+    // 优先级：引导副本（构造函数注入）> 本地描述符；两者都没有时留空，
+    // 等远端根的候选读完再决定（见 §3 阶段 1–3）。
     try {
-      await this.writeOwnGroupDescriptor();
+      const existing = await readGroupDescriptor(this.localFS);
+      this.localInstanceId = pickInstanceId(existing);
+      if (this.localInstanceId) {
+        log.log(`[AppDataGroup:${this.groupId}] local group.json instanceId=${this.localInstanceId}`);
+      }
     } catch (err) {
-      log.warn(`[AppDataGroup:${this.groupId}] failed to write .meta/group.json:`, err);
+      log.warn(`[AppDataGroup:${this.groupId}] failed to read local group.json:`, err);
+    }
+    if (!this.instanceId && this.localInstanceId) {
+      this.instanceId = this.localInstanceId;
     }
 
     // The app-facing view no longer hides `.meta/` wholesale — tools (and
@@ -3756,13 +4122,47 @@ class AppDataGroupImpl implements AppDataGroup {
       }
     }
 
-    // Setup sync with each data backend
+    // ---- 阶段 1：只读收集 —— 建实例、读每个远端根的 `group.json`（不写）----
+    const prepared: PreparedDataBackend[] = [];
     for (const desc of this._backends) {
       try {
         const instance = await createBackend({ type: desc.type, options: desc.options });
+        let remote: GroupDescriptor | null = null;
+        let readError: string | undefined;
+        try {
+          remote = await readGroupDescriptorStrict(instance);
+        } catch (err) {
+          readError = (err as Error)?.message ?? String(err);
+          log.warn(`[AppDataGroup:${this.groupId}] failed to read remote group.json of "${desc.id}":`, err);
+        }
+        prepared.push({ desc, instance, remote, readError });
+      } catch (err: any) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.backendStates.set(desc.id, {
+          backendId: desc.id,
+          error: { message, timestamp: Date.now() },
+        });
+        log.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
+      }
+    }
 
+    // ---- 阶段 2–3：硬边界 + 定身份（候选全空才生成一次；不一致只记录）----
+    this.finalizeIdentity(prepared);
+
+    // ---- 阶段 4：落盘一次（字节相同不写）----
+    try {
+      await this.writeOwnGroupDescriptor();
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] failed to write .meta/group.json:`, err);
+    }
+
+    // ---- 阶段 6：建同步对（消费已读快照，不再重复读远端）----
+    for (const item of prepared) {
+      const desc = item.desc;
+      const instance = item.instance;
+      try {
         // 同步边界：这个远端根属于另一个同步组 → 跳过，不建同步对。
-        const owned = await this.checkBackendOwnership(instance, desc.id);
+        const owned = await this.checkBackendOwnership(instance, desc.id, item.remote, item.readError);
         if (owned === 'conflict') {
           try { await instance.dispose?.(); } catch { /* best effort */ }
           continue;

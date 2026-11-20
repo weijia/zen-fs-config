@@ -154,20 +154,26 @@ function snapshotOf(descriptor: GroupDescriptor | null): RemoteIdentitySnapshot 
 export async function bindRemoteGroupIdentityDetailed(
   remoteFS: any,
   identity: GroupIdentity,
+  /** 已读到的远端描述符（`null` = 已确认空仓库）；`undefined` = 未读，函数自己读。 */
+  prefetched?: GroupDescriptor | null,
 ): Promise<IdentityBindingResult> {
   let remote: GroupDescriptor | null = null;
-  try {
-    remote = await readGroupDescriptorStrict(remoteFS);
-  } catch (err) {
-    log.warn(`[GroupIdentity] failed to read remote ${identity.kind}/"${identity.id}" group.json:`, err);
-    return {
-      state: 'conflict',
-      remote: null,
-      local: identity,
-      conflict: 'unreadable',
-      unreadable: true,
-      error: (err as Error)?.message ?? String(err),
-    };
+  if (prefetched !== undefined) {
+    remote = prefetched;
+  } else {
+    try {
+      remote = await readGroupDescriptorStrict(remoteFS);
+    } catch (err) {
+      log.warn(`[GroupIdentity] failed to read remote ${identity.kind}/"${identity.id}" group.json:`, err);
+      return {
+        state: 'conflict',
+        remote: null,
+        local: identity,
+        conflict: 'unreadable',
+        unreadable: true,
+        error: (err as Error)?.message ?? String(err),
+      };
+    }
   }
 
   const snapshot = snapshotOf(remote);
