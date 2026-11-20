@@ -494,6 +494,12 @@ export interface SyncGroupHandle {
    */
   getIdentityCandidates(): IdentityCandidate[];
   /**
+   * 同上，但会现场回读各根再返回（同步 getter 只给缓存）。
+   * 界面优先用它，才能在「本地已有身份、远端与本地不一致」时看到两个值。
+   * 可选：老版本实现可能没有这个方法。
+   */
+  getIdentityCandidatesAsync?(): Promise<IdentityCandidate[]>;
+  /**
    * 候选之间是否互相矛盾（需要用户在界面上拍板）。
    * 可选：老版本实现可能没有这个方法，调用方按候选去重自行判断。
    */

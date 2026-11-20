@@ -2645,11 +2645,38 @@ export class ConfigRepo implements IConfigRepo {
     return this.instanceId;
   }
 
-  /** 配置组的身份候选：本地描述符 + 已注册后端根上的值。 */
+  /** 配置组的身份候选：本地描述符 + 已注册后端根上的值（只读缓存）。 */
   getIdentityCandidates(): IdentityCandidate[] {
     if (this.identityCandidates.length > 0) return this.identityCandidates.map((c) => ({ ...c }));
     if (!this.instanceId) return [];
     return [{ source: 'local', instanceId: this.instanceId, rootCount: 1, kind: 'config', id: CONFIG_GROUP_ID }];
+  }
+
+  /**
+   * 现场回读各根，重算候选并填充缓存。
+   *
+   * 缓存只在「初始化时本地没有身份」才被填充；本地已有身份时缓存是空的，
+   * 同步 getter 也就只剩一个本地值 —— 界面看不到「本地 6abe… vs 远端 5a52…」
+   * 这种真正需要拍板的分歧。所以给界面一个能主动回读的入口。
+   */
+  async getIdentityCandidatesAsync(): Promise<IdentityCandidate[]> {
+    if (!this.instanceId) return [];
+    const collected = await this.collectConfigIdentityCandidates('config', CONFIG_GROUP_ID);
+    // 本地值始终算一个候选，哪怕读描述符失败（this.instanceId 就是本组身份）。
+    if (!collected.candidates.some((c) => c.source === 'local') && this.instanceId) {
+      collected.candidates.unshift({
+        source: 'local', instanceId: this.instanceId, rootCount: 1, kind: 'config', id: CONFIG_GROUP_ID,
+      });
+    }
+    this.identityCandidates = collected.candidates;
+    this.configIdentityUnsettled = collected.distinct.length > 1;
+    if (this.configIdentityUnsettled) {
+      log.warn(
+        `[ConfigRepo] identity candidates disagree (${collected.distinct.join(' / ')}) — ` +
+          'left to the user to decide in the UI',
+      );
+    }
+    return this.identityCandidates.map((c) => ({ ...c }));
   }
 
   /** 候选是否互相矛盾（界面据此要求用户拍板）。 */
