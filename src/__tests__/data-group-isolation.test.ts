@@ -106,19 +106,24 @@ describe('data group sync isolation', () => {
     expect(metaEntries).toContain('group.json');
     expect(metaEntries).toContain('backends');
 
-    // 账本只读：墓碑 / 版本 / 冲突一个都不许写
+    // 现行账本只读：墓碑 / 版本 / 冲突一个都不许写
     for (const target of [
       '/.meta/tombstones/forged.json',
       '/.meta/versions/forged.json',
       '/.meta/conflicts/forged.json',
-      '/.meta/.deleted/forged.json',
-      '/.meta/.conflicts/forged.json',
     ]) {
       await expect(group.fs.promises.writeFile(target, '{"forged":true}'))
         .rejects.toThrow(/read-only|EPERM/);
     }
     // 删除同样被拒（否则等于删账本）
     await expect(group.fs.promises.unlink('/.meta/tombstones')).rejects.toThrow(/read-only|EPERM/);
+
+    // 遗留归档（/.meta/.deleted）已不再被任何代码读取，因此不再受账本保护：
+    // 用户可以把它当普通遗产文件清理掉，删了也不会让已删文件复活。
+    await group.fs.promises.mkdir('/.meta/.deleted', { recursive: true });
+    await group.fs.promises.writeFile('/.meta/.deleted/legacy.json', '{"path":"/gone.txt"}');
+    await expect(group.fs.promises.unlink('/.meta/.deleted/legacy.json')).resolves.toBeUndefined();
+    await expect(group.fs.promises.unlink('/.meta/.deleted')).resolves.toBeUndefined();
 
     // 组身份可以改，但必须先确认（ECONFIRM），确认后放行
     await expect(group.fs.promises.writeFile('/.meta/group.json', '{"id":"hijack"}'))

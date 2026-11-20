@@ -165,6 +165,24 @@ const GROUP_NAME_MAX_LENGTH = 40;
 const NODES_DIR = '/nodes';
 const SHARED_DIR = '/shared';
 
+/**
+ * 旧版归档目录（`/.meta/.deleted`、`/.meta/.conflicts`）。
+ *
+ * 删除账本迁到 `/.meta/tombstones/`、冲突记录迁到 `/.meta/conflicts/` 之后，
+ * 这两处就不再被任何代码读写；留在那里的只是历史残留。因此它们不再列入
+ * 「元数据不可删」的范围 —— 否则用户永远清不掉一批已经死掉的文件。
+ * 现行账本（`tombstones` / `versions` / `conflicts`）、后端清单
+ * （`/.meta/backends/`）和组身份（`/.meta/group.json`）仍然一律禁删。
+ */
+function isDeletableLegacyMetaPath(path: string): boolean {
+  return (
+    path === LEGACY_TOMBSTONES_DIR ||
+    path.startsWith(`${LEGACY_TOMBSTONES_DIR}/`) ||
+    path === LEGACY_CONFLICTS_DIR ||
+    path.startsWith(`${LEGACY_CONFLICTS_DIR}/`)
+  );
+}
+
 /** Fixed group id of the config-sync group. */
 export const CONFIG_GROUP_ID = 'config';
 
@@ -4105,7 +4123,12 @@ class AppDataGroupImpl implements AppDataGroup {
     // debug UI) need to read `.meta/backends`, `.meta/group.json` etc. Instead
     // it is **visible but guarded**:
     //   · `.config/` stays hidden (config-sync territory, never data content),
-    //   · the sync ledgers (`tombstones` / `versions` / `conflicts`) are read-only,
+    //   · the live sync ledgers (`tombstones` / `versions` / `conflicts`) are
+    //     read-only,
+    //   · the *legacy* archives (`/.meta/.deleted`, `/.meta/.conflicts`) are
+    //     NOT protected any more: nothing reads them since the ledger moved to
+    //     `/.meta/tombstones`, so keeping them out of the read-only list only
+    //     left every user stuck with dead files they could not clean up.
     //   · `.meta/group.json` (group identity) is writable only with an explicit
     //     `{ confirm: true }` — tools may edit it after warning the user.
     // Deletes still go through the tombstone-aware path (onUnlink/onRmdir),
@@ -4114,10 +4137,8 @@ class AppDataGroupImpl implements AppDataGroup {
       hiddenPrefixes: [CONFIG_DIR],
       readOnlyPrefixes: [
         TOMBSTONES_DIR,
-        LEGACY_TOMBSTONES_DIR,
         VERSIONS_DIR,
         CONFLICTS_DIR,
-        LEGACY_CONFLICTS_DIR,
       ],
       confirmPrefixes: [GROUP_DESCRIPTOR_FILE],
       onWrite: async (path, data) => {
@@ -4409,10 +4430,10 @@ class AppDataGroupImpl implements AppDataGroup {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
     const normalized = path.startsWith('/') ? path : `/${path}`;
     if (
-      normalized === META_DIR ||
       normalized === CONFIG_DIR ||
-      normalized.startsWith(`${META_DIR}/`) ||
-      normalized.startsWith(`${CONFIG_DIR}/`)
+      normalized.startsWith(`${CONFIG_DIR}/`) ||
+      (normalized === META_DIR || normalized.startsWith(`${META_DIR}/`)) &&
+        !isDeletableLegacyMetaPath(normalized)
     ) {
       throw new Error(`Cannot delete metadata path "${normalized}"`);
     }
