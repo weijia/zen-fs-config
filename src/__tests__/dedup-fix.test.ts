@@ -337,8 +337,8 @@ describe('createConfigRepo — duplicate prevention on connect', () => {
   });
 });
 
-describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
-  it('detects and removes corrupted backend descriptor files (malformed JSON)', async () => {
+describe('readAllBackendDescriptors — corrupted JSON is skipped, not deleted', () => {
+  it('ignores malformed descriptor files (malformed JSON)', async () => {
     const appId = 'test-corrupt-json-cleanup';
     const idbStore = `persistent-${appId}`;
 
@@ -361,25 +361,25 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
     const localStore = persistentStores.get(idbStore)!;
     localStore.set('/.meta/backends/corrupt-rs.json', new TextEncoder().encode(corruptContent));
 
-    // readAllBackendDescriptors should detect the corrupted file and clean it up
+    // readAllBackendDescriptors should skip the corrupted file at read time
     const result = await repo.readAllBackendDescriptors();
 
-    // Only the valid backend should remain
+    // Only the valid backend is returned
     expect(result.length).toBe(1);
     expect(result[0].id).toBe('valid-backend');
 
-    // The corrupted file should have been deleted locally
-    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+    // The corrupted file is left on disk: read-time filtering only
+    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(true);
 
-    // A tombstone should have been created for the corrupted file
+    // No tombstone is written for it either
     const deletedEntries = await repo.rootFS.promises.readdir('/.meta/tombstones').catch(() => []);
     const corruptTombstone = deletedEntries.find((f: string) => f.includes('corrupt-rs'));
-    expect(corruptTombstone).toBeDefined();
+    expect(corruptTombstone).toBeUndefined();
 
     await repo.dispose();
   });
 
-  it('detects and removes descriptors missing required id/type fields', async () => {
+  it('ignores descriptors missing required id/type fields', async () => {
     const appId = 'test-missing-fields-cleanup';
     const idbStore = `persistent-${appId}`;
 
@@ -406,17 +406,18 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
 
     const result = await repo.readAllBackendDescriptors();
 
-    // Only the valid backend should remain
+    // Only the valid backend is returned…
     expect(result.length).toBe(1);
     expect(result[0].id).toBe('good-backend');
 
-    // The incomplete file should have been deleted
-    expect(localStore.has('/.meta/backends/incomplete-backend.json')).toBe(false);
+    // …but the unreadable file is never deleted: deleting something another
+    // client still considers valid is how backend lists got annihilated.
+    expect(localStore.has('/.meta/backends/incomplete-backend.json')).toBe(true);
 
     await repo.dispose();
   });
 
-  it('corrupted file does not reappear after flush (tombstone prevents re-sync)', async () => {
+  it('corrupted file is ignored but stays on disk (never deleted)', async () => {
     const appId = 'test-corrupt-no-resync';
     const sharedStoreKey = `shared-${appId}-${Date.now()}`;
     const idbStore = `persistent-${appId}`;
@@ -440,21 +441,20 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
       JSON.stringify({ version: 1, hash: 'fake', author: 'remote', timestamp: Date.now() }),
     ));
 
-    // Flush — sync will pull the corrupted file from remote,
-    // then readAllBackendDescriptors (called in post-sync dedup) should detect and clean it
+    // Flush — sync pulls the corrupted file from remote; it must be ignored at
+    // read time but left untouched on both sides.
     await repo.flush();
 
-    // The corrupted file should be gone from local
     const localStore = persistentStores.get(idbStore)!;
-    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(true);
 
-    // The corrupted file should also be gone from remote (deleted by dedup cleanup)
-    expect(remoteStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+    // The corrupted file is left on remote as well.
+    expect(remoteStore.has('/.meta/backends/corrupt-rs.json')).toBe(true);
 
-    // Flush again to make sure it doesn't come back
+    // Flush again — still nothing is deleted.
     await repo.flush();
-    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
-    expect(remoteStore.has('/.meta/backends/corrupt-rs.json')).toBe(false);
+    expect(localStore.has('/.meta/backends/corrupt-rs.json')).toBe(true);
+    expect(remoteStore.has('/.meta/backends/corrupt-rs.json')).toBe(true);
 
     // Only rs-1 should remain
     const backends = await repo.readAllBackendDescriptors();
@@ -465,8 +465,8 @@ describe('readAllBackendDescriptors — corrupted JSON cleanup', () => {
   });
 });
 
-describe('dedup during createConfigRepo — survives sync re-introduction', () => {
-  it('two identical backends on remote: createConfigRepo deduplicates and sync does not bring back the deleted one', async () => {
+describe('dedup during createConfigRepo — duplicates are filtered, never deleted', () => {
+  it('two identical backends on remote: one effective backend, both files preserved', async () => {
     const appId = 'test-dedup-survives-sync';
     const sharedStoreKey = `shared-${appId}-${Date.now()}`;
     const idbStore = `persistent-${appId}`;
@@ -517,21 +517,19 @@ describe('dedup during createConfigRepo — survives sync re-introduction', () =
     // Wait for background sync
     await new Promise(r => setTimeout(r, 200));
 
-    // Check: only ONE backend should exist
+    // Check: only ONE effective backend is reported
     const backends = await repo2.readAllBackendDescriptors();
     expect(backends.length).toBe(1);
 
-    // Check: rs-2 should NOT exist on remote anymore
-    // (processTombstones should have deleted it via rs-1's sync pair)
-    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
+    // Check: the duplicate descriptor file is NOT deleted anywhere — it is only
+    // ignored when reading. Deleting it is what let two clients erase each
+    // other's canonical descriptor until no backend was left.
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
+    expect(persistentStores.get(idbStore)!.has('/.meta/backends/rs-2.json')).toBe(true);
 
-    // Check: rs-2 should NOT exist on local either
-    expect(persistentStores.get(idbStore)!.has('/.meta/backends/rs-2.json')).toBe(false);
-
-    // Flush again to make sure it doesn't come back
     await repo2.flush();
-    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
-    expect(persistentStores.get(idbStore)!.has('/.meta/backends/rs-2.json')).toBe(false);
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
+    expect(persistentStores.get(idbStore)!.has('/.meta/backends/rs-2.json')).toBe(true);
 
     await repo2.dispose();
   });
@@ -631,15 +629,15 @@ describe('removeBackend — tombstone-based deletion', () => {
       options: { storeKey: sharedStoreKey },
     });
 
-    // Flush — this now includes post-sync dedup, which will detect rs-1 and
-    // rs-2 as duplicates and remove rs-2 (keeping rs-1, the older one).
-    // So after flush, only rs-1 should exist on remote.
+    // Flush — post-sync readAllBackendDescriptors reports rs-1 as the single
+    // effective backend, but deliberately leaves rs-2 on disk.
     await repo.flush();
 
-    // Verify: rs-1 exists, rs-2 was deduped
+    // Verify: both descriptor files still exist, only one is effective
     const remoteStore = sharedMockStores.get(sharedStoreKey)!;
     expect(remoteStore.has('/.meta/backends/rs-1.json')).toBe(true);
-    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
+    expect((await repo.readAllBackendDescriptors()).length).toBe(1);
 
     // Now remove rs-1 via removeBackend (uses deleteFile → tombstone)
     await repo.removeBackend('rs-1');
@@ -649,7 +647,7 @@ describe('removeBackend — tombstone-based deletion', () => {
 
     await repo.dispose();
 
-    // Reconnect — no backends should remain
+    // Reconnect — rs-2 survives and becomes the effective backend
     const repo2 = await createConfigRepo(appId, {
       folderPath: idbStore,
       nodeId: 'node-2',
@@ -661,12 +659,12 @@ describe('removeBackend — tombstone-based deletion', () => {
     // rs-1 should NOT exist on remote (tombstone propagated)
     expect(remoteStore.has('/.meta/backends/rs-1.json')).toBe(false);
 
-    // rs-2 was already deduped, so it should not exist either
-    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(false);
+    // rs-2 was only filtered out at read time, never deleted
+    expect(remoteStore.has('/.meta/backends/rs-2.json')).toBe(true);
 
-    // No backends should remain
     const backends = await repo2.readAllBackendDescriptors();
-    expect(backends.length).toBe(0);
+    expect(backends.length).toBe(1);
+    expect(backends[0].id).toBe('rs-2');
 
     await repo2.dispose();
   });

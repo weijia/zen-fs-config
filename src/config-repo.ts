@@ -2138,26 +2138,21 @@ export class ConfigRepo implements IConfigRepo {
     const items = [...fresh.items];
     const corruptFiles = [...fresh.corruptFiles];
 
-    // Clean up corrupted descriptor files: delete on all replicas, tombstone, delete locally.
-    // This prevents corrupted files from persisting and being re-synced indefinitely.
+    // Corrupted descriptor files are reported but never deleted here: deleting
+    // on one client can destroy a descriptor another client considers valid
+    // (see the dedup note below), so this path stays strictly read-only.
     for (const corruptPath of corruptFiles) {
-      // 1. Delete on all known replicas directly
-      for (const [, replica] of this.replicaBackends) {
-        try { await replica.instance.unlink(corruptPath); } catch { /* not on this replica */ }
-        await this.unlinkVersionSidecar(replica.instance, corruptPath);
-      }
-      // 2. Create a tombstone + delete locally
-      try {
-        await this.deleteFile(corruptPath);
-      } catch {
-        // deleteFile might fail if sync engine isn't set up yet — fall back to plain unlink
-        try { await this.cachedFS.unlink(corruptPath); } catch { /* already gone */ }
-        await this.unlinkVersionSidecar(this.cachedFS, corruptPath);
-      }
+      log.warn(`[ConfigRepo] readAllBackendDescriptors: ignoring unreadable descriptor ${corruptPath}`);
     }
 
     // Deduplicate: same type + options (stable key) but different id.
     // Keep the one with the earliest mtime (created first).
+    //
+    // IMPORTANT: this is a READ-TIME filter only. Duplicate descriptor files are
+    // never deleted or tombstoned. Each client derives backend ids differently
+    // (`gitee`, `Gitee-replica`, `Gitee-primary`, ...), so a destructive "keep one"
+    // rule made two clients delete each other's canonical file until the whole
+    // backend list disappeared (and then the repo could no longer reach any remote).
     const seen = new Map<string, { desc: BackendDescriptor; mtime: number }>();
     const duplicates: string[] = [];
 
@@ -2180,34 +2175,8 @@ export class ConfigRepo implements IConfigRepo {
 
     if (duplicates.length > 0) {
       log.log(
-        `[ConfigRepo] readAllBackendDescriptors: removing ${duplicates.length} duplicate(s): ${duplicates.join(', ')}`,
+        `[ConfigRepo] readAllBackendDescriptors: ignoring ${duplicates.length} duplicate descriptor(s) (kept on disk): ${duplicates.join(', ')}`,
       );
-      for (const dupId of duplicates) {
-        for (const descPath of [this.backendFilePath(dupId), this.legacyBackendFilePath(dupId)]) {
-          // 1. Delete the descriptor file on ALL known replicas directly.
-          //    This is critical: if we only write a tombstone + delete locally,
-          //    the sync engine will see "remote has file, local doesn't" and
-          //    copy it back — re-creating the duplicate in an infinite loop.
-          //    By deleting on all replicas NOW, both sides are clean.
-          for (const [, replica] of this.replicaBackends) {
-            try {
-              await replica.instance.unlink(descPath);
-            } catch { /* not on this replica */ }
-            await this.unlinkVersionSidecar(replica.instance, descPath);
-          }
-
-          // 2. Create a tombstone + delete the local file.
-          //    The tombstone ensures late-joining replicas also delete the file.
-          try {
-            await this.deleteFile(descPath);
-          } catch {
-            // deleteFile might fail if called before sync engine is set up
-            // (e.g. during createConfigRepo's tempRepo phase). Fall back to plain unlink.
-            try { await this.cachedFS.unlink(descPath); } catch { /* already gone */ }
-            await this.unlinkVersionSidecar(this.cachedFS, descPath);
-          }
-        }
-      }
     }
 
     const result = Array.from(seen.values()).map(i => i.desc);
