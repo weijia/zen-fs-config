@@ -2892,6 +2892,16 @@ export class ConfigRepo implements IConfigRepo {
       log.log(`[ConfigRepo] assigned group instanceId ${this.instanceId} (kind=${existingDescriptor?.kind ?? 'config'})`);
     }
     log.log(`[ConfigRepo] group-type set to "${type}"`);
+    // 描述符已就位，旧布局 `.meta/group-type` 只剩副作用：配置组同步会把它
+    // 推回每个远端根，于是「删掉又被写回」。有描述符就清掉它。
+    if (await this.safeExists(this.cachedFS, LEGACY_GROUP_TYPE_FILE)) {
+      try {
+        await this.cachedFS.unlink(LEGACY_GROUP_TYPE_FILE);
+        log.log('[ConfigRepo] removed stale legacy .meta/group-type');
+      } catch (err: any) {
+        log.warn(`[ConfigRepo] failed to remove legacy .meta/group-type: ${err.message}`);
+      }
+    }
   }
 
   /** Read the group-type marker. Returns null if not set (new path, then legacy). */
@@ -4760,6 +4770,15 @@ export async function createConfigRepo(
         instanceId: newGroupInstanceId(),
         features: CONFIG_GROUP_FEATURES,
       });
+    }
+    // 旧布局遗留的 `.meta/group-type` 必须主动清掉：描述符已经写好了，
+    // 这枚标记既是冗余，又会被配置组同步推回各个远端根（线上那台
+    // golf-admin 根上「删了又复活」的 config-sync 就是它）。
+    try {
+      await primaryInstance.unlink(`${META_DIR}/group-type`);
+      log.log('[createConfigRepo] removed stale legacy .meta/group-type');
+    } catch {
+      /* 不存在 —— 正常情况 */
     }
   } catch (err: any) {
     log.warn(`[createConfigRepo] Failed to write group metadata:`, err.message);

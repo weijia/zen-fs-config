@@ -120,4 +120,16 @@ describe('C. 只写新布局标记', () => {
 
     await repo.dispose();
   });
+
+  it('旧布局遗留的 .meta/group-type 在下次启动时被清掉（不再被同步推回远端）', async () => {
+    const appId = `auth-d-${Math.random().toString(36).slice(2, 8)}`;
+    const seed = await createConfigRepo(appId, { nodeId: 'seed' });
+    await seed.rootFS.promises.writeFile('/.meta/group-type', 'config-sync');
+    await seed.dispose();
+
+    const repo = await createConfigRepo(appId, { nodeId: 'next' });
+    expect(await readOrNull(repo.rootFS, '/.meta/group-type')).toBeNull();
+    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBe('config-sync');
+    await repo.dispose();
+  });
 });
