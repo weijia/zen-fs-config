@@ -13,11 +13,12 @@ import type {
   AppDataGroup,
   ConfigSyncGroupHandle,
   SyncGroupHandle,
+  GroupDescriptor,
 } from './types';
 import { createConfigRepo } from './config-repo';
 import { createBackend } from './backend-registry';
 import { createLogger } from './logger';
-import { readGroupDescriptor } from './group-meta';
+import { readGroupDescriptor, readGroupDescriptorStrict, isNotFoundError } from './group-meta';
 import {
   isValidGroupInstanceId,
   summarizeIdentity,
@@ -114,6 +115,161 @@ async function detectGroupTypeDetailed(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Three-state probe + init guard (see SYNC-GROUP-DESIGN §3.1.1)
+// ---------------------------------------------------------------------------
+
+/** 探测结果：不可达 / 空库 / 只有 group-type 标记 / 已有组描述符。 */
+export type GroupProbeState = 'unreachable' | 'empty' | 'marked' | 'occupied';
+
+export interface GroupProbeResult {
+  state: GroupProbeState;
+  /** 已知的组类型；`empty`/`unreachable` 下为 null。 */
+  groupType: SyncGroupType | null;
+  /** 远端已有的身份摘要（仅 occupied 时可能非空）。 */
+  remote: RemoteIdentitySnapshot | null;
+  /** 出错原因（unreachable 时是失败原因；occupied 但 kind 非法时是说明）。 */
+  error?: string;
+  /**
+   * 探测时读到的完整描述符（`null` = 已确认远端没有描述符）。
+   * 供 `createConfigRepo` 复用，避免 setupSync 再读一次同一个 `group.json`。
+   */
+  descriptor?: GroupDescriptor | null;
+}
+
+function errorText(err: unknown): string {
+  return (err as Error)?.message ?? String(err);
+}
+
+/** 只提取路径类字段用于提示，绝不包含凭证/token。 */
+function rootHintOf(options: Record<string, unknown>): string | undefined {
+  for (const key of ['folderPath', 'basePath', 'root', 'remoteRoot', 'prefix', 'path']) {
+    const value = options[key];
+    if (typeof value === 'string' && value) return value;
+  }
+  return undefined;
+}
+
+function bytesToText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+  if (value instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(value));
+  return String(value ?? '');
+}
+
+/** 远端连不上（网络/鉴权/超时）：不能当成空库处理，直接拒绝，避免误建本地组。 */
+export class RemoteUnreachableError extends Error {
+  readonly code = 'REMOTE_UNREACHABLE';
+  constructor(readonly backendType: string, readonly reason?: string) {
+    super(
+      `远端不可达（${backendType}）${reason ? `：${reason}` : ''}；` +
+        '未创建任何本地同步组。请检查网络/凭证后重试。',
+    );
+    this.name = 'RemoteUnreachableError';
+  }
+}
+
+/** 远端是空库：必须由用户显式选择组类型（initGroupType）才允许初始化。 */
+export class NeedsInitError extends Error {
+  readonly code = 'NEEDS_INIT';
+  readonly requiresInit = true;
+  constructor(readonly backendType: string, readonly rootHint?: string) {
+    super(
+      `远端${rootHint ? `（${backendType} ${rootHint}）` : `（${backendType}）`}尚未初始化：` +
+        '请确认是否将其初始化为 config-sync 或 data-sync，再带 initGroupType 重试。',
+    );
+    this.name = 'NeedsInitError';
+  }
+}
+
+/**
+ * 三态探测：严格区分「远端不可达」与「真·空库」。
+ *
+ * - 严格读 `/.meta/group.json`：只有明确的“文件不存在”才继续；
+ *   其它错误一律视为不可达，不再 `catch {}` 吞掉。
+ * - 无描述符时读 `/.config/group-type`、`/.meta/group-type`：
+ *   读到合法值 = `marked`；都不存在 = `empty`。
+ */
+export async function probeGroupTypeDetailed(
+  type: string,
+  options: Record<string, unknown>,
+): Promise<GroupProbeResult> {
+  let tempBackend: Awaited<ReturnType<typeof createBackend>> | undefined;
+  try {
+    tempBackend = await createBackend({ type, options });
+  } catch (err) {
+    return { state: 'unreachable', groupType: null, remote: null, error: errorText(err) };
+  }
+
+  try {
+    let descriptor: Awaited<ReturnType<typeof readGroupDescriptorStrict>>;
+    try {
+      descriptor = await readGroupDescriptorStrict(tempBackend);
+    } catch (err) {
+      return { state: 'unreachable', groupType: null, remote: null, error: errorText(err) };
+    }
+
+    let remote: RemoteIdentitySnapshot | null = null;
+    if (descriptor) {
+      remote = {
+        kind: descriptor.kind,
+        id: descriptor.id,
+        instanceId: isInstanceIdLike(descriptor.instanceId) ? descriptor.instanceId : undefined,
+        ...(descriptor.name ? { name: descriptor.name } : {}),
+      };
+      if (descriptor.kind === 'config') {
+        log(`probe: .meta/group.json kind=config → occupied(config-sync)`);
+        return { state: 'occupied', groupType: 'config-sync', remote, descriptor };
+      }
+      if (descriptor.kind === 'data') {
+        log(`probe: .meta/group.json kind=data → occupied(data-sync)`);
+        return { state: 'occupied', groupType: 'data-sync', remote, descriptor };
+      }
+      return {
+        state: 'occupied',
+        groupType: null,
+        remote,
+        descriptor,
+        error: `无法识别的组描述符 kind="${String(descriptor.kind)}"`,
+      };
+    }
+
+    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
+      let raw: unknown;
+      try {
+        raw = await tempBackend.readFile(path, 'utf-8');
+      } catch (err) {
+        if (isNotFoundError(err)) continue;
+        return { state: 'unreachable', groupType: null, remote: null, error: errorText(err) };
+      }
+      const value = bytesToText(raw).trim();
+      if (value === 'config-sync' || value === 'data-sync') {
+        log(`probe: found "${value}" at ${path} (no descriptor) → marked`);
+        return { state: 'marked', groupType: value, remote: null, descriptor: null };
+      }
+      return {
+        state: 'occupied',
+        groupType: null,
+        remote: null,
+        descriptor: null,
+        error: `group-type 标记值非法："${value}"（${path}）`,
+      };
+    }
+
+    log('probe: no descriptor and no group-type marker → empty');
+    return { state: 'empty', groupType: null, remote: null, descriptor: null };
+  } finally {
+    if (tempBackend?.dispose) {
+      try {
+        await tempBackend.dispose();
+      } catch {
+        // ignore dispose failure
+      }
+    }
+  }
+}
+
+
 /**
  * Unified entry point for connecting to a zen-fs-config sync group.
  *
@@ -190,26 +346,36 @@ export async function connect(
   // Case 2: backendInfo provided — detect group type from remote
   // -----------------------------------------------------------------
   const { type, options: backendOptions } = options.backendInfo;
-  const detected = await detectGroupTypeDetailed(type, backendOptions);
-  const detectedType = detected.groupType;
+  const probe = await probeGroupTypeDetailed(type, backendOptions);
 
   let groupType: SyncGroupType;
-  if (detectedType) {
-    // Remote backend already has a group-type
-    if (options.groupType && options.groupType !== detectedType) {
-      const remoteText = summarizeIdentity(detected.remote);
-      const advice = detectedType === 'config-sync'
+  if (probe.state === 'unreachable') {
+    throw new RemoteUnreachableError(type, probe.error);
+  }
+  if (probe.state === 'empty') {
+    // 空库：默认不初始化。只有显式 initGroupType（新契约）或显式 groupType
+    //（旧调用方已经做过选择）才继续，否则让 UI 去问用户。
+    const chosen = options.initGroupType ?? options.groupType;
+    if (!chosen) throw new NeedsInitError(type, rootHintOf(backendOptions));
+    groupType = chosen;
+    log(`connect: empty remote, initialized as "${groupType}" (explicit consent)`);
+  } else if (probe.groupType) {
+    // 远端已被某个组占用（或只留下 group-type 标记）
+    if (options.groupType && options.groupType !== probe.groupType) {
+      const remoteText = summarizeIdentity(probe.remote);
+      const advice = probe.groupType === 'config-sync'
         ? '该远端根已被一个配置组占用：请给数据组换一个专属的远端根，或在配置组侧解除对该根的绑定'
         : '该远端根已被一个数据组占用：请给配置组换一个远端根，或删除那个数据组后端';
       throw new Error(
-        `Group type mismatch: 远端标记为 "${detectedType}"（${remoteText}），本端要求 "${options.groupType}"。${advice}`,
+        `Group type mismatch: 远端标记为 "${probe.groupType}"（${remoteText}），本端要求 "${options.groupType}"。${advice}`,
       );
     }
-    groupType = detectedType;
+    groupType = probe.groupType;
   } else {
-    // New backend — use options.groupType or default to config-sync
-    groupType = options.groupType ?? 'config-sync';
-    log(`connect: new backend, using groupType="${groupType}"`);
+    // occupied 但 kind 无法识别：不允许猜测，直接失败。
+    throw new Error(
+      `远端根已有无法识别的组描述符${probe.error ? `：${probe.error}` : ''}；拒绝自动建组。`,
+    );
   }
 
   // The config-sync repo always hosts the data groups' topology. For a
@@ -221,6 +387,12 @@ export async function connect(
     groupType === 'config-sync'
       ? {
           backendInfo: options.backendInfo,
+          prefetchedRemote: {
+            type,
+            options: backendOptions,
+            descriptor: probe.descriptor ?? null,
+          },
+          deferReplicaSetup: options.deferReplicaSetup,
           idbStoreName: options.idbStoreName,
           nodeId: options.nodeId,
           primaryBackendId: options.primaryBackendId,
@@ -278,6 +450,11 @@ export async function connect(
     }
   }
 
+  const replicasPending =
+    !!options.deferReplicaSetup && groupType === 'config-sync' && !!options.backendInfo;
+  const whenReplicasReady =
+    typeof repo.whenReplicasReady === 'function' ? repo.whenReplicasReady() : undefined;
+
   return {
     groupType,
     repo,
@@ -285,5 +462,7 @@ export async function connect(
     groups: [repo as unknown as SyncGroupHandle, ...appDataGroups],
     dataGroup,
     appDataGroups,
+    replicasPending,
+    whenReplicasReady,
   };
 }

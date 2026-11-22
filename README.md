@@ -155,6 +155,9 @@ const { repo } = await connect('my-app', {
     options: { token: 'xxx', owner: 'xxx', repo: 'xxx', branch: 'main' },
   },
   idbStoreName: 'my-app-config', // custom IndexedDB store name
+  // A brand-new (empty) remote has no group type of its own: state it explicitly,
+  // otherwise connect() throws NeedsInitError instead of guessing.
+  initGroupType: 'config-sync',
 });
 
 // Next time you don't need to pass backend info again
@@ -190,16 +193,43 @@ if (result.groupType === 'data-sync') {
 Detection & dispatch rules:
 
 - Always creates (or reuses) a **config-sync `ConfigRepo`** as the anchor.
-- Reads `/.meta/group-type` from the backend: `config-sync` → connect the repo to that backend; `data-sync` → attach the backend to the default app data group inside the config-sync repo.
-- If that file is absent (a brand-new backend), falls back to `options.groupType` (default `config-sync`).
-- If you pass `options.groupType` and it conflicts with the backend's actual type, `connect()` throws a `Group type mismatch` error.
-- The returned `ConnectResult` always carries `groupType` and `repo` (the config-sync repo). It also carries `dataGroup` (the default app data group) on first launch and when a data-sync backend was connected.
+- Probes the backend before creating anything local: it reads `/.meta/group.json` strictly (only a genuine "not found" counts as empty — a 401/403 is surfaced, not swallowed) and then the legacy `/.meta/group-type` marker. The probe yields one of `unreachable | empty | marked | occupied`.
+- `unreachable` → throws `RemoteUnreachableError` (`code: 'REMOTE_UNREACHABLE'`); no local group is created.
+- `empty` (no descriptor and no marker) → throws `NeedsInitError` (`code: 'NEEDS_INIT'`, `requiresInit: true`) unless you pass `initGroupType` (or the older `groupType`). **The library never guesses a group type for a brand-new backend** — ask the user and retry.
+- `marked` → `config-sync` connects the repo to that backend; `data-sync` attaches the backend to the default app data group inside the config-sync repo.
+- If `options.groupType` conflicts with the detected type, `connect()` throws a `Group type mismatch` error. An `occupied` descriptor with an invalid `kind` is rejected outright.
+- The returned `ConnectResult` always carries `groupType` and `repo` (the config-sync repo). It also carries `dataGroup` (the default app data group) when a data-sync backend was connected.
 
 | Method | Description |
 |--------|-------------|
 | `connect(appId, options?)` | Unified entry: always returns a `ConfigRepo`, optionally with a default data group |
+| `probeGroupTypeDetailed(type, options)` | Raw probe (no local writes): returns `{ state, groupType, remote, error?, descriptor? }` |
 
-`connect()` accepts the same options as `createConfigRepo` (`backendInfo`, `primaryBackendId`, `idbStoreName`, `nodeId`, `folderPath`, `cache`, `serializer`, `onConflict`, `syncPollIntervalMs`) plus `groupType`. On Node.js, pass `folderPath` (or set `ZEN_FS_CONFIG_HOME`) to enable local disk persistence.
+`connect()` accepts the same options as `createConfigRepo` (`backendInfo`, `primaryBackendId`, `idbStoreName`, `nodeId`, `folderPath`, `cache`, `serializer`, `onConflict`, `syncPollIntervalMs`) plus `groupType`, `initGroupType` (the type to use when the remote is empty) and `deferReplicaSetup`. On Node.js, pass `folderPath` (or set `ZEN_FS_CONFIG_HOME`) to enable local disk persistence.
+
+### Deferred replica setup: two signals
+
+`connect()` normally verifies every remote backend's group identity (a network round-trip per replica) before it returns. With `deferReplicaSetup: true` it stops doing that inline:
+
+```typescript
+const result = await connect('my-app', {
+  backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+  deferReplicaSetup: true,
+});
+
+// Signal ① — connect() has returned. Local config works right now.
+result.repo.getConfig('/theme');
+result.replicasPending; // true
+
+// Signal ② — remote identity check + pair creation finished.
+const summary = await result.whenReplicasReady?.();
+// { ready: ['Gitee-replica'], skipped: [], failed: [] }
+```
+
+- Signal ① (`connect()` resolved): the local repo is fully usable — reads/writes, `getBackends()` (descriptors are on disk), `listAppDataGroups()`. But no sync pair exists yet, so `getSyncStatuses()` is empty. **Never render an empty pair list as "no remote backend"**: check `replicasPending` first.
+- Signal ② (`whenReplicasReady()`): resolves with `{ ready, skipped, failed }`. `skipped` holds `{ backendId, reason }` for backends that belong to another group (identity conflict) — these are **not thrown** from `connect()` any more. `failed` holds `{ backendId, error }` for backend/network failures. The promise never rejects; it resolves immediately (with the current state) when defer is off, so consumers can `await` unconditionally.
+- No pair is created before verification succeeds. That removes the "create then tear down on conflict" window (and any need to gate syncing behind a flag); the price is that consumers must honour the two signals.
+- `dispose()` and `flush()` await the background setup, so a late pair can never attach to a disposed engine and `flush()` never runs against zero pairs.
 
 ## App data group path semantics
 
@@ -253,6 +283,7 @@ Each config file has a sidecar version file: `db.json` → `.db.json.version` (v
 | `publishNodeConfig(nodeId)` | Explicit one-shot push of node config to all backends (auto-sync also covers it) |
 | `peekNodeConfig<T>(nodeId, path)` | Read another node's config (from the synced-in local copy) |
 | `flush()` | Manually trigger all pending syncs |
+| `whenReplicasReady?()` | Optional; resolves with the replica setup summary (see deferred setup above) |
 | `listConflicts()` | List all archived conflicts |
 | `resolveConflict(id, merged)` | Resolve a conflict with merged content |
 | `fs.promises.*` | Standard fs API, chrooted to `/{appId}/` |

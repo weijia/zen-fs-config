@@ -59,7 +59,13 @@ export type {
 // Unified connect entry point — the single recommended external entry.
 // Data-sync groups are always managed by a config-sync repo (decision A / T5);
 // the standalone `createDataSyncGroup` factory is deprecated and NOT exported.
-export { connect } from './connect';
+export {
+  connect,
+  probeGroupTypeDetailed,
+  NeedsInitError,
+  RemoteUnreachableError,
+} from './connect';
+export type { GroupProbeState, GroupProbeResult } from './connect';
 
 // Backend registry
 export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, getBackendMetadata, listBackendMetadata, getAccountFields, mergeAccountFields, wrapZenFSFileSystem } from './backend-registry';
@@ -127,6 +133,8 @@ export type {
   BackendSyncState,
   ConnectOptions,
   ConnectResult,
+  ReplicaSetupSummary,
+  SyncGroupSyncEvent,
   BackendConflictReason,
   BackendConflictInfo,
   BackendConflictResolution,

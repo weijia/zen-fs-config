@@ -176,6 +176,24 @@ export interface ConfigRepoOptions {
     options: Record<string, unknown>;
   };
 
+  /**
+   * 连接前已探测到的远端描述符（内部优化）：同一个 type+options 的副本在
+   * `setupSync()` 里直接复用，省掉一次重复的 `group.json` 远端读。
+   * `descriptor: null` 表示已确认远端没有描述符（空库 / 老仓库）。
+   */
+  prefetchedRemote?: {
+    type: string;
+    options?: Record<string, unknown>;
+    descriptor: GroupDescriptor | null;
+  };
+
+  /**
+   * 把副本建对推迟到后台（默认 false）。开启后 `createConfigRepo` 先返回本地
+   * 可用的 repo，副本校验与建对由 `whenReplicasReady()` 通知；校验完成前不会
+   * 建任何 pair，也不会启动首同步。
+   */
+  deferReplicaSetup?: boolean;
+
   /** IndexedDB store name for the local primary backend. Default: `zen-fs-config-{appId}` */
   idbStoreName?: string;
 
@@ -312,6 +330,29 @@ export interface BackendSyncState {
    */
   error?: { message: string; timestamp: number };
 }
+
+/**
+ * 同步对事件（`onSyncEvent`）。
+ *
+ * `sync:end` 每轮同步结束都会发（**包含零变更轮**），调用方可用 `result`
+ * 里的计数过滤自己关心的变更；`sync:error` 只在整轮抛错时发。
+ */
+export interface SyncGroupSyncEvent {
+  type: 'sync:end' | 'sync:error';
+  /** 事件所属组的类型。 */
+  groupKind: SyncGroupKind;
+  /** 配置组固定为 `config`；数据组为其 groupId。 */
+  groupId: string;
+  /** 该同步对对应的后端 id（不含隐式本地主库）。 */
+  backendId: string;
+  pairId: string;
+  timestamp: number;
+  /** `sync:end` 时附带本轮结果。 */
+  result?: SyncResult;
+  /** `sync:error` 时的错误消息。 */
+  error?: string;
+}
+
 
 // ---------------------------------------------------------------------------
 // Sync Group (unified config-sync / data-sync model)
@@ -524,6 +565,11 @@ export interface SyncGroupHandle {
   // --- sync lifecycle ---
   getSyncStatuses(): Map<string, SyncPairStatus>;
   getBackendSyncStates(): Map<string, BackendSyncState>;
+  /**
+   * 订阅同步对事件（`sync:end` / `sync:error`）。返回取消订阅函数。
+   * 可选：老版本实现可能没有该方法，调用方按可选处理。
+   */
+  onSyncEvent?(handler: (event: SyncGroupSyncEvent) => void): () => void;
   flush(): Promise<SyncResult[]>;
   dispose(): Promise<void>;
 
@@ -574,8 +620,17 @@ export interface ConnectOptions {
     type: string;
     options: Record<string, unknown>;
   };
-  /** Force a specific group type (skips auto-detection for new backends). */
+  /**
+   * Force a specific group type. For an already-marked remote it must match the
+   * remote's type; for an empty remote it is treated as the user's explicit
+   * choice (legacy callers). New callers should use `initGroupType` instead.
+   */
   groupType?: SyncGroupType;
+  /**
+   * 空库初始化授权：仅当远端完全为空（无 group.json、无 group-type 标记）时使用。
+   * 未提供时 connect() 抛 `NeedsInitError`，由 UI 询问用户后带上本字段重试。
+   */
+  initGroupType?: SyncGroupType;
   /** IndexedDB store name. Default: `zen-fs-config-{appId}` */
   idbStoreName?: string;
   /**
@@ -604,6 +659,23 @@ export interface ConnectOptions {
   onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>;
   /** Sync polling interval in ms. Default: 1800000 (30 min). */
   syncPollIntervalMs?: number;
+
+  /**
+   * 把「建副本同步对」整体推迟到后台：`connect()` 只做探测 + 本地仓初始化，
+   * 返回后由 `whenReplicasReady` 通知结果。默认 false（保持旧行为）。
+   * 校验完成前不建任何 pair，因此不存在「建了又拆」的冲突窗口。
+   */
+  deferReplicaSetup?: boolean;
+}
+
+/** `whenReplicasReady()` 的结果：哪些副本已可用、哪些被跳过、哪些失败。 */
+export interface ReplicaSetupSummary {
+  /** 校验通过并已建同步对的副本 id。 */
+  ready: string[];
+  /** 因归属冲突/不可读被跳过的副本。 */
+  skipped: { backendId: string; reason: string }[];
+  /** 建实例或建对失败的副本。 */
+  failed: { backendId: string; error: string }[];
 }
 
 /** Result of connect(). */
@@ -626,6 +698,16 @@ export interface ConnectResult {
   dataGroup?: AppDataGroup;
   /** All app data group handles loaded for this app (may be empty). */
   appDataGroups?: AppDataGroup[];
+  /**
+   * 副本是否还在后台准备中。`true` 时 `repo` 已可用（本地数据可读），
+   * 但远端同步对尚未建好，调用方应等待 `whenReplicasReady` 再做远端相关操作。
+   */
+  replicasPending?: boolean;
+  /**
+   * 副本准备结果。未开启 `deferReplicaSetup` 时是一个已 resolve 的 Promise。
+   * 永不 reject：失败信息放在 `failed` / `skipped` 里。
+   */
+  whenReplicasReady?: Promise<ReplicaSetupSummary>;
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +720,11 @@ export interface IConfigRepo {
   readonly appId: string;
   /** Node ID. */
   readonly nodeId: string;
+  /**
+   * 副本后台准备的结果（`deferReplicaSetup` 时才有意义）。
+   * 未推迟时立即 resolve；永不 reject。
+   */
+  whenReplicasReady?(): Promise<ReplicaSetupSummary>;
   /** Fixed group id of the config-sync group (`config`). */
   readonly groupId: string;
   /** Structural discriminator — always `'config'`. */
@@ -680,6 +767,12 @@ export interface IConfigRepo {
 
   /** Get sync status for all registered sync pairs. */
   getSyncStatuses(): Map<string, SyncPairStatus>;
+
+  /**
+   * Subscribe to pair-level sync events (`sync:end` / `sync:error`).
+   * Returns an unsubscribe function. Optional for older implementations.
+   */
+  onSyncEvent?(handler: (event: SyncGroupSyncEvent) => void): () => void;
 
   /**
    * Per-backend sync state, including replica descriptors that failed to

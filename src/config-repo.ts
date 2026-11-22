@@ -38,6 +38,8 @@ import type {
   SetGroupInstanceIdOptions,
   SetGroupInstanceIdResult,
   GroupInstanceIdRootResult,
+  ReplicaSetupSummary,
+  SyncGroupSyncEvent,
 } from './types';
 import { createSerializerChain, configKeyToFilePath } from './serializer';
 import { createChrootFS } from './context-fs';
@@ -352,6 +354,23 @@ function backendDedupKey(desc: BackendDescriptor): string {
 }
 
 /**
+ * 取出连接前探测过的远端描述符（type+options 必须完全一致）。
+ * 返回 `undefined` 表示「没探测过，自己读」；返回 `null` 表示「已确认没有描述符」。
+ */
+function prefetchedDescriptorFor(
+  desc: BackendDescriptor,
+  prefetched?: ConfigRepoOptions['prefetchedRemote'],
+): GroupDescriptor | null | undefined {
+  if (!prefetched) return undefined;
+  const candidate: BackendDescriptor = {
+    id: 'prefetched',
+    type: prefetched.type,
+    options: prefetched.options ?? {},
+  };
+  return backendDedupKey(candidate) === backendDedupKey(desc) ? prefetched.descriptor : undefined;
+}
+
+/**
  * Age rank for a data backend — SMALLER means OLDER.
  * - backends with a numeric `createdAt` use that timestamp;
  * - legacy backends without `createdAt` are treated as the oldest; among
@@ -431,6 +450,11 @@ export class ConfigRepo implements IConfigRepo {
   private onConflictCallback?: (conflict: ConflictInfo) => Promise<unknown | null>;
   private disposed = false;
   private configCache = new Map<string, unknown>();
+  /** 后台建对（deferReplicaSetup）的状态，见 `whenReplicasReady()`。 */
+  private replicaSetupPromise: Promise<ReplicaSetupSummary> | null = null;
+  private replicaSetupSummary: ReplicaSetupSummary | null = null;
+  /** 同步对事件订阅者，见 `onSyncEvent()`。 */
+  private syncEventHandlers = new Set<(event: SyncGroupSyncEvent) => void>();
   private readonly primaryBackendId: string;
   private readonly cacheOptions?: CacheOptions;
   private readonly pollIntervalMs?: number;
@@ -692,6 +716,10 @@ export class ConfigRepo implements IConfigRepo {
 
   async flush(): Promise<SyncResult[]> {
     this.assertNotDisposed();
+    // defer 模式下副本可能还在后台建对：等它完成，否则 flush 会跑在 0 个 pair 上。
+    if (this.replicaSetupPromise) {
+      try { await this.replicaSetupPromise; } catch { /* never rejects */ }
+    }
     // Wait for background initial sync if still running — prevents
     // concurrent syncEngine.syncAll() calls which could cause race conditions.
     if (this.initialSyncPromise) {
@@ -1472,6 +1500,26 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * Subscribe to sync-pair events (`sync:end` / `sync:error`). Returns an
+   * unsubscribe function. Handlers run after the existing state bookkeeping,
+   * so `getSyncStatuses()` is already up to date when they fire.
+   */
+  onSyncEvent(handler: (event: SyncGroupSyncEvent) => void): () => void {
+    this.syncEventHandlers.add(handler);
+    return () => { this.syncEventHandlers.delete(handler); };
+  }
+
+  private emitSyncEvent(event: SyncGroupSyncEvent): void {
+    for (const handler of this.syncEventHandlers) {
+      try {
+        handler(event);
+      } catch (err) {
+        log.warn(`[ConfigRepo] sync event handler failed:`, err);
+      }
+    }
+  }
+
+  /**
    * Per-backend sync state. Includes replica descriptors that failed to connect
    * (they have no sync pair, so they never show up in getSyncStatuses()).
    */
@@ -1492,18 +1540,37 @@ export class ConfigRepo implements IConfigRepo {
   private trackSyncErrors(backendId: string, pairId: string): void {
     this.syncEngine.on(pairId, 'sync:error', (event) => {
       const error = event.error;
+      const message = error instanceof Error ? error.message : String(error ?? 'sync failed');
       this.backendStates.set(backendId, {
         backendId,
         pairId,
         error: {
-          message: error instanceof Error ? error.message : String(error ?? 'sync failed'),
+          message,
           timestamp: Date.now(),
         },
       });
+      this.emitSyncEvent({
+        type: 'sync:error',
+        groupKind: 'config',
+        groupId: this.groupId,
+        backendId,
+        pairId,
+        timestamp: event.timestamp ?? Date.now(),
+        error: message,
+      });
     });
-    this.syncEngine.on(pairId, 'sync:end', () => {
+    this.syncEngine.on(pairId, 'sync:end', (event) => {
       const current = this.backendStates.get(backendId);
       if (current?.error) this.backendStates.set(backendId, { backendId, pairId });
+      this.emitSyncEvent({
+        type: 'sync:end',
+        groupKind: 'config',
+        groupId: this.groupId,
+        backendId,
+        pairId,
+        timestamp: event.timestamp ?? Date.now(),
+        result: event.result,
+      });
     });
   }
 
@@ -1631,12 +1698,17 @@ export class ConfigRepo implements IConfigRepo {
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
+    // 后台建对可能还在跑：等它结束再拆，避免往已销毁的 syncEngine 上挂 pair。
+    if (this.replicaSetupPromise) {
+      try { await this.replicaSetupPromise; } catch { /* never rejects */ }
+    }
     // Wait for background initial sync if still running
     if (this.initialSyncPromise) {
       await this.initialSyncPromise;
       this.initialSyncPromise = null;
     }
     this.disposed = true;
+    this.syncEventHandlers.clear();
     // Clear post-delete sync timer
     if (this.postDeleteSyncTimer) {
       clearTimeout(this.postDeleteSyncTimer);
@@ -1662,29 +1734,144 @@ export class ConfigRepo implements IConfigRepo {
   // Internal — Setup
   // -----------------------------------------------------------------------
 
+  /** 当前副本准备结果（不等待）。 */
+  private collectReplicaSetupSummary(): ReplicaSetupSummary {
+    const failed: ReplicaSetupSummary['failed'] = [];
+    for (const [backendId, state] of this.backendStates) {
+      if (state.error) failed.push({ backendId, error: state.error.message });
+    }
+    return {
+      ready: Array.from(this.replicaBackends.keys()),
+      skipped: Array.from(this.skippedBackends, ([backendId, reason]) => ({ backendId, reason })),
+      failed,
+    };
+  }
+
+  /** 副本后台准备的结果。未开启 defer 时立即 resolve。永不 reject。 */
+  whenReplicasReady(): Promise<ReplicaSetupSummary> {
+    if (this.replicaSetupPromise) return this.replicaSetupPromise;
+    return Promise.resolve(this.replicaSetupSummary ?? this.collectReplicaSetupSummary());
+  }
+
+  /**
+   * 后台建对：`connect()` 只做探测 + 本地初始化，副本的 createBackend /
+   * 归属校验 / addPair 全部放在这里。
+   *
+   * 关键点：**校验完成前不建任何 pair**，因此不存在「pair 已存在但还没校验」
+   * 的冲突窗口，也不需要给同步加闸门；首同步与 watch 在 pair 建好之后才启动。
+   */
+  startReplicaSetupInBackground(
+    backends: BackendDescriptor[],
+    primaryBackendId: string,
+    pollIntervalMs?: number,
+    prefetchedRemote?: ConfigRepoOptions['prefetchedRemote'],
+    opts?: { migrateVersionSidecars?: boolean },
+  ): Promise<ReplicaSetupSummary> {
+    if (this.replicaSetupPromise) return this.replicaSetupPromise;
+
+    this.replicaSetupPromise = (async (): Promise<ReplicaSetupSummary> => {
+      if (this.disposed) return { ready: [], skipped: [], failed: [] };
+      try {
+        await this.setupSync(backends, primaryBackendId, pollIntervalMs, prefetchedRemote);
+      } catch (err) {
+        log.error('[ConfigRepo] background replica setup failed:', err);
+      }
+
+      // 旧版 `.x.version` 侧车迁移（只在 defer 模式下放到这里，先有副本才谈得上远端清理）。
+      if (opts?.migrateVersionSidecars) {
+        try {
+          await this.migrateLegacyVersionSidecars();
+        } catch (err) {
+          log.warn('[ConfigRepo] background version sidecar migration failed:', err);
+        }
+      }
+
+      if (this.disposed) {
+        this.replicaSetupSummary = this.collectReplicaSetupSummary();
+        return this.replicaSetupSummary;
+      }
+
+      // 建好对之后才启动首同步 + watch，避免 watch 快照把首同步跳掉。
+      if (this.replicaCount > 0) {
+        this.startBackgroundSync();
+        this.syncMetaToReplicas().catch((err) => {
+          log.error('[ConfigRepo] background syncMetaToReplicas failed:', err);
+        });
+      }
+
+      this.replicaSetupSummary = this.collectReplicaSetupSummary();
+      log.log(
+        `[ConfigRepo] background replica setup done: ready=${this.replicaSetupSummary.ready.join(',') || '(none)'} `
+        + `skipped=${this.replicaSetupSummary.skipped.length} failed=${this.replicaSetupSummary.failed.length}`,
+      );
+      return this.replicaSetupSummary;
+    })();
+
+    // 防止未处理的 rejection（内部已 catch，这里只是保险）。
+    this.replicaSetupPromise.catch(() => {});
+    return this.replicaSetupPromise;
+  }
+
   async setupSync(
     backends: BackendDescriptor[],
     primaryBackendId: string,
     pollIntervalMs?: number,
+    prefetchedRemote?: ConfigRepoOptions['prefetchedRemote'],
   ): Promise<void> {
     log.log(`[ConfigRepo] setupSync: ${backends.length} backends, primary=${primaryBackendId} pollInterval=${pollIntervalMs ?? 'default'}ms`);
 
+    const wanted: BackendDescriptor[] = [];
+    const seenIds = new Set<string>();
     for (const desc of backends) {
       if (desc.id === primaryBackendId) continue;
       if ((desc as any).enabled === false) {
         log.log(`[ConfigRepo] Skipping disabled replica: ${desc.id}`);
         continue;
       }
+      if (seenIds.has(desc.id)) {
+        log.warn(`[ConfigRepo] Duplicate backend id "${desc.id}" in setupSync input — using the first entry`);
+        continue;
+      }
+      seenIds.add(desc.id);
+      wanted.push(desc);
+    }
+
+    // 阶段 1：并发建实例、并发做归属校验。
+    // 每个副本的远端身份读互不依赖，原来串行执行会让延迟相加；
+    // connect() 已经探测过的那个后端（type+options 相同）直接复用描述符，
+    // 省掉同一次连接里的第二次 group.json 读取。
+    const prepared = new Map<string, { instance: any }>();
+    await Promise.all(wanted.map(async (desc) => {
       log.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
       try {
         const instance = await createBackend(desc);
 
         // 同步边界：远端根属于另一个同步组时**不建同步对**（跨组永不同步）。
-        const owner = await this.bindBackendIdentity(instance, desc.id);
+        const prefetched = prefetchedDescriptorFor(desc, prefetchedRemote);
+        const owner = await this.bindBackendIdentity(instance, desc.id, prefetched);
         if (owner === 'conflict') {
           try { await instance.dispose?.(); } catch { /* best effort */ }
-          continue;
+          return;
         }
+        prepared.set(desc.id, { instance });
+      } catch (err: any) {
+        log.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
+        this.backendStates.set(desc.id, {
+          backendId: desc.id,
+          error: {
+            message: err instanceof Error ? err.message : String(err),
+            timestamp: Date.now(),
+          },
+        });
+      }
+    }));
+
+    // 阶段 2：按描述符顺序建同步对（addPair 是同步操作，顺序不影响结果）。
+    for (const desc of wanted) {
+      const entry = prepared.get(desc.id);
+      if (!entry) continue;
+      try {
+        const instance = entry.instance;
 
         // Wrap replica with CachedFileSystem when caching is enabled.
         // This avoids redundant network reads on Gitee/RemoteStorage backends
@@ -2177,7 +2364,10 @@ export class ConfigRepo implements IConfigRepo {
     }
 
     const result = Array.from(seen.values()).map(i => i.desc);
-    this.backendDescriptorCache = result;
+    // 缓存必须是独立数组：调用方（如 createConfigRepo 的 allBackends）拿着返回数组，
+    // 而 writeBackendDescriptor() 会 push 进缓存 —— 直接共用同一个数组会让调用方的
+    // 列表凭空多出一项，setupSync 就会为同一个 id 建两次同步对。
+    this.backendDescriptorCache = [...result];
     return result;
   }
 
@@ -2511,13 +2701,26 @@ export class ConfigRepo implements IConfigRepo {
   // IConfigRepo — Group Type
   // -----------------------------------------------------------------------
 
+  private identityPromise: Promise<GroupIdentity> | null = null;
+
+  private async ensureGroupIdentity(kind: SyncGroupKind = 'config', id = CONFIG_GROUP_ID): Promise<GroupIdentity> {
+    // setupSync 现在并发校验多个副本：首次身份初始化只能跑一次，
+    // 否则并发分支会各自生成不同的 instanceId 并互相覆盖。
+    if (!this.identityPromise) {
+      this.identityPromise = this.resolveGroupIdentity(kind, id).finally(() => {
+        this.identityPromise = null;
+      });
+    }
+    return this.identityPromise;
+  }
+
   /**
    * 本组的同步身份（kind + id + 不可变 instanceId）。
    *
    * 首次调用时若 `.meta/group.json` 里还没有 `instanceId`（老部署），生成一个
    * 并就地写回 —— 只写一次，之后字节相同不再落盘。
    */
-  private async ensureGroupIdentity(kind: SyncGroupKind = 'config', id = CONFIG_GROUP_ID): Promise<GroupIdentity> {
+  private async resolveGroupIdentity(kind: SyncGroupKind = 'config', id = CONFIG_GROUP_ID): Promise<GroupIdentity> {
     let existingFeatures: GroupDescriptor['features'] | undefined;
     if (!this.instanceId) {
       let existing = null as Awaited<ReturnType<typeof readGroupDescriptor>>;
@@ -2742,10 +2945,11 @@ export class ConfigRepo implements IConfigRepo {
   private async bindBackendIdentity(
     instance: any,
     backendId: string,
+    prefetched?: GroupDescriptor | null,
   ): Promise<'match' | 'claimed' | 'conflict'> {
     try {
       const identity = await this.ensureGroupIdentity();
-      const result = await bindRemoteGroupIdentityDetailed(instance, identity);
+      const result = await bindRemoteGroupIdentityDetailed(instance, identity, prefetched);
       if (result.state === 'conflict') {
         this.skippedBackends.set(backendId, describeConflict(result));
         this.backendConflicts.set(backendId, {
@@ -3431,6 +3635,8 @@ class AppDataGroupImpl implements AppDataGroup {
   private dataBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string; desc: AppDataBackendDescriptor }> = new Map();
   private backendStates: Map<string, BackendSyncState> = new Map();
   private disposed = false;
+  /** 同步对事件订阅者，见 `onSyncEvent()`。 */
+  private syncEventHandlers = new Set<(event: SyncGroupSyncEvent) => void>();
 
   /** `.meta/` stores shared with the config-sync group. */
   private tombstones!: TombstoneStore;
@@ -4261,6 +4467,22 @@ class AppDataGroupImpl implements AppDataGroup {
     return this.syncEngine.getStatusAll();
   }
 
+  /** 订阅同步对事件；返回取消订阅函数。见 `SyncGroupSyncEvent`。 */
+  onSyncEvent(handler: (event: SyncGroupSyncEvent) => void): () => void {
+    this.syncEventHandlers.add(handler);
+    return () => { this.syncEventHandlers.delete(handler); };
+  }
+
+  private emitSyncEvent(event: SyncGroupSyncEvent): void {
+    for (const handler of this.syncEventHandlers) {
+      try {
+        handler(event);
+      } catch (err) {
+        log.warn(`[AppDataGroup:${this.groupId}] sync event handler failed:`, err);
+      }
+    }
+  }
+
   async flush(): Promise<SyncResult[]> {
     // Delete tombstoned files everywhere BEFORE syncing, so a remote copy
     // cannot be seen as "newer" and win.
@@ -4284,18 +4506,37 @@ class AppDataGroupImpl implements AppDataGroup {
   private trackSyncErrors(backendId: string, pairId: string): void {
     this.syncEngine.on(pairId, 'sync:error', (event) => {
       const error = event.error;
+      const message = error instanceof Error ? error.message : String(error ?? 'sync failed');
       this.backendStates.set(backendId, {
         backendId,
         pairId,
         error: {
-          message: error instanceof Error ? error.message : String(error ?? 'sync failed'),
+          message,
           timestamp: Date.now(),
         },
       });
+      this.emitSyncEvent({
+        type: 'sync:error',
+        groupKind: 'data',
+        groupId: this.groupId,
+        backendId,
+        pairId,
+        timestamp: event.timestamp ?? Date.now(),
+        error: message,
+      });
     });
-    this.syncEngine.on(pairId, 'sync:end', () => {
+    this.syncEngine.on(pairId, 'sync:end', (event) => {
       const current = this.backendStates.get(backendId);
       if (current?.error) this.backendStates.set(backendId, { backendId, pairId });
+      this.emitSyncEvent({
+        type: 'sync:end',
+        groupKind: 'data',
+        groupId: this.groupId,
+        backendId,
+        pairId,
+        timestamp: event.timestamp ?? Date.now(),
+        result: event.result,
+      });
     });
   }
 
@@ -4634,6 +4875,7 @@ class AppDataGroupImpl implements AppDataGroup {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.syncEventHandlers.clear();
     if (this.postDeleteTimer) {
       clearTimeout(this.postDeleteTimer);
       this.postDeleteTimer = undefined;
@@ -4673,6 +4915,17 @@ export async function createConfigRepo(
   options: ConfigRepoOptions = {},
 ): Promise<IConfigRepo> {
   // -------------------------------------------------------------------
+  // Step 0: Phase timing — connect() 的阻塞耗时全部在这个工厂里，必须可观测
+  // -------------------------------------------------------------------
+  const nowMs = (): number =>
+    typeof globalThis.performance?.now === 'function' ? globalThis.performance.now() : Date.now();
+  const connectStartedAt = nowMs();
+  const phase = (name: string, extra?: string): void => {
+    const ms = Math.round(nowMs() - connectStartedAt);
+    log.log(`[connect-timing] ${name}: ${ms}ms${extra ? ` (${extra})` : ''}`);
+  };
+  phase('start');
+  // -------------------------------------------------------------------
   // Step 1: Create the local primary backend (IndexedDB on browser, Folder on Node)
   // -------------------------------------------------------------------
   const localPrimary = await resolveLocalPrimary(appId, 'config', {
@@ -4682,6 +4935,7 @@ export async function createConfigRepo(
   log.log(`[createConfigRepo] Creating local primary (type: ${localPrimary.type})...`);
 
   const primaryInstance = await createBackend(localPrimary);
+  phase('local-primary');
 
   const cachedFS = primaryInstance;
 
@@ -4727,6 +4981,7 @@ export async function createConfigRepo(
       log.warn(`[createConfigRepo] .keep purge failed:`, err?.message ?? err);
     }
   }
+  phase('local-purge');
 
   // Cache is enabled by default for replica backends (Gitee, RemoteStorage,
   // etc.) using IdbCacheStore. The local IndexedDB primary is not cached.
@@ -4808,6 +5063,7 @@ export async function createConfigRepo(
   } catch (err: any) {
     log.warn(`[createConfigRepo] Failed to write group metadata:`, err.message);
   }
+  phase('local-meta');
 
   // -------------------------------------------------------------------
   // Step 3: Create temp repo for meta operations (nodeId not yet known)
@@ -4875,6 +5131,7 @@ export async function createConfigRepo(
   }
 
   log.log(`[createConfigRepo] Replica backends: ${allBackends.map(b => b.id).join(', ') || '(none)'}`);
+  phase('descriptors', `backends=${allBackends.length}`);
 
   // -------------------------------------------------------------------
   // Step 7: Determine nodeId
@@ -4908,9 +5165,30 @@ export async function createConfigRepo(
     if (nameDescriptor?.name) repo.name = nameDescriptor.name;
   } catch { /* name is optional */ }
 
-  await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs);
+  // Load config cache from local IndexedDB (fast, no network) — 本地操作，
+  // 与副本无关：先加载，defer 模式下 connect 返回时就能直接读配置。
+  await repo.load();
+  phase('load');
 
-  // Step 8a: Migrate legacy `.x.version` sidecars to the new `<name>.version`
+  // -------------------------------------------------------------------
+  // Step 8a: defer 模式 —— 只返回本地可用的 repo，副本的事全放后台。
+  // -------------------------------------------------------------------
+  if (options.deferReplicaSetup) {
+    repo.startReplicaSetupInBackground(
+      allBackends,
+      LOCAL_IDB_BACKEND_ID,
+      options.syncPollIntervalMs,
+      options.prefetchedRemote,
+      { migrateVersionSidecars: options.migrateVersionSidecars !== false },
+    );
+    phase('return', 'replicas pending');
+    return repo;
+  }
+
+  await repo.setupSync(allBackends, LOCAL_IDB_BACKEND_ID, options.syncPollIntervalMs, options.prefetchedRemote);
+  phase('setupSync', `replicas=${allBackends.length}`);
+
+  // Step 8b: Migrate legacy `.x.version` sidecars to the new `<name>.version`
   // naming. Runs locally (rename) and on every replica (delete residual), so
   // existing version history is preserved and the old dotfile copies disappear
   // from both ends instead of being re-pulled by sync.
@@ -4924,11 +5202,9 @@ export async function createConfigRepo(
       log.warn(`[createConfigRepo] version sidecar migration failed:`, err?.message ?? err);
     }
   }
+  phase('version-migrate');
 
-  // Load config cache from local IndexedDB (fast, no network)
-  await repo.load();
-
-  // Step 8b: Initial sync + dedup cycle — run in BACKGROUND to avoid
+  // Step 8c: Initial sync + dedup cycle — run in BACKGROUND to avoid
   // blocking the caller. The sync engine's watchAll() will start
   // monitoring for changes once the initial sync completes.
   // flush() and dispose() will await this if called before it finishes.
@@ -4943,6 +5219,7 @@ export async function createConfigRepo(
     log.error('[createConfigRepo] background syncMetaToReplicas failed:', err);
   });
 
+  phase('ready', 'background sync started');
   return repo;
 }
 

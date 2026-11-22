@@ -153,6 +153,9 @@ const { repo } = await connect('my-app', {
     options: { token: 'xxx', owner: 'xxx', repo: 'xxx', branch: 'main' },
   },
   idbStoreName: 'my-app-config',  // 自定义 IndexedDB store 名称
+  // 全新（空）远端自己没有组类型：必须显式声明，
+  // 否则 connect() 抛 NeedsInitError，而不是替你猜。
+  initGroupType: 'config-sync',
 });
 
 // 之后重新打开时不需要再传后端参数
@@ -183,16 +186,43 @@ if (result.groupType === 'data-sync') {
 探测与分发规则：
 
 - 始终创建（或复用）一个**配置同步组 `ConfigRepo`** 作为锚点。
-- 读取后端上的 `/.meta/group-type`：`config-sync` → 将该后端连到配置同步组；`data-sync` → 把它挂到配置同步组下的默认数据组。
-- 若该文件不存在（全新后端），回退到 `options.groupType`（默认 `config-sync`）。
-- 如果你显式传了 `options.groupType`，且与后端实际类型不符，`connect()` 会抛出 `Group type mismatch` 错误。
-- 返回的 `ConnectResult` 始终带 `groupType` 和 `repo`（配置同步组）；首次启动或接入 data-sync 后端时还带 `dataGroup`（默认数据组）。
+- 建任何本地东西之前先探测后端：严格读 `/.meta/group.json`（只有真正的「不存在」才算空，401/403 会照实报错而不是被吞成空库），没有描述符时再读旧标记 `/.meta/group-type`。探测结果是 `unreachable | empty | marked | occupied` 四态之一。
+- `unreachable` → 抛 `RemoteUnreachableError`（`code: 'REMOTE_UNREACHABLE'`），不创建本地组。
+- `empty`（无描述符也无标记）→ 抛 `NeedsInitError`（`code: 'NEEDS_INIT'`，`requiresInit: true`），除非你传了 `initGroupType`（或旧选项 `groupType`）。**库不会替全新后端猜组类型** —— 先问用户，再带类型重连。
+- `marked` → `config-sync` 把该后端连到配置同步组；`data-sync` 把它挂到配置同步组下的默认数据组。
+- 显式传的 `options.groupType` 与探测结果不符 → `Group type mismatch`；`occupied` 但描述符 `kind` 非法 → 直接报错。
+- 返回的 `ConnectResult` 始终带 `groupType` 和 `repo`（配置同步组）；接入 data-sync 后端时还带 `dataGroup`（默认数据组）。
 
 | 方法 | 说明 |
 |---|---|
 | `connect(appId, options?)` | 统一入口：始终返回 `ConfigRepo`，可选附带默认数据组 |
+| `probeGroupTypeDetailed(type, options)` | 只探测、不写本地：返回 `{ state, groupType, remote, error?, descriptor? }` |
 
-`connect()` 接受与 `createConfigRepo` 相同的选项（`backendInfo`、`primaryBackendId`、`idbStoreName`、`nodeId`、`folderPath`、`cache`、`serializer`、`onConflict`、`syncPollIntervalMs`），另加 `groupType`。在 Node.js 上通过 `folderPath`（或设 `ZEN_FS_CONFIG_HOME`）开启本地磁盘持久化。
+`connect()` 接受与 `createConfigRepo` 相同的选项（`backendInfo`、`primaryBackendId`、`idbStoreName`、`nodeId`、`folderPath`、`cache`、`serializer`、`onConflict`、`syncPollIntervalMs`），另加 `groupType`、`initGroupType`（远端为空时用户选定的组类型）与 `deferReplicaSetup`。在 Node.js 上通过 `folderPath`（或设 `ZEN_FS_CONFIG_HOME`）开启本地磁盘持久化。
+
+### deferReplicaSetup：两个信号
+
+默认情况下，`connect()` 要逐个校验远端后端的组身份（每个副本一次网络往返）才能返回。传 `deferReplicaSetup: true` 后这段挪到后台：
+
+```typescript
+const result = await connect('my-app', {
+  backendInfo: { type: 'Gitee', options: { token, owner, repo, branch } },
+  deferReplicaSetup: true,
+});
+
+// 信号① —— connect() 已返回，本地配置立刻可用
+result.repo.getConfig('/theme');
+result.replicasPending; // true
+
+// 信号② —— 远端校验 + 建对完成
+const summary = await result.whenReplicasReady?.();
+// { ready: ['Gitee-replica'], skipped: [], failed: [] }
+```
+
+- 信号①（`connect()` resolve）：本地仓完整可用 —— 读写、`getBackends()`（描述符已落盘）、`listAppDataGroups()` 都正常。但此时还没有同步对，`getSyncStatuses()` 是空的。**不能把空的同步对列表当成「没有远端后端」**，先看 `replicasPending`。
+- 信号②（`whenReplicasReady()`）：resolve 出 `{ ready, skipped, failed }`。`skipped` 是 `{ backendId, reason }`，表示该后端归属别的同步组（身份冲突）—— 这类情况**不再从 `connect()` 抛出**；`failed` 是 `{ backendId, error }`，表示建实例 / 网络失败。该方法永不 reject；未开 defer 时也会立即 resolve（读当前状态），所以调用方可以无分支地 `await`。
+- 校验通过前不建任何同步对，因此没有「建了又拆」的冲突窗口，也不需要给同步加闸门。代价是消费方必须认上面两个信号。
+- `dispose()` 与 `flush()` 都会等待后台建对，晚到的 pair 不会挂到已销毁的引擎上，`flush()` 也不会跑在 0 个 pair 上。
 
 ## 数据组的路径语义
 
@@ -244,6 +274,7 @@ await dataGroup.fs.promises.writeFile('/struct/host.json', json);
 | `publishNodeConfig(nodeId)` | 显式一次性推送节点配置到所有后端（自动同步已覆盖） |
 | `peekNodeConfig<T>(nodeId, path)` | 只读查看其他节点的已发布配置 |
 | `flush()` | 手动触发所有同步 |
+| `whenReplicasReady?()` | 可选；resolve 出副本建对摘要（见上文 defer 模式） |
 | `listConflicts()` | 列出所有冲突归档 |
 | `resolveConflict(id, merged)` | 用合并内容解决冲突 |
 | `fs.promises.*` | 标准 fs API，chroot 隔离到 `/{appId}/` |

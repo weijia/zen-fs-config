@@ -107,11 +107,21 @@ describe('connect() — unified entry point', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Case 4: backendInfo on a brand-new backend (no group-type) → config-sync
+  // Case 4: backendInfo on a brand-new backend (no group-type) → needs init
   // -------------------------------------------------------------------------
-  it('connect with backendInfo on a new backend (no group-type) defaults to config-sync', async () => {
-    const result: ConnectResult = await connect('test-conn-app4', {
-      backendInfo: { type: 'InMemory', options: { label: 'remote-new' } },
+  it('connect with backendInfo on an empty backend requires explicit init', async () => {
+    await expect(
+      connect('test-conn-app4', {
+        backendInfo: { type: 'InMemory', options: { label: 'remote-new' } },
+        nodeId: 'test-node',
+      }),
+    ).rejects.toMatchObject({ code: 'NEEDS_INIT' });
+  });
+
+  it('connect with backendInfo on an empty backend + initGroupType defaults to config-sync', async () => {
+    const result: ConnectResult = await connect('test-conn-app4b', {
+      backendInfo: { type: 'InMemory', options: { label: 'remote-new-init' } },
+      initGroupType: 'config-sync',
       nodeId: 'test-node',
     });
     expect(result.groupType).toBe('config-sync');

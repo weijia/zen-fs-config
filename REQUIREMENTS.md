@@ -172,6 +172,16 @@
 - FR11.2：自定义 `ConfigSerializer`（按扩展名解析）。
 - FR11.3：`onConflict` 自定义冲突解决回调。
 
+### FR12 — 同步事件通知（sync events）
+
+- FR12.1：`IConfigRepo.onSyncEvent(handler)` 与 `AppDataGroup.onSyncEvent(handler)` 订阅同步对事件，返回取消订阅函数。事件 `SyncGroupSyncEvent` 至少含：`type`（`sync:end` / `sync:error`）、`groupKind`（`config` / `data`）、`groupId`、`backendId`、`pairId`、`timestamp`；`sync:end` 附 `result: SyncResult`，`sync:error` 附 `error: string`。
+- FR12.2：`sync:end` 每轮同步结束都发一次（**含零变更轮**）；调用方用 `result` 里的 `filesCreated/Updated/Deleted` 等计数过滤真实变更，不另设"仅变更才发"的模式。
+- FR12.3：事件在既有状态簿记之后派发——handler 执行时 `getSyncStatuses()` / `getBackendSyncStates()` 已是本轮之后的状态。
+- FR12.4：单个 handler 抛错只记日志，不影响同步本身与其它订阅者；`dispose()` 清空所有订阅。
+- FR12.5：UI 转发：`<sync-group-configurator>` 的 `sync` 事件（React `onSync`）载荷与库事件一致；控件收到事件后立即刷新状态行（不再等 2 秒轮询）。旧版库没有 `onSyncEvent` 时控件静默降级，不报错。
+
+**验收**：`flush()` 触发一轮后收到 `sync:end` 且字段齐全（`backendId`/`pairId`/`result`）；取消订阅后不再收到；数据组事件 `groupKind='data'` 且 `groupId` 为组 id；handler 抛错不影响后续轮次；旧库无该方法时 UI 正常工作。实现见 `sync-events.test.ts`（库）与 `sync-events.test.ts`（UI 订阅适配层）。
+
 ## 6. 非功能需求（NFR）
 
 - NFR1 离线可用：config-sync 所有读写直接命中 IndexedDB，无网络也可工作。
@@ -245,6 +255,8 @@
 - **T3（data-sync 参数级去重 · 结论见 §8 #1 / FR5.2）**：`AppDataGroupImpl.addBackend` 补 `backendDedupKey` 校验，与 config-sync 对齐。
 - **T4（`hasLocalConfig` API）**：落地 `ConfigRepo.hasLocalConfig(appId)`（静态，查本地主后端）作为 config-sync 便捷首跑依据；**不扩展到独立 data-sync 入口（已随决策 A 废除）**（由 FR2.1 / FR7.3 确定，见 §8 #2）。
 - **T5（废除独立 data-sync 顶层入口 · 决策 A）【已实现】**：移除/降级顶层独立 data-sync 入口（保留为 `@deprecated` 导出），数据组一律经 `ConfigRepo.createAppDataGroup(appId, id, options?)` 创建并登记到 `.meta/app-data-groups/{appId}/{id}.json`；`connect` 始终以配置同步组为锚点——首启动建默认数据组，接入 data-sync 后端时把该后端挂到默认数据组并回写配置（见 FR2.3 / USE-CASES UC2 / UC3）；§8 #4 随之消除。`DESIGN.md`/`DESIGN.zh-CN.md`/`PROMPT.md`/`README.md`/`README.zh-CN.md` 已同步更新。
+- **T6（同步事件通知 · FR12）【已实现】**：`ConfigRepo` / `AppDataGroupImpl` 各自维护 `syncEventHandlers` 并暴露 `onSyncEvent(handler): () => void`；在既有 `trackSyncErrors` 的 `sync:error` / `sync:end` 回调里同时派发 `SyncGroupSyncEvent`（`groupKind` 分别为 `config` / `data`），`dispose()` 清空订阅。UI 侧 `subscribeGroupSyncEvents` 适配层把 repo/数据组的 `onSyncEvent` 转成 `sync` 事件（Web Component）与 `onSync`（React），并立即刷新状态行。
+  - 验证：库 `sync-events.test.ts` 2 项（配置组 `flush` 收到 `sync:end` + 取消订阅、数据组 `groupKind='data'`）；UI `sync-events.test.ts` 2 项（转发/取消、旧库返回 null）；两端 `tsc --noEmit` 干净。
 
 ## 11. 验收总表
 
@@ -264,6 +276,7 @@
 | FR9 删除传播 | 墓碑跨副本删、GC |
 | FR10 缓存 | 零下载重校验、持久热启动 |
 | FR11 扩展 | 自定义后端/序列化/冲突回调 |
+| FR12 同步事件 | `onSyncEvent` 可订阅/取消；`sync:end` 每轮必发且带 `result`；数据组 `groupKind='data'`；UI 转发 `sync` 事件并立即刷新状态行；旧库无该方法时静默降级 |
 
 ## 12. 依赖
 
