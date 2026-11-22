@@ -186,7 +186,8 @@ if (result.groupType === 'data-sync') {
 探测与分发规则：
 
 - 始终创建（或复用）一个**配置同步组 `ConfigRepo`** 作为锚点。
-- 建任何本地东西之前先探测后端：严格读 `/.meta/group.json`（只有真正的「不存在」才算空，401/403 会照实报错而不是被吞成空库），没有描述符时再读旧标记 `/.meta/group-type`。探测结果是 `unreachable | empty | marked | occupied` 四态之一。
+- 建任何本地东西之前先探测后端：严格读 `/.meta/group.json`（只有真正的「不存在」才算空，401/403 会照实报错而不是被吞成空库），没有描述符时再读旧标记 `/.config/group-type`、`/.meta/group-type`。探测结果是 `unreachable | empty | marked | occupied` 四态之一。
+- **库不再生成任何 `group-type` 标记**（0.9.0 起）：组类型只由 `group.json` 的 `kind` 表达，旧标记仅作读取兼容，遇到就删除。所以 `getGroupType()` 在新部署上返回 `null`，判断类型请读描述符的 `kind`（或直接看 `connect()` 返回的 `groupType`）。
 - `unreachable` → 抛 `RemoteUnreachableError`（`code: 'REMOTE_UNREACHABLE'`），不创建本地组。
 - `empty`（无描述符也无标记）→ 抛 `NeedsInitError`（`code: 'NEEDS_INIT'`，`requiresInit: true`），除非你传了 `initGroupType`（或旧选项 `groupType`）。**库不会替全新后端猜组类型** —— 先问用户，再带类型重连。
 - `marked` → `config-sync` 把该后端连到配置同步组；`data-sync` 把它挂到配置同步组下的默认数据组。

@@ -526,12 +526,12 @@ export async function createDataSyncGroup(
   });
   const localFS = await createBackend(localPrimary);
 
-  // Step 2: Ensure /.meta/ exists and write group-type
+  // Step 2: Ensure /.meta/ exists（不再写 group-type 标记）
   try {
     await localFS.mkdir(META_DIR);
   } catch { /* already exists */ }
 
-  // Step 3: If backendInfo provided, check/create group-type and register backend
+  // Step 3: 有 backendInfo 时先按 legacy 标记粗判类型（只读），再登记后端
   if (options.backendInfo) {
     const remoteBackend = await createBackend({
       type: options.backendInfo.type,
@@ -550,15 +550,8 @@ export async function createDataSyncGroup(
       // If "data-sync", that's fine — we'll read its backends
     } catch (err: any) {
       if (err.message?.includes('config-sync')) throw err;
-      // File doesn't exist — write group-type on remote
-      try {
-        await remoteBackend.writeFile(
-          GROUP_TYPE_FILE,
-          new TextEncoder().encode('data-sync'),
-        );
-      } catch (writeErr: any) {
-        log(`Could not write group-type on remote: ${writeErr.message}`);
-      }
+      // 标记不存在：什么都不写（0.9.0 起本库不再生成 group-type，
+      // 类型由 `.meta/group.json` 的 kind 表达；标记仅作旧部署读取兼容）。
     }
 
     // Read remote backends (if any)
@@ -580,10 +573,7 @@ export async function createDataSyncGroup(
     // Create the group
     const group = new DataSyncGroup(appId, groupId, localFS);
 
-    // Write group-type on local
-    try {
-      await localFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode('data-sync'));
-    } catch { /* ignore */ }
+    // 不再写 group-type 标记（0.9.0 起停写，类型由 `.meta/group.json` 承载）
 
     // Add the user-provided backend
     const backendId = options.primaryBackendId || `${options.backendInfo.type}-primary`;
@@ -631,9 +621,7 @@ export async function createDataSyncGroup(
 
   // No backendInfo — just local-only group
   const group = new DataSyncGroup(appId, groupId, localFS);
-  try {
-    await localFS.writeFile(GROUP_TYPE_FILE, new TextEncoder().encode('data-sync'));
-  } catch { /* ignore */ }
+  // 不再写 group-type 标记（0.9.0 起停写）
 
   log(`createDataSyncGroup: local-only group created`);
   return group;

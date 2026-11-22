@@ -106,7 +106,6 @@ import {
   isDeletableLegacyMetaPath,
   META_BACKENDS_DIR,
   encodeMetaPath,
-  ensureParentDir,
   readGroupDescriptor,
   readGroupDescriptorStrict,
   writeGroupDescriptor,
@@ -3042,27 +3041,17 @@ export class ConfigRepo implements IConfigRepo {
     }
   }
 
-  /** Write the group-type marker file if it doesn't exist. */
+  /**
+   * 确保统一组描述符（`.meta/group.json`）就位。
+   *
+   * **已停写 `group-type` 标记**：`/.config/group-type` 与 `/.meta/group-type`
+   * 都不再生成。组类型现在只由描述符的 `kind` 表达，标记仅作旧部署的读取兼容
+   * （`getGroupType()`、`probeGroupTypeDetailed()` 的 legacy 分支），遗留文件会被顺手清掉。
+   * `type` 参数只为兼容既有调用方保留，不再决定任何写入内容。
+   */
   async ensureGroupType(type: SyncGroupType): Promise<void> {
     this.assertNotDisposed();
-    for (const path of [GROUP_TYPE_FILE, LEGACY_GROUP_TYPE_FILE]) {
-      try {
-        const existing = await this.cachedFS.readFile(path, 'utf-8');
-        const current = (existing as string).trim();
-        if (current && current !== type) {
-          log.warn(`[ConfigRepo] group-type already set to "${current}" at ${path}, ignoring request to set "${type}"`);
-          return;
-        }
-      } catch {
-        // File doesn't exist — write it below
-      }
-    }
-    const bytes = new TextEncoder().encode(type);
-    // 只写新布局标记；legacy `.meta/group-type` 不再生成（读了它只作兼容）。
-    if (!(await this.safeExists(this.cachedFS, GROUP_TYPE_FILE))) {
-      await this.ensureDir(GROUP_TYPE_FILE);
-      await this.cachedFS.writeFile(GROUP_TYPE_FILE, bytes);
-    }
+    log.log(`[ConfigRepo] ensureGroupType(${type}): 只确保 group.json，不写 group-type 标记`);
     // Unified group descriptor (`.meta/group.json`) — written once, for both
     // kinds. Renames update it explicitly; launches must not rewrite it (that
     // would produce needless sync churn).
@@ -3106,9 +3095,9 @@ export class ConfigRepo implements IConfigRepo {
       });
       log.log(`[ConfigRepo] assigned group instanceId ${this.instanceId} (kind=${existingDescriptor?.kind ?? 'config'})`);
     }
-    log.log(`[ConfigRepo] group-type set to "${type}"`);
-    // 描述符已就位，旧布局 `.meta/group-type` 只剩副作用：配置组同步会把它
-    // 推回每个远端根，于是「删掉又被写回」。有描述符就清掉它。
+    log.log('[ConfigRepo] group descriptor ensured');
+    // 标记已停写，遗留的那份只剩副作用：配置组同步会把它推回每个远端根，于是
+    // 「删掉又被写回」。见即清。
     if (await this.safeExists(this.cachedFS, LEGACY_GROUP_TYPE_FILE)) {
       try {
         await this.cachedFS.unlink(LEGACY_GROUP_TYPE_FILE);
@@ -5008,8 +4997,12 @@ export async function createConfigRepo(
   }
 
   // -------------------------------------------------------------------
-  // Step 2b: Write group-type = "config-sync" (new `.config/` layout)
+  // Step 2b: Ensure the unified group descriptor (`/.meta/group.json`)
   // -------------------------------------------------------------------
+  // `group-type` 标记（`/.config/group-type`、legacy `/.meta/group-type`）已停写：
+  // 组类型只由描述符的 `kind` 表达。标记仅保留读取兼容，遗留文件见即清 ——
+  // 它会被配置组同步推回每个远端根（线上 golf-admin 根上「删了又复活」的
+  // config-sync 就是它）。
   // 先看这个根自己的声明。本地主根永远是本应用的配置组存储，所以这里的
   // `kind=data` 只可能是「别的组把它的 .meta/group.json 同步过来了」造成的
   // 污染（线上 admin 就是这么被一台数据组根覆盖的）。这种情况就地纠正回
@@ -5034,31 +5027,29 @@ export async function createConfigRepo(
       features: CONFIG_GROUP_FEATURES,
     });
   }
+  // `/.config/` 目录仍按布局保留（配置专属元数据都落在里面），但不再往里写
+  // group-type 标记 —— 目录本身是布局契约，标记是历史遗留。
   try {
-    const groupTypeBytes = new TextEncoder().encode('config-sync');
-    // 只写新布局 `.config/group-type`；legacy `.meta/group-type` 不再补写，
-    // 否则删掉一个还会有另一个「复活」，两个标记永远互相打架。
-    const markerPath = `${CONFIG_DIR}/group-type`;
-    try {
-      await primaryInstance.readFile(markerPath);
-    } catch {
-      await ensureParentDir(primaryInstance, markerPath);
-      await primaryInstance.writeFile(markerPath, groupTypeBytes);
-      log.log(`[createConfigRepo] group-type set to "config-sync" at ${markerPath}`);
-    }
-    // Unified descriptor (`.meta/group.json`) — shared by both group kinds.
+    await primaryInstance.mkdir(CONFIG_DIR);
+  } catch {
+    /* 已存在 —— 正常情况 */
+  }
+  try {
+    // 统一描述符（`.meta/group.json`）由身份流程按需写入，这里只清遗留标记。
     // 初始化**不预置身份**：本组还一个后端都没接时不该凭空派生一个 instanceId，
     // 否则新设备 / 清过本地库的客户端一打开就带着一个随机身份，同步上去后会把
     // 远端根的身份顶掉。身份在「接入第一个后端」「用户显式设置」「沿用远端已有
     // 身份」时才由 ensureGroupIdentity / 身份流程写入。
-    // 旧布局遗留的 `.meta/group-type` 必须主动清掉：描述符已经写好了，
-    // 这枚标记既是冗余，又会被配置组同步推回各个远端根（线上那台
-    // golf-admin 根上「删了又复活」的 config-sync 就是它）。
-    try {
-      await primaryInstance.unlink(`${META_DIR}/group-type`);
-      log.log('[createConfigRepo] removed stale legacy .meta/group-type');
-    } catch {
-      /* 不存在 —— 正常情况 */
+    // 遗留标记（`.config/group-type` 与旧布局 `.meta/group-type`）见即清：
+    // 类型已由描述符承载，标记既是冗余，又会被配置组同步推回各个远端根
+    // （线上那台 golf-admin 根上「删了又复活」的 config-sync 就是它）。
+    for (const stale of [`${CONFIG_DIR}/group-type`, `${META_DIR}/group-type`]) {
+      try {
+        await primaryInstance.unlink(stale);
+        log.log(`[createConfigRepo] removed stale ${stale}`);
+      } catch {
+        /* 不存在 —— 正常情况 */
+      }
     }
   } catch (err: any) {
     log.warn(`[createConfigRepo] Failed to write group metadata:`, err.message);

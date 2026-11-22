@@ -944,10 +944,19 @@ export interface IConfigRepo {
 
   // --- Group Type ---
 
-  /** Write the group-type marker file if it doesn't exist. */
+  /**
+   * Ensure the unified group descriptor (`.meta/group.json`) exists.
+   *
+   * No longer writes any `group-type` marker (since 0.9.0); `type` is kept for
+   * API compatibility only. Stale markers are deleted when encountered.
+   */
   ensureGroupType(type: SyncGroupType): Promise<void>;
 
-  /** Read the group-type marker. Returns null if not set. */
+  /**
+   * Read the legacy `group-type` marker (`/.config/group-type`, then
+   * `/.meta/group-type`). Returns null when neither exists — which is now the
+   * normal case, since type is carried by `.meta/group.json`'s `kind`.
+   */
   getGroupType(): Promise<SyncGroupType | null>;
 
   /** Dispose: stop all sync, release cache FS and resources. */

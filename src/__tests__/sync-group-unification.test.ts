@@ -87,8 +87,8 @@ describe('config-sync group layout', () => {
     // 初始化不预置身份：一个后端都没接时 `.meta/group.json` 不落盘
     expect(await exists(repo.rootFS, '/.meta/group.json')).toBe(false);
 
-    expect(decode(await repo.rootFS.promises.readFile('/.config/group-type'))).toBe('config-sync');
-    // 0.7.18: legacy `.meta/group-type` 不再生成（见 group-type-authority.test.ts）
+    // 0.9.0: 任何 `group-type` 标记都不再生成，类型只由 `.meta/group.json` 承载
+    expect(await exists(repo.rootFS, '/.config/group-type')).toBe(false);
     expect(await exists(repo.rootFS, '/.meta/group-type')).toBe(false);
 
     await repo.addBackend('cfg-b1', 'UnifyRemote', { label: 'cfg-b1' });

@@ -32,7 +32,7 @@
 
 - G1：提供配置同步组（config-sync），管理应用配置、共享配置、节点配置。
 - G2：提供数据同步组（data-sync），承载纯应用数据的多后端同步。
-- G3：提供组类型自动路由入口 `connect()`，按 `.meta/group-type` 自动分发到正确工厂（注意：非覆盖全部启动场景的统一生命周期入口，见 FR3.4）。
+- G3：提供组类型自动路由入口 `connect()`，按 `.meta/group.json` 的 `kind` 自动分发到正确工厂（无描述符时才回退旧标记 `.config/group-type` / `.meta/group-type`；注意：非覆盖全部启动场景的统一生命周期入口，见 FR3.4）。
 - G4：本地主后端持久化，重开时无需外部参数即可恢复拓扑与数据（config-sync）。
 - G5：冲突安全，任何一方内容不丢失，可恢复。
 - G6：可扩展后端与序列化器。
@@ -49,7 +49,7 @@
 |---|---|
 | 通用同步组（Generic Sync Group） | 同步组的抽象：**本地主存储 + 若干远端副本 + 通用 `.meta/` + 该组自己的后端定义**。配置组与数据组是同一基座上的两个**能力位**（`configHost` / `appData`），互不蕴含；墓碑为两组通用能力，版本 sidecar / 冲突归档可配置开启 |
 | 同步组类型（group type） | 组自身的 `type` 字段：`config-sync` / `data-sync` |
-| 配置同步组（Config Sync Group） | `configHost=true`：可承载 `.config/`（数据组登记、引导副本、`group-type`），pair 同步整棵 `/`；本身不是 `appData` |
+| 配置同步组（Config Sync Group） | `configHost=true`：可承载 `.config/`（数据组登记、引导副本），pair 同步整棵 `/`；本身不是 `appData` |
 | 数据同步组（Data Sync Group） | `appData=true`：可被登记为数据组，pair 排除 `/.config`、`/nodes`、`/shared`；**自身后端拓扑的权威在 `.meta/backends/`**；**一律由配置同步组以 `app-data-groups` 纳管创建（不提供独立顶层入口）** |
 | 应用数据组（App Data Group） | 配置同步组下登记项（登记/引导副本存于 `.config/app-data-groups/{appId}/{id}.json`；旧镜像 `.meta/` 只读兼容、不再写入）；权威拓扑在数据组自己的 `.meta/backends/{id}.json` |
 | 本地主后端（Primary） | config-sync 固定 IndexedDB；data-sync 由 `resolveLocalPrimary`（浏览器 IndexedDB / Node 设 `folderPath` 或 `ZEN_FS_CONFIG_HOME` → Folder，否则 InMemory）|
@@ -93,10 +93,10 @@
 
 ### FR3 — 组类型自动路由入口 `connect()`（注意：非"统一生命周期入口"）
 
-- FR3.1：`connect(appId, options?)` 若有 `backendInfo`，先临时连上远端读 `.meta/group-type`：
-  - `config-sync` → 返回 `{ groupType, repo }`
-  - `data-sync` → 返回 `{ groupType, dataGroup }`
-  - 缺失 → 回退到 `options.groupType`（默认 `config-sync`）新建
+- FR3.1：`connect(appId, options?)` 若有 `backendInfo`，先临时连上远端读 `.meta/group.json` 的 `kind`；没有描述符时才回退读旧标记 `.config/group-type`、`.meta/group-type`：
+  - `kind=config` / `config-sync` → 返回 `{ groupType: 'config-sync', repo }`
+  - `kind=data` / `data-sync` → 返回 `{ groupType: 'data-sync', dataGroup }`
+  - 描述符与标记都不存在 → 回退到 `options.groupType`（默认 `config-sync`）新建
 - FR3.2：若 `options.groupType` 与远端实际类型冲突，抛 `Group type mismatch`。
 - FR3.3：无 `backendInfo` 时（**首次启动**），`connect` 默认**一次创建两个同步组**——一个配置同步组 + 一个数据同步组，并把该数据同步组登记进配置同步组的 `.config/app-data-groups/{appId}/{id}.json`。
 - FR3.4（边界，重要）：`connect` 只统一了"**组类型探测与工厂分发**"，并不统一"启动生命周期"。它本身**不是**覆盖所有起点的统一入口：

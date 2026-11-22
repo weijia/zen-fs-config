@@ -193,7 +193,8 @@ if (result.groupType === 'data-sync') {
 Detection & dispatch rules:
 
 - Always creates (or reuses) a **config-sync `ConfigRepo`** as the anchor.
-- Probes the backend before creating anything local: it reads `/.meta/group.json` strictly (only a genuine "not found" counts as empty — a 401/403 is surfaced, not swallowed) and then the legacy `/.meta/group-type` marker. The probe yields one of `unreachable | empty | marked | occupied`.
+- Probes the backend before creating anything local: it reads `/.meta/group.json` strictly (only a genuine "not found" counts as empty — a 401/403 is surfaced, not swallowed) and then the legacy `.config/group-type` / `.meta/group-type` markers. The probe yields one of `unreachable | empty | marked | occupied`.
+- **The library no longer writes any `group-type` marker** (since 0.9.0): the group type lives only in `group.json`'s `kind`; legacy markers stay readable and are deleted on sight. `getGroupType()` therefore returns `null` on new deployments — use the descriptor's `kind` (or the `groupType` returned by `connect()`) instead.
 - `unreachable` → throws `RemoteUnreachableError` (`code: 'REMOTE_UNREACHABLE'`); no local group is created.
 - `empty` (no descriptor and no marker) → throws `NeedsInitError` (`code: 'NEEDS_INIT'`, `requiresInit: true`) unless you pass `initGroupType` (or the older `groupType`). **The library never guesses a group type for a brand-new backend** — ask the user and retry.
 - `marked` → `config-sync` connects the repo to that backend; `data-sync` attaches the backend to the default app data group inside the config-sync repo.

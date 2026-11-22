@@ -90,13 +90,17 @@ A **sync group** is a set of backends that synchronize with each other. There ar
 - Backends: full credentials + storage location, but typically reusing the same account as a config-sync backend with a different storage target (e.g., same token/owner, different repo/branch)
 - Can be referenced by a config-sync group as an app's data storage (via `ConfigRepo.createAppDataGroup`)
 
-**Group type detection**: When connecting to a backend, the library reads `.meta/group-type` to determine the group type. If the file is absent, the backend is treated as a new empty group and the caller decides which type to create.
+**Group type detection**: When connecting to a backend, the library reads `.meta/group.json` first and takes its `kind` as the group type. Only when no descriptor exists does it fall back to the legacy `group-type` markers (`/.config/group-type`, `/.meta/group-type`). If neither exists, the backend is treated as a new empty group and the caller decides which type to create.
 
-| `.meta/group-type` | Behavior |
+| `.meta/group.json` `kind` (legacy marker) | Behavior |
 |---|---|
-| `config-sync` | Full system: IndexedDB primary + config replicas + optional data-sync groups |
-| `data-sync` | Lightweight: data backends only, direct read/write, no config meta layer |
-| absent | New empty backend; caller decides group type at creation time |
+| `config` (`config-sync`) | Full system: IndexedDB primary + config replicas + optional data-sync groups |
+| `data` (`data-sync`) | Lightweight: data backends only, direct read/write, no config meta layer |
+| absent (no marker either) | New empty backend; caller decides group type at creation time |
+
+Since 0.9.0 the library **no longer writes** any `group-type` marker; `kind` is the only
+source of truth. Markers remain read-compatible for remotes created by older versions and
+are deleted on sight.
 
 **Group type is write-once, and sync may not change it**: besides the connect-time
 check (`connect()` throws when `options.groupType` disagrees with the detected
@@ -125,7 +129,7 @@ group wiring instead of syncing the marker.
 ```
 /
 ├─ .meta/                               [synced to replicas]
-│  ├─ group-type                        Group type marker: "config-sync"
+│  ├─ group.json                        Unified descriptor { schemaVersion, kind, id, instanceId?, name?, features }
 │  ├─ backends/                         Backend topology (one file per backend)
 │  │  ├─ local-idb.json                 { id, type, options, description }
 │  │  ├─ gitee-prod.json
@@ -162,8 +166,8 @@ group wiring instead of syncing the marker.
 
 ```
 /
-├─ .meta/                               [synced to replicas]
-│  ├─ group-type                        Group type marker: "data-sync"
+├─ .meta/                               [group.json excluded from sync]
+│  ├─ group.json                        Descriptor { schemaVersion:2, kind:"data", id, instanceId?, name?, features }
 │  └─ backends/                         Data backend topology (one file per backend)
 │     ├─ gitee-data-1.json              { id, type, options, description }
 │     └─ gitee-data-2.json
@@ -712,9 +716,11 @@ createConfigRepo('my-app', options?)
   ├─ 1. Create IndexedDB backend (always, ID = 'local-idb')
   │     storeName = options.idbStoreName || `zen-fs-config-${appId}`
   │
-  ├─ 2. Ensure /.meta/ directory exists
+  ├─ 2. Ensure /.meta/ and /.config/ directories exist
   │
-  ├─ 3. Write /.meta/group-type = "config-sync" (if not exists)
+  ├─ 3. Delete stale group-type markers (/.config/group-type, /.meta/group-type)
+  │     └─ No marker is written since 0.9.0: type lives in .meta/group.json's kind
+  │        markers stay readable for old remotes (getGroupType / probe fallback)
   │
   ├─ 4. Migrate legacy .meta/backends.json → .meta/backends/*.json (if exists)
   │
@@ -934,18 +940,19 @@ connect('my-app', options?)
   │
   ├─ 1. Determine config-sync repo (create or reuse) — this always hosts the data groups
   │
-  ├─ 2. If options.backendInfo provided, read /.meta/group-type
+  ├─ 2. If options.backendInfo provided, read /.meta/group.json's kind
+  │     (fall back to the legacy .config/group-type or .meta/group-type marker)
   │
-  ├─ "config-sync" → connect the repo to that backend; then load every app
+  ├─ kind=config / "config-sync" → connect the repo to that backend; then load every app
   │                  data group from .meta/app-data-groups/{appId}/*.json (UC2)
   │                  return { groupType: "config-sync", repo, appDataGroups }
   │
-  ├─ "data-sync"   → keep the config repo local-only; ensure the default data
+  ├─ kind=data / "data-sync"   → keep the config repo local-only; ensure the default data
   │                  group exists and attach the backend to it (UC3). The backend
   │                  info is written back into app-data-groups by addBackend.
   │                  return { groupType: "data-sync", repo, dataGroup }
   │
-  └─ absent (no backendInfo) → local-only config repo + a default data group
+  └─ absent (no descriptor, no marker, no backendInfo) → local-only config repo + a default data group
      └─ return { groupType: "config-sync" (or options.groupType), repo, dataGroup }
 ```
 

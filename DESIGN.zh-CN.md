@@ -16,9 +16,11 @@ createConfigRepo('my-app', options?)
   ├─ 1. 创建 IndexedDB 后端（始终创建，ID = 'local-idb'）
   │     storeName = options.idbStoreName || `zen-fs-config-${appId}`
   │
-  ├─ 2. 确保 /.meta/ 目录存在
+  ├─ 2. 确保 /.meta/ 与 /.config/ 目录存在
   │
-  ├─ 3. 写入 /.meta/group-type = "config-sync"（如不存在）
+  ├─ 3. 清理遗留的 group-type 标记（`/.config/group-type`、`/.meta/group-type`）
+  │     └─ 0.9.0 起不再生成标记：组类型只由 .meta/group.json 的 kind 表达
+  │        标记仅作旧部署读取兼容（getGroupType / probe 回退分支）
   │
   ├─ 4. 迁移旧版 .meta/backends.json → .meta/backends/*.json（如存在）
   │
@@ -403,7 +405,7 @@ syncBidirectional()
 │  └─ conflicts/                        冲突归档（双方内容都保存）
 │
 ├─ .config/                             配置组专属（数据组不同步）
-│  ├─ group-type                        "config-sync" | "data-sync"
+│  ├─ group-type                        旧标记（0.9.0 起停写，仅读取兼容，见即清）
 │  ├─ config-sync-group.json            配置组显示名
 │  ├─ app-data-groups/{appId}/{id}.json 数据组登记 + 引导副本（唯一写入位置）
 │  └─ backends/                         历史位置（不再读取，仅删除时尽力清理）

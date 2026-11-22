@@ -123,19 +123,21 @@ describe('B. 本地主根的描述符被污染时就地纠正', () => {
     // 只纠正 kind/id：instanceId 属于身份，换身份必须由用户拍板，
     // 初始化阶段不得顺手派生新 UUID（那会给远端根引入第三个值）。
     expect(descriptor.instanceId).toBe('d25103f3-cdd4-401c-8bba-aaf3aaa99318');
-    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBe('config-sync');
+    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBeNull();
     expect(await readOrNull(repo.rootFS, '/.meta/group-type')).toBeNull();
     await repo.dispose();
   });
 });
 
-describe('C. 只写新布局标记', () => {
-  it('新根初始化只生成 .config/group-type，不再补 legacy .meta/group-type', async () => {
+describe('C. 不再写任何 group-type 标记', () => {
+  it('新根初始化两个标记都不生成，类型由 .meta/group.json 承载', async () => {
     const appId = `auth-c-${Math.random().toString(36).slice(2, 8)}`;
     const repo = await createConfigRepo(appId, { nodeId: 'c' });
 
-    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBe('config-sync');
+    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBeNull();
     expect(await readOrNull(repo.rootFS, '/.meta/group-type')).toBeNull();
+    // 目录布局仍保留
+    expect(await (repo.rootFS.promises as any).exists('/.config')).toBe(true);
 
     await repo.dispose();
   });
@@ -148,7 +150,7 @@ describe('C. 只写新布局标记', () => {
 
     const repo = await createConfigRepo(appId, { nodeId: 'next' });
     expect(await readOrNull(repo.rootFS, '/.meta/group-type')).toBeNull();
-    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBe('config-sync');
+    expect(await readOrNull(repo.rootFS, '/.config/group-type')).toBeNull();
     await repo.dispose();
   });
 });

@@ -51,9 +51,8 @@ describe('DataSyncGroup (standalone)', () => {
       expect(group.fs).toBeDefined();
     });
 
-    it('writes the data-sync group-type marker under /.meta', async () => {
-      const content = await group.fs.promises.readFile('/.meta/group-type', 'utf-8');
-      expect(content).toBe('data-sync');
+    it('no longer writes the data-sync group-type marker under /.meta', async () => {
+      await expect(group.fs.promises.readFile('/.meta/group-type', 'utf-8')).rejects.toThrow();
     });
   });
 
