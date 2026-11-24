@@ -271,7 +271,10 @@ describe('serialization', () => {
 });
 
 describe('sync boundary at the repo level', () => {
-  it('两个同步组共用同一个远端时，后到的组不建立同步对', async () => {
+  // 空副本接入「已有身份」的根 = 加入已存在的组：沿用该身份，不生成、不冲突。
+  // 这正是「清除本地配置后重连」「同一声明根被多个 app 共用」都必须走通的路径；
+  // 真正的边界冲突（本组已有不同身份）由下面的单元用例与数据组用例覆盖。
+  it('后到的空副本接到同一个根时沿用该身份，不建冲突', async () => {
     const repoA = await createConfigRepo('app-a', {
       idbStoreName: 'identity-a',
       backendInfo: { type: 'IdentityRemote', options: { label: 'shared-root' } },
@@ -279,6 +282,10 @@ describe('sync boundary at the repo level', () => {
     });
     // 默认 defer：A 的认领在后台，先等它完成再让 B 连同一个根。
     await repoA.whenReplicasReady?.();
+    const idA = (repoA as any).getGroupInstanceId?.() ?? (await (repoA as any).ensureGroupInstanceId());
+    const descA = await readGroupDescriptor(await registeredRemote('shared-root'));
+    expect(descA?.instanceId).toBe(idA);
+
     const repoB = await createConfigRepo('app-b', {
       idbStoreName: 'identity-b',
       backendInfo: { type: 'IdentityRemote', options: { label: 'shared-root' } },
@@ -286,15 +293,13 @@ describe('sync boundary at the repo level', () => {
     });
     await repoB.whenReplicasReady?.();
 
-    // A 先连上 → 认领远端根，写入自己的实例身份。
-    const idA = (repoA as any).getGroupInstanceId?.() ?? (await (repoA as any).ensureGroupInstanceId());
-    const descA = await readGroupDescriptor(await registeredRemote('shared-root'));
-    expect(descA?.instanceId).toBe(idA);
-
-    // B 连同一个远端 → 归属冲突，后端被跳过（没有同步对）。
-    const skipped = (repoB as any).listSkippedBackends();
-    expect(skipped.length).toBeGreaterThan(0);
-    expect((repoB as any).getSyncStatuses().size).toBe(0);
+    expect((repoB as any).listSkippedBackends()).toEqual([]);
+    expect((repoB as any).listBackendConflicts()).toEqual([]);
+    expect((repoB as any).getGroupInstanceId()).toBe(idA);
+    expect((repoB as any).getSyncStatuses().size).toBe(1);
+    // 远端没有被 B 改写
+    const sharedInst = await registeredRemote('shared-root');
+    expect((await readGroupDescriptor(sharedInst))?.instanceId).toBe(idA);
 
     await repoA.dispose();
     await repoB.dispose();

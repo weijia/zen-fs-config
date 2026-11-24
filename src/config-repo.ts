@@ -87,6 +87,8 @@ function describeConflict(result: {
       return `远端 group.json 读不到（${result.error ?? '未知错误'}），无法判断归属，已跳过该后端`;
     case 'claim-failed':
       return `认领远端根失败（${result.error ?? '未知错误'}），已跳过该后端`;
+    case 'local-unset':
+      return '本组实例身份尚未确定（已注册的远端根都读不到 group.json），本轮既不判定归属也不写入任何远端，已跳过该后端';
     default:
       return `远端根归属冲突：远端 ${remote}，本组 ${local}`;
   }
@@ -2779,7 +2781,28 @@ export class ConfigRepo implements IConfigRepo {
         const collected = await this.collectConfigIdentityCandidates(kind, id);
         this.identityCandidates = collected.candidates;
         const distinct = collected.distinct;
-        this.instanceId = distinct[0] ?? newGroupInstanceId();
+        // 「有后端但一个都读不到」≠「哪里都没有身份」：这时生成并落盘只会给远端根
+        // 引入一个新值，之后必然判成 instance-mismatch。宁可本轮不分配身份，
+        // 也不写本地描述符、不碰任何远端（等网络恢复或用户在界面上裁决）。
+        if (!distinct.length && collected.backendCount > 0 && collected.readableCount === 0) {
+          this.instanceId = undefined;
+          this.configIdentityUnsettled = true;
+          log.warn(
+            `[ConfigRepo] ${collected.backendCount} registered backend(s) but none readable — ` +
+              'group instanceId NOT assigned (nothing written, no remote touched)',
+          );
+          existingFeatures = existingFeatures ?? CONFIG_GROUP_FEATURES;
+          return {
+            kind,
+            id,
+            instanceId: '',
+            ...(this.name ? { name: this.name } : {}),
+            features: existingFeatures,
+          };
+        }
+
+        const assigned = distinct[0] ?? newGroupInstanceId();
+        this.instanceId = assigned;
         this.configIdentityUnsettled = distinct.length > 1;
         if (this.configIdentityUnsettled) {
           log.warn(
@@ -2788,18 +2811,18 @@ export class ConfigRepo implements IConfigRepo {
           );
         }
         if (!distinct.length) {
-          log.log(`[ConfigRepo] no identity anywhere (local/remote all empty) — generated ${this.instanceId}`);
+          log.log(`[ConfigRepo] no identity anywhere (local/remote all empty) — generated ${assigned}`);
         }
         try {
           await writeGroupDescriptor(this.cachedFS, {
             schemaVersion: 2,
             kind: existing?.kind ?? kind,
             id: existing?.id ?? id,
-            instanceId: this.instanceId,
+            instanceId: assigned,
             ...((existing?.name ?? this.name) ? { name: (existing?.name ?? this.name) as string } : {}),
             features: existing?.features ?? CONFIG_GROUP_FEATURES,
           });
-          log.log(`[ConfigRepo] group instanceId assigned: ${this.instanceId} (kind=${existing?.kind ?? kind})`);
+          log.log(`[ConfigRepo] group instanceId assigned: ${assigned} (kind=${existing?.kind ?? kind})`);
         } catch (err) {
           log.warn('[ConfigRepo] failed to persist group instanceId:', err);
         }
@@ -2813,7 +2836,9 @@ export class ConfigRepo implements IConfigRepo {
     return {
       kind,
       id,
-      instanceId: this.instanceId,
+      // 身份可能「尚未分配」（已注册的根都读不到时有意不定）——用空串占位，
+      // 由 `isValidGroupInstanceId` 判定为无效，调用方据此跳过而不误比对。
+      instanceId: this.instanceId ?? '',
       ...(this.name ? { name: this.name } : {}),
       ...(existingFeatures ? { features: existingFeatures } : {}),
     };
@@ -2826,7 +2851,14 @@ export class ConfigRepo implements IConfigRepo {
   private async collectConfigIdentityCandidates(
     kind: SyncGroupKind,
     id: string,
-  ): Promise<{ candidates: IdentityCandidate[]; distinct: string[] }> {
+  ): Promise<{
+    candidates: IdentityCandidate[];
+    distinct: string[];
+    /** 已注册的副本后端数（`.meta/backends/` 里真实落盘的描述符）。 */
+    backendCount: number;
+    /** 其中**确实读到了** `group.json`（含确认空仓库）的根数。 */
+    readableCount: number;
+  }> {
     const candidates: IdentityCandidate[] = [];
     let local: string | undefined;
     try {
@@ -2836,15 +2868,37 @@ export class ConfigRepo implements IConfigRepo {
       candidates.push({ source: 'local', instanceId: local, rootCount: 1, kind, id });
     }
 
-    for (const desc of this.backendDescriptorCache ?? []) {
+    // 候选来源必须是**真实落盘的** `.meta/backends/`，不能是 backendDescriptorCache：
+    // 首次 connect 时该缓存还没 hydrate（createConfigRepo 读描述符用的是 tempRepo），
+    // 拿空缓存收集会把「没读」当成「哪里都没身份」，凭空生成 UUID 顶掉远端已有身份，
+    // 制造一场必现的同步边界冲突。
+    let descriptors: AppDataBackendDescriptor[] = [];
+    try {
+      descriptors = await this.readAllBackendDescriptors();
+    } catch (err) {
+      log.warn('[ConfigRepo] collectConfigIdentityCandidates: failed to read .meta/backends:', err);
+    }
+
+    let readableCount = 0;
+    for (const desc of descriptors) {
       let inst: any;
       try {
-        inst = await createBackend({ type: desc.type, options: desc.options });
+        inst = await withTimeout(
+          createBackend({ type: desc.type, options: desc.options }),
+          REPLICA_SETUP_TIMEOUT_MS,
+          `配置组后端 ${desc.id} 创建实例`,
+        );
       } catch {
         continue;
       }
       try {
-        const remote = await readGroupDescriptorStrict(inst);
+        const remote = await withTimeout(
+          readGroupDescriptorStrict(inst),
+          REPLICA_SETUP_TIMEOUT_MS,
+          `配置组后端 ${desc.id} 读 group.json`,
+        );
+        // 读到了（哪怕是空仓库 / 别的组）：算「可读」，与「读不到」区分开。
+        readableCount += 1;
         if (!remote || remote.kind !== kind || remote.id !== id) continue;
         const value = pickInstanceId(remote);
         if (!value) continue;
@@ -2860,7 +2914,7 @@ export class ConfigRepo implements IConfigRepo {
     for (const c of candidates) {
       c.rootCount = candidates.filter((x) => x.instanceId === c.instanceId).length;
     }
-    return { candidates, distinct };
+    return { candidates, distinct, backendCount: descriptors.length, readableCount };
   }
 
   /** 组实例身份（未初始化时先兜底生成并落盘）。 */
@@ -2998,7 +3052,7 @@ export class ConfigRepo implements IConfigRepo {
           reason: describeConflict(result),
           ...(result.conflict ? { conflict: result.conflict } : {}),
           remote: result.remote,
-          local: { kind: identity.kind, id: identity.id, instanceId: identity.instanceId },
+          local: { kind: identity.kind, id: identity.id, instanceId: this.instanceId },
           canAdoptRemoteInstance:
             !!result.remote?.instanceId
             && result.remote.kind === identity.kind

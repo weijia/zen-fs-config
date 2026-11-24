@@ -42,7 +42,9 @@ export type IdentityConflictReason =
   /** 远端描述符读不到（网络 / 权限），无法判断归属。 */
   | 'unreadable'
   /** 认领写入失败（远端只读 / 无权限）。 */
-  | 'claim-failed';
+  | 'claim-failed'
+  /** 本组实例身份尚未确定（没有读到任何候选），本轮不判定、也不认领。 */
+  | 'local-unset';
 
 
 /** 本组身份：kind + 显示用 id + 不可变实例身份。 */
@@ -191,8 +193,16 @@ export async function bindRemoteGroupIdentityDetailed(
     return { state: 'conflict', remote: snapshot, local: identity, conflict: 'kind-mismatch' };
   }
 
+  // 本组身份尚未分配（例如已注册的根全部读不到时有意不定身份）：
+  // 既不拿空值去比对、也不去认领远端 —— 空身份写进远端会污染别的设备，
+  // 拿临时值比对又会把「远端本来就有身份」误判成冲突。
+  if (!isValidGroupInstanceId(identity.instanceId)) {
+    return { state: 'conflict', remote: snapshot, local: identity, conflict: 'local-unset' };
+  }
+  const localInstanceId: string = identity.instanceId;
+
   if (isValidGroupInstanceId(current)) {
-    if (current === identity.instanceId) {
+    if (current === localInstanceId) {
       return { state: 'match', remote: snapshot, local: identity };
     }
     const reason: IdentityConflictReason =
@@ -210,7 +220,7 @@ export async function bindRemoteGroupIdentityDetailed(
     schemaVersion: 2,
     kind: remote?.kind ?? identity.kind,
     id: remote?.id ?? identity.id,
-    instanceId: identity.instanceId,
+    instanceId: localInstanceId,
     ...(remote?.name ?? identity.name ? { name: (remote?.name ?? identity.name) as string } : {}),
     ...((remote?.features ?? identity.features) ? { features: (remote?.features ?? identity.features)! } : {}),
   };
@@ -228,7 +238,7 @@ export async function bindRemoteGroupIdentityDetailed(
     };
   }
   log.log(
-    `[GroupIdentity] claimed remote root for ${identity.kind}/"${identity.id}" (instanceId=${identity.instanceId})`,
+    `[GroupIdentity] claimed remote root for ${identity.kind}/"${identity.id}" (instanceId=${localInstanceId})`,
   );
   return { state: 'claimed', remote: snapshot, local: identity };
 }

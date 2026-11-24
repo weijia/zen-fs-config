@@ -418,7 +418,9 @@ export type BackendConflictReason =
   | 'id-mismatch'
   | 'instance-mismatch'
   | 'unreadable'
-  | 'claim-failed';
+  | 'claim-failed'
+  /** 本组实例身份尚未确定（没有读到任何候选），本轮不判定、也不认领。 */
+  | 'local-unset';
 
 /**
  * 一个后端与远端根归属冲突的完整信息。

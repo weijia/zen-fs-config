@@ -64,7 +64,9 @@ describe('prefetchedRemote 复用', () => {
     // 默认 defer：副本校验在后台，先等它结束再断言读数。
     await repo.whenReplicasReady?.();
     expect((repo as any).replicaCount).toBe(1);
-    expect(groupJsonReads).toBe(1); // 只有写描述符前的幂等比对
+    // 1 次身份候选收集（本地无身份时必须真的读根）+ 1 次写描述符前的幂等比对；
+    // 归属校验本身复用了 prefetchedRemote，没有再读。
+    expect(groupJsonReads).toBe(2);
     await repo.dispose();
   });
 
@@ -77,7 +79,8 @@ describe('prefetchedRemote 复用', () => {
     });
     await repo.whenReplicasReady?.();
     expect((repo as any).replicaCount).toBe(1);
-    expect(groupJsonReads).toBe(2); // 归属校验 + 写前比对
+    // 身份候选收集 1 次 + 归属校验 1 次 + 写前比对 1 次
+    expect(groupJsonReads).toBe(3);
     await repo.dispose();
   });
 });

@@ -70,9 +70,8 @@ describe('config group identity candidates (fresh read)', () => {
     });
 
     // 已注册的后端根（模拟 init 时读到的两个远端：configs 的 gitee / RemoteStorage）
-    (repo as any).backendDescriptorCache = [
-      { id: 'r1', type: 'IdRemote', options: { label: 'cfg-1' } },
-    ];
+    // 必须真实落盘到 `.meta/backends/`：现场回读认的是磁盘，不是内存缓存。
+    await repo.writeBackendDescriptor({ id: 'r1', type: 'IdRemote', options: { label: 'cfg-1' } });
 
     // 同步 getter 只给缓存 → 只有本地一条
     const syncList = repo.getIdentityCandidates();
@@ -101,9 +100,7 @@ describe('config group identity candidates (fresh read)', () => {
     const inst = await createBackend({ type: 'IdRemote', options: { label: 'cfg-2' } });
     remotes.set('cfg-2', inst);
     await writeGroupDescriptor(inst, { schemaVersion: 2, kind: 'config', id: 'config', instanceId: local });
-    (repo as any).backendDescriptorCache = [
-      { id: 'r2', type: 'IdRemote', options: { label: 'cfg-2' } },
-    ];
+    await repo.writeBackendDescriptor({ id: 'r2', type: 'IdRemote', options: { label: 'cfg-2' } });
 
     const fresh = await repo.getIdentityCandidatesAsync();
     expect(new Set(fresh.map((c: any) => c.instanceId)).size).toBe(1);
