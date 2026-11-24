@@ -466,6 +466,16 @@ export class ConfigRepo implements IConfigRepo {
   private onConflictCallback?: (conflict: ConflictInfo) => Promise<unknown | null>;
   private disposed = false;
   private configCache = new Map<string, unknown>();
+  /**
+   * 引导副本（`.config/app-data-groups/**`）改动后的「立刻推送」定时器。
+   *
+   * 写完描述符只落到本地主存储，配置组的同步对要等下一轮 poll（默认几十秒）
+   * 才会把文件搬上远端；这中间的窗口里，远端 `app-data-groups` 描述符和
+   * 数据组真实的后端拓扑不一致 —— 新设备 / 另一台机器此时接进来，按旧描述符
+   * 建组就会得到一套过期后端（线上 golf-admin 的 `gitee` ↔ `gitee-mwuh02rn`
+   * 就是这么来的）。这里在同一轮变更后合并触发一次 flush，把描述符立刻推上去。
+   */
+  private descriptorPushTimer?: ReturnType<typeof setTimeout>;
   /** 后台建对（deferReplicaSetup）的状态，见 `whenReplicasReady()`。 */
   private replicaSetupPromise: Promise<ReplicaSetupSummary> | null = null;
   private replicaSetupSummary: ReplicaSetupSummary | null = null;
@@ -1729,6 +1739,10 @@ export class ConfigRepo implements IConfigRepo {
     if (this.postDeleteSyncTimer) {
       clearTimeout(this.postDeleteSyncTimer);
       this.postDeleteSyncTimer = undefined;
+    }
+    if (this.descriptorPushTimer) {
+      clearTimeout(this.descriptorPushTimer);
+      this.descriptorPushTimer = undefined;
     }
     this.syncEngine.dispose();
 
@@ -3344,6 +3358,27 @@ export class ConfigRepo implements IConfigRepo {
       backends,
     };
     await this.writeAppDataGroupDescriptorFile(id, descriptor);
+    // 描述符是「引导副本」：它必须尽快与数据组真实拓扑一致，否则远端会留旧值。
+    this.scheduleDescriptorPush();
+  }
+
+  /**
+   * 合并同一轮内的多次描述符改写，只触发一次配置组 flush。
+   *
+   * 刻意不 await：addBackend/removeBackend 已经在等后端的首次同步，
+   * 再同步等一轮配置组全量 flush 只会让「添加后端」按钮更慢；
+   * 这里放到下一轮事件循环推送，失败也只记录日志（poll 仍是兜底）。
+   */
+  private scheduleDescriptorPush(): void {
+    if (this.disposed) return;
+    if (this.descriptorPushTimer) return;
+    this.descriptorPushTimer = setTimeout(() => {
+      this.descriptorPushTimer = undefined;
+      if (this.disposed) return;
+      void this.flush().catch((err) => {
+        log.warn('[ConfigRepo] 引导副本 flush 失败（等待下一轮 poll 兜底）:', err);
+      });
+    }, 0);
   }
 
   /**
@@ -3545,7 +3580,33 @@ export class ConfigRepo implements IConfigRepo {
     );
     await group.init({ deferRemote: true });
     this.appDataGroups.set(id, group);
+    // 自愈：引导副本可能落后于数据组自己的权威拓扑（历史上改过后端但没回刷、
+    // 或两台设备互相覆盖过）。这里按权威列表重写一次（字节相同则不写），
+    // 后台建对完成后再补一次，把远端拉回来的 `.meta/backends/` 也算进来。
+    await this.syncBootstrapDescriptor(id, group);
+    const ready = group.whenBackendsReady?.();
+    if (ready) {
+      void ready
+        .then(() => this.syncBootstrapDescriptor(id, group))
+        .catch(() => { /* 后台段失败不影响已返回的实例 */ });
+    }
     return group;
+  }
+
+  /**
+   * 用数据组自己的权威后端列表回刷 `.config/app-data-groups/{appId}/{id}.json`。
+   *
+   * 只在本地已有声明时执行：新设备首次连接、数据组本地库还是空的时候，
+   * 权威列表为空，此时写描述符会把远端已登记的拓扑抹成空组。
+   */
+  private async syncBootstrapDescriptor(id: string, group: AppDataGroupImpl): Promise<void> {
+    try {
+      const declared = group.listDeclaredBackends();
+      if (declared.length === 0) return;
+      await this.updateAppDataGroupDescriptor(id, declared);
+    } catch (err) {
+      log.warn(`[ConfigRepo] ${id}: 引导副本回刷失败（忽略）:`, err);
+    }
   }
 
   async listAppDataGroups(): Promise<AppDataGroupDescriptor[]> {
