@@ -203,7 +203,7 @@ if (result.groupType === 'data-sync') {
 
 ### deferReplicaSetup：两个信号
 
-默认情况下，`connect()` 要逐个校验远端后端的组身份（每个副本一次网络往返）才能返回。传 `deferReplicaSetup: true` 后这段挪到后台：
+**默认就是本地优先**：`connect()` 不再逐个校验远端后端（每个副本一次网络往返）才返回，这段直接挪到后台；传 `deferReplicaSetup: false` 才恢复「等所有副本校验完再返回」的旧行为（此时一个不响应的后端会把 `connect()` 挂住）：
 
 ```typescript
 const result = await connect('my-app', {

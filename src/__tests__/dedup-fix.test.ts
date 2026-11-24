@@ -765,6 +765,8 @@ describe('config-sync replica dedup — same endpoint, different option serializ
     expect(backends.length).toBe(1);
 
     // Only one sync pair should exist — not two to the same remote.
+    // 默认 defer：等后台建对完成再数 pair。
+    await repo3.whenReplicasReady?.();
     expect(repo3.replicaCount).toBe(1);
 
     await repo3.dispose();

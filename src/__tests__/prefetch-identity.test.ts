@@ -61,6 +61,8 @@ describe('prefetchedRemote 复用', () => {
       folderPath: path.join(os.tmpdir(), `zf-prefetch-a-${Date.now()}`),
       nodeId: 'n',
     });
+    // 默认 defer：副本校验在后台，先等它结束再断言读数。
+    await repo.whenReplicasReady?.();
     expect((repo as any).replicaCount).toBe(1);
     expect(groupJsonReads).toBe(1); // 只有写描述符前的幂等比对
     await repo.dispose();
@@ -73,6 +75,7 @@ describe('prefetchedRemote 复用', () => {
       folderPath: path.join(os.tmpdir(), `zf-prefetch-b-${Date.now()}`),
       nodeId: 'n',
     });
+    await repo.whenReplicasReady?.();
     expect((repo as any).replicaCount).toBe(1);
     expect(groupJsonReads).toBe(2); // 归属校验 + 写前比对
     await repo.dispose();

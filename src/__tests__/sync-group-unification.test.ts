@@ -151,6 +151,8 @@ describe('config-sync group layout', () => {
       backendInfo: { type: 'GhostBackend', options: { label: 'ghost' } } as any,
     });
 
+    // 默认 defer：建对与失败记录都在后台，等它结束再看 backendStates。
+    await repo.whenReplicasReady?.();
     const state = repo.getBackendSyncStates().get('GhostBackend-replica');
     expect(state?.error?.message).toBeTruthy();
 

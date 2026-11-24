@@ -233,6 +233,23 @@ function isNotFoundError(err: unknown): boolean {
 }
 
 /**
+ * 给副本初始化加超时：远端请求本身不一定有 fetch 超时，一个不响应的后端会把
+ * `Promise.all` 永久挂住（defer 模式下则让 `whenReplicasReady()` 永远不 resolve）。
+ * 超时后记入 backendStates，其它副本照常建对。
+ */
+const REPLICA_SETUP_TIMEOUT_MS = 15_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} 超时（${Math.round(ms / 1000)}s）`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/**
  * Validate and normalize a group display name. Ids are never edited, so this
  * only guards the human-readable label.
  */
@@ -1842,18 +1859,29 @@ export class ConfigRepo implements IConfigRepo {
     const prepared = new Map<string, { instance: any }>();
     await Promise.all(wanted.map(async (desc) => {
       log.log(`[ConfigRepo] Creating replica backend: id=${desc.id}, type=${desc.type}`);
+      let instance: any;
       try {
-        const instance = await createBackend(desc);
+        instance = await withTimeout(
+          createBackend(desc),
+          REPLICA_SETUP_TIMEOUT_MS,
+          `副本 ${desc.id} 创建实例`,
+        );
 
         // 同步边界：远端根属于另一个同步组时**不建同步对**（跨组永不同步）。
         const prefetched = prefetchedDescriptorFor(desc, prefetchedRemote);
-        const owner = await this.bindBackendIdentity(instance, desc.id, prefetched);
+        const owner = await withTimeout(
+          this.bindBackendIdentity(instance, desc.id, prefetched),
+          REPLICA_SETUP_TIMEOUT_MS,
+          `副本 ${desc.id} 归属校验`,
+        );
         if (owner === 'conflict') {
           try { await instance.dispose?.(); } catch { /* best effort */ }
           return;
         }
         prepared.set(desc.id, { instance });
       } catch (err: any) {
+        // 超时/失败后实例可能已经建出来，清掉，避免留一个悬挂的后端。
+        try { await instance?.dispose?.(); } catch { /* best effort */ }
         log.error(`[ConfigRepo] Failed to create replica ${desc.id} (${desc.type}):`, err);
         this.backendStates.set(desc.id, {
           backendId: desc.id,
@@ -5164,7 +5192,7 @@ export async function createConfigRepo(
   // -------------------------------------------------------------------
   // Step 8a: defer 模式 —— 只返回本地可用的 repo，副本的事全放后台。
   // -------------------------------------------------------------------
-  if (options.deferReplicaSetup) {
+  if (options.deferReplicaSetup !== false) {
     repo.startReplicaSetupInBackground(
       allBackends,
       LOCAL_IDB_BACKEND_ID,

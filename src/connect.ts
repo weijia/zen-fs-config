@@ -296,6 +296,11 @@ export async function connect(
 ): Promise<ConnectResult> {
   log(`connect: appId=${appId}`);
 
+  // 默认本地优先：副本建对放后台（传 false 才恢复「等全部远端校验完再返回」）。
+  // Case 1 曾漏传这个 flag，导致页面重载（无 backendInfo）时走阻塞式 setupSync，
+  // 一个不响应的后端就能把 connect() 挂死。
+  const deferReplicaSetup = options.deferReplicaSetup !== false;
+
   // -----------------------------------------------------------------
   // Case 1: No backendInfo — first launch (local-only)
   // -----------------------------------------------------------------
@@ -311,6 +316,7 @@ export async function connect(
       serializer: options.serializer,
       onConflict: options.onConflict,
       syncPollIntervalMs: options.syncPollIntervalMs,
+      deferReplicaSetup,
     });
     // Recover any locally-cached data groups (persisted in the local primary
     // store). Never create a group here: connect() is not a create action, and
@@ -339,6 +345,9 @@ export async function connect(
       groups: [repo as unknown as SyncGroupHandle, ...appDataGroups],
       dataGroup,
       appDataGroups,
+      replicasPending: deferReplicaSetup,
+      whenReplicasReady:
+        typeof repo.whenReplicasReady === 'function' ? repo.whenReplicasReady() : undefined,
     };
   }
 
@@ -392,7 +401,7 @@ export async function connect(
             options: backendOptions,
             descriptor: probe.descriptor ?? null,
           },
-          deferReplicaSetup: options.deferReplicaSetup,
+          deferReplicaSetup,
           idbStoreName: options.idbStoreName,
           nodeId: options.nodeId,
           primaryBackendId: options.primaryBackendId,
@@ -451,7 +460,7 @@ export async function connect(
   }
 
   const replicasPending =
-    !!options.deferReplicaSetup && groupType === 'config-sync' && !!options.backendInfo;
+    deferReplicaSetup && groupType === 'config-sync' && !!options.backendInfo;
   const whenReplicasReady =
     typeof repo.whenReplicasReady === 'function' ? repo.whenReplicasReady() : undefined;
 

@@ -188,9 +188,10 @@ export interface ConfigRepoOptions {
   };
 
   /**
-   * 把副本建对推迟到后台（默认 false）。开启后 `createConfigRepo` 先返回本地
-   * 可用的 repo，副本校验与建对由 `whenReplicasReady()` 通知；校验完成前不会
-   * 建任何 pair，也不会启动首同步。
+   * 把副本建对推迟到后台（默认 true）。`createConfigRepo` 先用本地缓存可用，
+   * 副本校验与建对由 `whenReplicasReady()` 通知；校验完成前不会建任何 pair，
+   * 也不会启动首同步。传 `false` 恢复旧行为（逐个校验远端后再返回，任一后端
+   * 不响应会一直等下去）。
    */
   deferReplicaSetup?: boolean;
 
@@ -662,7 +663,8 @@ export interface ConnectOptions {
 
   /**
    * 把「建副本同步对」整体推迟到后台：`connect()` 只做探测 + 本地仓初始化，
-   * 返回后由 `whenReplicasReady` 通知结果。默认 false（保持旧行为）。
+   * 返回后由 `whenReplicasReady` 通知结果。默认 true（本地缓存优先启动）；
+   * 传 false 恢复旧行为（等待所有副本校验完成才返回）。
    * 校验完成前不建任何 pair，因此不存在「建了又拆」的冲突窗口。
    */
   deferReplicaSetup?: boolean;

@@ -277,11 +277,14 @@ describe('sync boundary at the repo level', () => {
       backendInfo: { type: 'IdentityRemote', options: { label: 'shared-root' } },
       cache: false,
     });
+    // 默认 defer：A 的认领在后台，先等它完成再让 B 连同一个根。
+    await repoA.whenReplicasReady?.();
     const repoB = await createConfigRepo('app-b', {
       idbStoreName: 'identity-b',
       backendInfo: { type: 'IdentityRemote', options: { label: 'shared-root' } },
       cache: false,
     });
+    await repoB.whenReplicasReady?.();
 
     // A 先连上 → 认领远端根，写入自己的实例身份。
     const idA = (repoA as any).getGroupInstanceId?.() ?? (await (repoA as any).ensureGroupInstanceId());

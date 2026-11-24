@@ -210,7 +210,7 @@ Detection & dispatch rules:
 
 ### Deferred replica setup: two signals
 
-`connect()` normally verifies every remote backend's group identity (a network round-trip per replica) before it returns. With `deferReplicaSetup: true` it stops doing that inline:
+`connect()` no longer verifies every remote backend's group identity (a network round-trip per replica) before returning — that is deferred to the background by default. Pass `deferReplicaSetup: false` to restore the old blocking behaviour (where one unresponsive backend could stall `connect()` indefinitely):
 
 ```typescript
 const result = await connect('my-app', {
