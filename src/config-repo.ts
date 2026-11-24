@@ -534,6 +534,14 @@ export class ConfigRepo implements IConfigRepo {
   /** Last known backend descriptors, for the synchronous unified handle API. */
   private backendDescriptorCache: AppDataBackendDescriptor[] = [];
   /**
+   * 本会话内被用户**显式**清空后端的数据组 id。
+   *
+   * 只有这类组允许把「0 个后端」的引导副本推给远端；启动时读到的空副本
+   * （历史脏数据、或「清空本页配置」后本地新建的空组）绝不覆盖远端既有拓扑，
+   * 见 `healEmptyBootstrapDescriptors()`。
+   */
+  private explicitEmptyDescriptors = new Set<string>();
+  /**
    * Tracks the background initial sync started by createConfigRepo().
    * `flush()` and `dispose()` will await this if it hasn't completed yet,
    * preventing concurrent syncEngine.syncAll() calls.
@@ -756,6 +764,8 @@ export class ConfigRepo implements IConfigRepo {
     }
     // 1. Process tombstones: delete actual files on all replicas
     await this.processTombstones();
+    // 1b. 「空引导副本」不允许覆盖远端既有拓扑（见 healEmptyBootstrapDescriptors）
+    await this.healEmptyBootstrapDescriptors();
     // 2. Run normal sync (syncs data files + tombstone files)
     const resultsMap = await this.syncEngine.syncAll();
     // Invalidate tombstone cache — sync may have pulled new tombstones from remote
@@ -1347,6 +1357,8 @@ export class ConfigRepo implements IConfigRepo {
    */
   async initialSyncAndDedup(): Promise<void> {
     this.syncEngine.unwatchAll();
+    // 首次同步同样遵守「空引导副本只升不降」：否则启动那一刻就会把远端拓扑抹平。
+    await this.healEmptyBootstrapDescriptors();
     await this.syncEngine.syncAll();
     await this.readAllBackendDescriptors();
     await this.processTombstones();
@@ -3411,6 +3423,9 @@ export class ConfigRepo implements IConfigRepo {
       ...(features ? { features } : {}),
       backends,
     };
+    // 显式清空后端：这是用户真实意图（移除该组最后一个后端），允许推送空副本。
+    if (backends.length === 0) this.explicitEmptyDescriptors.add(id);
+    else this.explicitEmptyDescriptors.delete(id);
     await this.writeAppDataGroupDescriptorFile(id, descriptor);
     // 描述符是「引导副本」：它必须尽快与数据组真实拓扑一致，否则远端会留旧值。
     this.scheduleDescriptorPush();
@@ -3688,6 +3703,62 @@ export class ConfigRepo implements IConfigRepo {
       }
     }
     return Array.from(byId.values());
+  }
+
+  /**
+   * 「引导副本只升不降」：本地 `.config/app-data-groups/{appId}/{id}.json` 若声明
+   * **0 个后端**，而任何副本上同一路径还带着非空后端列表，就采用远端那份。
+   *
+   * 为什么必须做：本页「清除同步组配置」后本地库被重建，应用会先建一个只有隐式
+   * 本地存储的空 default 组并写下 `backends: []`；配置组后端一接上，首轮双向同步
+   * 以本地为准，这份空副本就会把远端登记的真实拓扑抹平（2026-11-24 线上实际发生）。
+   *
+   * 例外：本会话内用户显式清空后端（`updateAppDataGroupDescriptor(id, [])`）是
+   * 真实意图，允许推送空副本，不参与自愈。
+   */
+  private async healEmptyBootstrapDescriptors(): Promise<void> {
+    if (this.replicaBackends.size === 0) return;
+    let localDescriptors: AppDataGroupDescriptor[];
+    try {
+      localDescriptors = await this.listAppDataGroups();
+    } catch {
+      return;
+    }
+    for (const descriptor of localDescriptors) {
+      if ((descriptor.backends?.length ?? 0) > 0) continue;
+      if (this.explicitEmptyDescriptors.has(descriptor.id)) continue;
+      const descPath = this.appDataGroupFilePath(descriptor.id);
+      for (const [replicaId, replica] of this.replicaBackends) {
+        let remote: any;
+        try {
+          const raw = await withTimeout(
+            replica.instance.readFile(descPath),
+            REPLICA_SETUP_TIMEOUT_MS,
+            `${replicaId} 读取引导副本`,
+          );
+          remote = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+        } catch {
+          continue; // 该副本没这份描述符 / 读不到：换下一个
+        }
+        if (!remote || remote.id !== descriptor.id || remote.groupType !== 'data-sync') continue;
+        const remoteBackends: AppDataBackendDescriptor[] = Array.isArray(remote.backends)
+          ? remote.backends
+          : [];
+        if (remoteBackends.length === 0) continue;
+        await this.writeAppDataGroupDescriptorFile(descriptor.id, {
+          id: descriptor.id,
+          groupType: 'data-sync',
+          ...(remote.instanceId ? { instanceId: remote.instanceId } : {}),
+          ...(remote.name ? { name: remote.name } : {}),
+          ...(remote.features ? { features: remote.features } : {}),
+          backends: remoteBackends,
+        });
+        log.warn(
+          `[ConfigRepo] ${descriptor.id}: 本地引导副本为空，采用远端拓扑（${remoteBackends.length} 个后端），避免覆盖远端设置`,
+        );
+        break;
+      }
+    }
   }
 
   async removeAppDataGroup(id: string): Promise<void> {
