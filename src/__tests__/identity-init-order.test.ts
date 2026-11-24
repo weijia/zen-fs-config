@@ -136,6 +136,7 @@ describe('身份初始化顺序', () => {
 
     const repo2 = await createConfigRepo('idinit-boot', { nodeId: 'b2' });
     const g2 = await repo2.getAppDataGroup('g-boot');
+    await g2.whenBackendsReady?.();
     expect(g2.getGroupInstanceId()).toBe(bootstrapId);
     expect(g2.isIdentityUnsettled?.()).toBe(true);
 
@@ -163,6 +164,7 @@ describe('身份初始化顺序', () => {
 
     const repo2 = await createConfigRepo('idinit-two', { nodeId: 't2' });
     const g2 = await repo2.getAppDataGroup('g-two');
+    await g2.whenBackendsReady?.();
     expect(g2.getGroupInstanceId()).toBe(original);
     expect(g2.isIdentityUnsettled?.()).toBe(true);
 
@@ -190,6 +192,7 @@ describe('身份初始化顺序', () => {
 
     const repo2 = await createConfigRepo('idinit-set', { nodeId: 's2' });
     const g2 = await repo2.getAppDataGroup('g-set');
+    await g2.whenBackendsReady?.();
     expect(g2.isIdentityUnsettled?.()).toBe(true);
 
     // 用户选远端那个值

@@ -70,6 +70,48 @@ describe('data group backend → pair mapping', () => {
     expect(group.getSyncStatuses().size).toBe(2);
   });
 
+  it('load path returns before the remote phase; whenBackendsReady finishes it', async () => {
+    registerBackend(
+      'SlowMirror',
+      async () => {
+        await new Promise((r) => setTimeout(r, 300));
+        return createBackend({ type: 'InMemory', options: { label: `slow-${Date.now()}` } });
+      },
+      {
+        type: 'SlowMirror',
+        label: 'SlowMirror',
+        icon: '\u{1F40C}',
+        fields: [],
+        defaultOptions: {},
+        identityFields: ['label'],
+      },
+    );
+
+    const repo = await createConfigRepo('states-slow', { nodeId: 'test-node' });
+    // 创建路径仍是「全部就绪才返回」（300ms 的慢后端也等完）。
+    const created = await repo.createAppDataGroup('slow', [
+      { id: 's', type: 'SlowMirror', options: { label: 'slow' } },
+    ]);
+    expect(created.getSyncStatuses().size).toBe(1);
+    await created.dispose();
+    (repo as any).appDataGroups.delete('slow');
+
+    // 加载路径（页面打开走这条）：只做本地初始化就返回，不等远端。
+    const t0 = Date.now();
+    const reopened = await repo.getAppDataGroup('slow');
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(250);
+    expect(reopened.getSyncStatuses().size).toBe(0); // 远端阶段还没跑
+
+    // 等后台阶段：建对完成、计数变成真实值。
+    await reopened.whenBackendsReady?.();
+    expect(reopened.getSyncStatuses().size).toBe(1);
+    expect(reopened.getBackendSyncStates().get('s')?.pairId).toBeTruthy();
+
+    await reopened.dispose();
+    await repo.dispose();
+  });
+
   it('lets removeBackend drop a descriptor that never got a pair', async () => {
     const repo = await createConfigRepo('states-app-3', { nodeId: 'test-node' });
     const group = await repo.createAppDataGroup('cleanup', [

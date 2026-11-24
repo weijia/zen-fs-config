@@ -3543,7 +3543,7 @@ export class ConfigRepo implements IConfigRepo {
       this,
       descriptor,
     );
-    await group.init();
+    await group.init({ deferRemote: true });
     this.appDataGroups.set(id, group);
     return group;
   }
@@ -3649,6 +3649,16 @@ class AppDataGroupImpl implements AppDataGroup {
 
   private syncEngine: ZenFSSync;
   private localFS: BackendInstance;
+  /** 本地主存储的可同步视图；建对外阶段复用，避免重复包裹。 */
+  private localSyncable: SyncableFS | null = null;
+  /**
+   * 后台「建实例 → 定身份 → 建同步对 → 首同步 → watch」的完成信号。
+   *
+   * `init()` 只做本地部分就返回（本地 fs、墓碑、后端清单、本地身份），远端探测与
+   * 建对全部挪到这里：一个不响应的后端不能再把 `getAppDataGroup()` / `connect()`
+   * 挂住，UI 打开即可列出组与后端清单。
+   */
+  private remoteSetupPromise: Promise<void> | null = null;
   private dataBackends: Map<string, { instance: any; syncable: SyncableFS; pairId: string; desc: AppDataBackendDescriptor }> = new Map();
   private backendStates: Map<string, BackendSyncState> = new Map();
   private disposed = false;
@@ -4207,7 +4217,14 @@ class AppDataGroupImpl implements AppDataGroup {
     }
   }
 
-  async init(): Promise<void> {
+  /**
+   * 初始化组实例。
+   *
+   * - 默认（`deferRemote: false`）：本地 + 远端全部就绪才返回，语义与旧版一致。
+   * - `deferRemote: true`：本地 fs / 墓碑 / 后端清单就绪即返回，远端探测、定身份、
+   *   建对、首同步交给 `whenBackendsReady()`；用于「打开页面先看到组」的加载路径。
+   */
+  async init(opts: { deferRemote?: boolean } = {}): Promise<void> {
     // Create local primary backend (Folder on Node, IndexedDB on browser).
     //
     // Each data group gets its own store: the legacy/default group keeps
@@ -4272,7 +4289,7 @@ class AppDataGroupImpl implements AppDataGroup {
       log.warn(`[AppDataGroup:${this.groupId}] .keep purge failed:`, err?.message ?? err);
     }
 
-    const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
+    this.localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
 
     // Unified `.meta/` metadata area (tombstones / versions / conflicts).
     // `/.config/` stays hidden: a data group never owns config payload.
@@ -4373,21 +4390,57 @@ class AppDataGroupImpl implements AppDataGroup {
       }
     }
 
+    // 本地部分到这里就完整了（本地 fs / 墓碑 / 后端清单 / 本地身份）。
+    // 远端探测与建对可放后台（deferRemote）：加载路径先让调用方拿到组，再等
+    // whenBackendsReady()；创建路径保持旧的「全部就绪才返回」语义。
+    this.remoteSetupPromise = this.runRemoteSetup().catch((err) => {
+      log.error(`[AppDataGroup:${this.groupId}] background remote setup failed:`, err);
+    });
+    if (opts.deferRemote) return;
+    await this.remoteSetupPromise;
+  }
+
+  /** 远端身份校验 / 建对 / 首同步的完成信号。未启动时用缓存的已 resolve promise，
+   *  保证同一个组多次调用返回同一实例（调用方可以用 Promise 相等判断是否已登记）。 */
+  whenBackendsReady(): Promise<void> {
+    if (!this.remoteSetupPromise) this.remoteSetupPromise = Promise.resolve();
+    return this.remoteSetupPromise;
+  }
+
+  /**
+   * 后台远端阶段：建实例（并发 + 逐项超时）→ 定身份 → 写 group.json → 建同步对 →
+   * 首同步 → watch。内部兜住所有错误（失败落 backendStates），不会 reject。
+   */
+  private async runRemoteSetup(): Promise<void> {
+    const localSyncable = this.localSyncable;
+    if (this.disposed || !localSyncable) return;
+
     // ---- 阶段 1：只读收集 —— 建实例、读每个远端根的 `group.json`（不写）----
+    // 并发 + 逐项超时：串行时一个挂住的后端会把整组拖到「后端数 × 超时」。
     const prepared: PreparedDataBackend[] = [];
-    for (const desc of this._backends) {
+    await Promise.all(this._backends.map(async (desc) => {
+      let instance: any;
       try {
-        const instance = await createBackend({ type: desc.type, options: desc.options });
+        instance = await withTimeout(
+          createBackend({ type: desc.type, options: desc.options }),
+          REPLICA_SETUP_TIMEOUT_MS,
+          `数据组后端 ${desc.id} 创建实例`,
+        );
         let remote: GroupDescriptor | null = null;
         let readError: string | undefined;
         try {
-          remote = await readGroupDescriptorStrict(instance);
+          remote = await withTimeout(
+            readGroupDescriptorStrict(instance),
+            REPLICA_SETUP_TIMEOUT_MS,
+            `数据组后端 ${desc.id} 读 group.json`,
+          );
         } catch (err) {
           readError = (err as Error)?.message ?? String(err);
           log.warn(`[AppDataGroup:${this.groupId}] failed to read remote group.json of "${desc.id}":`, err);
         }
         prepared.push({ desc, instance, remote, readError });
       } catch (err: any) {
+        try { await instance?.dispose?.(); } catch { /* best effort */ }
         const message = err instanceof Error ? err.message : String(err);
         this.backendStates.set(desc.id, {
           backendId: desc.id,
@@ -4395,6 +4448,14 @@ class AppDataGroupImpl implements AppDataGroup {
         });
         log.error(`[AppDataGroup:${this.groupId}] Failed to create backend ${desc.id} (${desc.type}):`, err);
       }
+    }));
+
+    // 已销毁：收掉刚建出来的实例，不往已释放的引擎上挂 pair。
+    if (this.disposed) {
+      for (const item of prepared) {
+        try { await item.instance.dispose?.(); } catch { /* best effort */ }
+      }
+      return;
     }
 
     // ---- 阶段 2–3：硬边界 + 定身份（候选全空才生成一次；不一致只记录）----
@@ -4405,6 +4466,13 @@ class AppDataGroupImpl implements AppDataGroup {
       await this.writeOwnGroupDescriptor();
     } catch (err) {
       log.warn(`[AppDataGroup:${this.groupId}] failed to write .meta/group.json:`, err);
+    }
+
+    if (this.disposed) {
+      for (const item of prepared) {
+        try { await item.instance.dispose?.(); } catch { /* best effort */ }
+      }
+      return;
     }
 
     // ---- 阶段 6：建同步对（消费已读快照，不再重复读远端）----
@@ -4469,6 +4537,8 @@ class AppDataGroupImpl implements AppDataGroup {
       }
     }
 
+    if (this.disposed) return;
+
     // Initial sync — pull data from remote backends (before watching)
     try {
       await this.syncEngine.syncAll();
@@ -4476,6 +4546,7 @@ class AppDataGroupImpl implements AppDataGroup {
       log.warn(`[AppDataGroup:${this.groupId}] Initial sync failed:`, err);
     }
 
+    if (this.disposed) return;
     // Now start watching — snapshots will reflect the synced state
     this.syncEngine.watchAll();
   }
@@ -4501,6 +4572,8 @@ class AppDataGroupImpl implements AppDataGroup {
   }
 
   async flush(): Promise<SyncResult[]> {
+    // 后台建对可能还没完成：等它结束再同步，否则 flush 跑在 0 个 pair 上。
+    await this.whenBackendsReady();
     // Delete tombstoned files everywhere BEFORE syncing, so a remote copy
     // cannot be seen as "newer" and win.
     await this.runTombstonePass('flush-pre');
@@ -4769,6 +4842,8 @@ class AppDataGroupImpl implements AppDataGroup {
     description?: string,
   ): Promise<void> {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    // 后台建对可能与 addBackend 竞争：等它先完成，避免同一后端建出两个 pair。
+    await this.whenBackendsReady();
     assertValidBackendId(id);
     if (this.dataBackends.has(id)) {
       throw new Error(`Backend "${id}" already exists in data group "${this.groupId}"`);
@@ -4844,6 +4919,8 @@ class AppDataGroupImpl implements AppDataGroup {
 
   async removeBackend(id: string): Promise<void> {
     if (this.disposed) throw new Error('DataSyncGroup has been disposed');
+    // 同上：后台建对完成后再摘 pair，避免摘掉之后又被后台重新挂上。
+    await this.whenBackendsReady();
     const backend = this.dataBackends.get(id);
     const desc = this._backends.find(b => b.id === id);
     if (!backend && !desc) {
@@ -4892,6 +4969,8 @@ class AppDataGroupImpl implements AppDataGroup {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    // 后台阶段会自己检查 disposed 并收掉已建实例；这里等它退干净再销毁引擎。
+    try { await this.remoteSetupPromise; } catch { /* 内部已兜住 */ }
     this.syncEventHandlers.clear();
     if (this.postDeleteTimer) {
       clearTimeout(this.postDeleteTimer);

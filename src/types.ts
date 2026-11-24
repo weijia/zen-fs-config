@@ -607,6 +607,14 @@ export interface SyncGroupHandle {
 /** Handle to a data-sync group, providing direct fs access. */
 export interface AppDataGroup extends SyncGroupHandle {
   readonly kind: 'data';
+  /**
+   * 远端阶段（建实例 → 定身份 → 建同步对 → 首同步 → watch）的完成信号。
+   *
+   * 组实例在本地就绪后即返回，远端后端在后台逐个（并发 + 超时）探测；调用方可以
+   * 先渲染组的本地状态，再等这个 Promise 结束后刷新为真实的同步对计数 / 错误。
+   * 未启动时立即 resolve，永不 reject。旧版本没有该方法，调用方按可选处理。
+   */
+  whenBackendsReady?: () => Promise<void>;
 }
 
 

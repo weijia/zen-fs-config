@@ -232,6 +232,8 @@ describe('connect() — unified entry point', () => {
     const ids = (await second.repo!.listAppDataGroups()).map((g) => g.id);
     expect(ids).toContain('default');
     const dg = await second.repo!.getAppDataGroup('default');
+    // 加载路径是「本地先返回、远端后台建对」：等后台阶段结束再断言。
+    await dg.whenBackendsReady?.();
     expect(dg.listBackends().map((b) => b.id)).toEqual(['g1']);
     expect(second.dataGroup).toBeDefined();
     await second.dataGroup!.dispose();

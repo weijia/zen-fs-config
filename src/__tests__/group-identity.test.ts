@@ -331,6 +331,8 @@ describe('sync boundary at the repo level', () => {
     (repo as any).appDataGroups.delete('g1');
 
     const reopened: AppDataGroup = await repo.getAppDataGroup('g1');
+    // 加载路径延后远端阶段：等后台探测完再断言跳过/建对结果。
+    await reopened.whenBackendsReady?.();
     expect(reopened.listSkippedBackends().length).toBe(1);
     expect(reopened.getBackendSyncStates().size).toBe(0);
 
