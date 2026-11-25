@@ -491,6 +491,11 @@ export class ConfigRepo implements IConfigRepo {
    * 就是这么来的）。这里在同一轮变更后合并触发一次 flush，把描述符立刻推上去。
    */
   private descriptorPushTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * 已做过「凭据回填」的端点去重键。同一进程内每个端点只回填一次，
+   * 避免每次建对都重写一遍别人的描述符。
+   */
+  private credentialBackfillDone = new Set<string>();
   /** 后台建对（deferReplicaSetup）的状态，见 `whenReplicasReady()`。 */
   private replicaSetupPromise: Promise<ReplicaSetupSummary> | null = null;
   private replicaSetupSummary: ReplicaSetupSummary | null = null;
@@ -2000,6 +2005,12 @@ export class ConfigRepo implements IConfigRepo {
         this.replicaBackends.set(desc.id, { instance: fsInstance, syncable, pairId: pair.pairId });
         this.backendStates.set(desc.id, { backendId: desc.id, pairId: pair.pairId });
 
+        // 这个副本真的连上了：把它的凭据回填到同端点的历史重复描述符，
+        // 免得下一次「读时去重保留最早那份」又选中一个失效 token。
+        void this.backfillDuplicateBackendCredentials(desc).catch((err) => {
+          log.warn('[ConfigRepo] backfill duplicate backend credentials failed:', err);
+        });
+
         // Register conflict handler
         const conflictHandler: SyncEventHandler = (event: SyncEvent) => {
           this.handleConflict(event);
@@ -2437,6 +2448,55 @@ export class ConfigRepo implements IConfigRepo {
     // 列表凭空多出一项，setupSync 就会为同一个 id 建两次同步对。
     this.backendDescriptorCache = [...result];
     return result;
+  }
+
+  /**
+   * 把「连得上的凭据」回填到同一端点的重复描述符里。
+   *
+   * 背景：RemoteStorage 的 `token` 不进 `identityFields`（见 admin 的后端注册），
+   * 同一 `href`+`basePath` 只会被当成一个端点；但历史上按 token 判重时，每次
+   * 重新授权都会新增一个 `remotestorage-<时间戳>` 描述符，旧描述符仍留在
+   * `.meta/backends/` 里。读时去重按 mtime 保留最早的一份，如果那份的 token
+   * 已经失效，这个端点就会永远连不上。这里在某个描述符成功建对之后，把它的
+   * token 写回同键的其它描述符，保证「留下的那份」凭据是可用的。
+   *
+   * 只改 token 一个字段，不新增/删除描述符，也不影响 id 与 mtime 之外的内容。
+   */
+  private async backfillDuplicateBackendCredentials(desc: BackendDescriptor): Promise<void> {
+    const options = desc.options as Record<string, unknown> | undefined;
+    const mine = options?.token;
+    if (typeof mine !== 'string' || mine.length === 0) return;
+
+    const key = backendDedupKey(desc);
+    if (this.credentialBackfillDone.has(key)) return;
+    this.credentialBackfillDone.add(key);
+
+    let items: { desc: BackendDescriptor; mtime: number }[];
+    try {
+      items = (await this.readBackendDescriptorsFrom(BACKENDS_DIR)).items;
+    } catch (err) {
+      log.warn('[ConfigRepo] backfill credentials: read descriptors failed:', err);
+      return;
+    }
+
+    for (const item of items) {
+      if (item.desc.id === desc.id) continue;
+      if (backendDedupKey(item.desc) !== key) continue;
+      const theirs = (item.desc.options as Record<string, unknown> | undefined)?.token;
+      if (typeof theirs !== 'string' || theirs === mine) continue;
+      try {
+        await this.writeBackendDescriptor({
+          ...item.desc,
+          options: { ...item.desc.options, token: mine },
+        });
+        log.log(
+          `[ConfigRepo] backfilled working credential into duplicate descriptor `
+          + `${item.desc.id} (endpoint ${key})`,
+        );
+      } catch (err) {
+        log.warn(`[ConfigRepo] backfill credentials: write ${item.desc.id} failed:`, err);
+      }
+    }
   }
 
   /**
