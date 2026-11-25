@@ -180,3 +180,25 @@ export type {
 
 // Re-export SyncResult and SyncPairStatus from zen-fs-sync for convenience
 export type { SyncResult, SyncPairStatus } from 'zen-fs-sync';
+
+// 数据组选择（跨 app 通用：候选枚举 / 解析 / 本机偏好 / 补建默认组）
+export {
+  listDataGroupCandidates,
+  collectDataGroupCandidates,
+  resolveDataGroup,
+  ensureDataGroup,
+  groupHasPath,
+  getPreferredDataGroupId,
+  setPreferredDataGroupId,
+  isLocalBackendType,
+  DATA_GROUP_PREFERENCE_PREFIX,
+} from './data-group-selection';
+export type {
+  DataGroupCandidate,
+  DataGroupSource,
+  ResolveDataGroupOptions,
+  EnsureDataGroupOptions,
+  EnsureDataGroupResult,
+  PreferenceOptions,
+  PreferenceStorage,
+} from './data-group-selection';
