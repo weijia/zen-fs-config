@@ -141,6 +141,19 @@ import type {
 
 const log = createLogger('zen-fs-config:config-repo');
 
+/**
+ * 这个错误是否表示「远端确实没有这个文件/目录」，而不是网络/权限故障。
+ *
+ * `readGroupDescriptorStrict` 只认 `isNotFoundError`，但有些后端（Gitee 的
+ * raw/contents 接口）把 404 抛成 `Gitee API 404: ...` 的普通 `Error`。
+ * 归属探测必须把它当成「空仓库」而不是「读不到」，否则新建组的正常流程会被拒。
+ */
+function isMissingDescriptorError(err: unknown): boolean {
+  if (isNotFoundError(err)) return true;
+  const message = String((err as Error)?.message ?? err ?? '');
+  return /(^|\W)404(\W|$)|not found|no such file|不存在/i.test(message);
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -3291,6 +3304,50 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * 读一个数据组后端根上的 `.meta/group.json`（只读，不写、不建同步对）。
+   *
+   * `null` = 空仓库（可以认领）；抛错 = 读不到（调用方必须 fail-closed）。
+   * 复用的实例由调用方负责 dispose。
+   */
+  private async readRemoteGroupDescriptor(
+    desc: Pick<AppDataBackendDescriptor, 'id' | 'type' | 'options'>,
+    instance?: BackendInstance,
+  ): Promise<GroupDescriptor | null> {
+    const own = instance ?? await createBackend({ type: desc.type, options: desc.options });
+    try {
+      return await withTimeout(
+        readGroupDescriptorStrict(own as any),
+        REPLICA_SETUP_TIMEOUT_MS,
+        `数据组后端 ${desc.id} 读 group.json`,
+      );
+    } finally {
+      if (!instance) {
+        try { await (own as any)?.dispose?.(); } catch { /* best effort */ }
+      }
+    }
+  }
+
+  /**
+   * 同一个远端目录只能归一个组。`.meta/group.json` 里的 `kind`/`id` 就是归属
+   * 记录 —— 它与「本地方知不知道这个组」无关，描述符丢了也照样能判定。
+   */
+  private assertRemoteNotOwnedByOthers(
+    remote: GroupDescriptor | null,
+    backendId: string,
+    ownerId: string,
+  ): void {
+    if (!remote) return;
+    if (remote.kind === 'data' && remote.id === ownerId) return;
+    const who = remote.kind === 'data'
+      ? `数据组「${remote.id}」${remote.instanceId ? `（instanceId=${remote.instanceId}）` : ''}`
+      : `配置同步组（kind=${remote.kind ?? '未知'}${remote.id ? `，id=${remote.id}` : ''}）`;
+    throw new Error(
+      `后端「${backendId}」指向的远端目录已被${who}占用：同一个远端目录不能归两个组` +
+      `（否则两条同步链会互相改写身份、版本与墓碑）。请直接加载该组，或为它改用不同的 basePath/repo`,
+    );
+  }
+
+  /**
    * Reject two groups pointing at the exact same remote endpoint. Two groups
    * syncing the same files independently would fight over deletions and
    * tombstones (see SYNC-GROUP-UNIFICATION §4.3).
@@ -3321,6 +3378,45 @@ export class ConfigRepo implements IConfigRepo {
           );
         }
       }
+    }
+
+    // 远端归属探测（fail-closed）：上面两轮只看「本地知道的组」，描述符列表为空
+    // 或读失败时校验会静默空跑 —— 2026-11-25 线上凭空多出一个同远端组就是这么来
+    // 的（描述符丢了，新组照样建成功，之后两个组互相改写 `.meta/group.json`）。
+    // 远端根里的 `.meta/group.json` 才是归属的权威记录，所以逐个真读一次：
+    // 有主且不是本组 → 拒绝；读不到（且不是「确实不存在」）→ 也拒绝。
+    for (const backend of backends) {
+      if (backend.type === localPrimaryType()) continue; // 本地存储没有远端根
+      let instance: BackendInstance;
+      try {
+        instance = await withTimeout(
+          createBackend({ type: backend.type, options: backend.options }),
+          REPLICA_SETUP_TIMEOUT_MS,
+          `数据组后端 ${backend.id} 创建实例（归属探测）`,
+        );
+      } catch (err) {
+        // 实例都建不出来（类型未注册 / 参数不全）：组照旧可以保存，init() 会把
+        // 错误挂在该后端上，不会产生同步对 —— 也就不存在两个组抢同一个根。
+        log.warn(
+          `[ConfigRepo] assertNoSharedRemote: 无法创建后端「${backend.id}」` +
+          `（${(err as Error)?.message ?? String(err)}），跳过远端归属探测`,
+        );
+        continue;
+      }
+      let remote: GroupDescriptor | null;
+      try {
+        remote = await this.readRemoteGroupDescriptor(backend, instance);
+      } catch (err) {
+        if (isMissingDescriptorError(err)) continue; // 目录/文件确实不存在 → 空仓库
+        throw new Error(
+          `无法读取后端「${backend.id}」的远端 .meta/group.json（${(err as Error)?.message ?? String(err)}）：` +
+          `无法判断该远端目录是否已被其它同步组占用，已拒绝创建数据组「${ownerId}」。` +
+          `请检查后端参数与网络后重试`,
+        );
+      } finally {
+        try { await instance.dispose?.(); } catch { /* best effort */ }
+      }
+      this.assertRemoteNotOwnedByOthers(remote, backend.id, ownerId);
     }
   }
 
@@ -3515,7 +3611,29 @@ export class ConfigRepo implements IConfigRepo {
     const candidate = { ...declared[index], type, options, description: description ?? declared[index].description };
     const mergedOptions = await this.resolveAppDataBackendOptions(candidate);
     const probe = await createBackend({ type, options: mergedOptions });
-    try { await probe.dispose?.(); } catch { /* best effort */ }
+    // 顺手用这个实例做远端归属探测（不额外建连接）：同一个远端目录不能换给
+    // 别的组，否则新参数一挂上就会和原主互相改写身份与墓碑。读不到就保留旧参数。
+    let probeRemote: GroupDescriptor | null = null;
+    let probeError: unknown = null;
+    try {
+      if (type !== localPrimaryType()) {
+        probeRemote = await this.readRemoteGroupDescriptor(
+          { id: backendId, type, options: mergedOptions },
+          probe,
+        );
+      }
+    } catch (err) {
+      probeError = err;
+    } finally {
+      try { await probe.dispose?.(); } catch { /* best effort */ }
+    }
+    if (probeError && !isMissingDescriptorError(probeError)) {
+      throw new Error(
+        `无法读取后端「${backendId}」的远端 .meta/group.json（${(probeError as Error)?.message ?? String(probeError)}）：` +
+        `无法判断该远端目录是否已被其它同步组占用，已保留原参数。请检查后端参数与网络后重试`,
+      );
+    }
+    this.assertRemoteNotOwnedByOthers(probeRemote, backendId, groupId);
 
     const oldBackends = declared.map((b) => ({ ...b }));
     const nextBackends = declared.map((b, i) =>
@@ -4698,15 +4816,8 @@ class AppDataGroupImpl implements AppDataGroup {
         this.dataBackends.set(desc.id, { instance, syncable, pairId: pair.pairId, desc });
         this.backendStates.set(desc.id, { backendId: desc.id, pairId: pair.pairId });
 
-        // Conflict archives land in `.meta/conflicts/` (syncable diagnostics).
-        if (this.features.conflicts) {
-          const conflictHandler: SyncEventHandler = (event) => {
-            this.archiveConflict(event).catch((err) => {
-              log.warn(`[AppDataGroup:${this.groupId}] conflict archive failed:`, err);
-            });
-          };
-          this.syncEngine.on(pair.pairId, 'conflict', conflictHandler);
-        }
+        // Pair events (`sync:start` / `sync:end` / `sync:error` / `conflict`)
+        // are wired by trackSyncErrors().
         this.trackSyncErrors(desc.id, pair.pairId);
         // NOTE: Don't watch yet — sync first, then watch (same pattern as ConfigRepo)
         log.log(`[AppDataGroup:${this.groupId}] backend ${desc.id} (${desc.type}) connected, pair=${pair.pairId}`);
@@ -4780,6 +4891,34 @@ class AppDataGroupImpl implements AppDataGroup {
 
   /** Mirror per-pair `sync:error` into `getBackendSyncStates()` (see ConfigRepo). */
   private trackSyncErrors(backendId: string, pairId: string): void {
+    this.syncEngine.on(pairId, 'sync:start', (event) => {
+      this.emitSyncEvent({
+        type: 'sync:start',
+        groupKind: 'data',
+        groupId: this.groupId,
+        backendId,
+        pairId,
+        timestamp: event.timestamp ?? Date.now(),
+      });
+    });
+    this.syncEngine.on(pairId, 'conflict', (event) => {
+      // Archive is a diagnostic side effect; the event itself must always be
+      // observable, even when conflict archiving is disabled for this group.
+      if (this.features.conflicts) {
+        this.archiveConflict(event).catch((err) => {
+          log.warn(`[AppDataGroup:${this.groupId}] conflict archive failed:`, err);
+        });
+      }
+      this.emitSyncEvent({
+        type: 'conflict',
+        groupKind: 'data',
+        groupId: this.groupId,
+        backendId,
+        pairId,
+        timestamp: event.timestamp ?? Date.now(),
+        conflict: event.conflict,
+      });
+    });
     this.syncEngine.on(pairId, 'sync:error', (event) => {
       const error = event.error;
       const message = error instanceof Error ? error.message : String(error ?? 'sync failed');
@@ -5062,13 +5201,6 @@ class AppDataGroupImpl implements AppDataGroup {
     const desc: AppDataBackendDescriptor = { id, type, options, description, createdAt: Date.now() };
     this.dataBackends.set(id, { instance, syncable, pairId: pair.pairId, desc });
     this.backendStates.set(id, { backendId: id, pairId: pair.pairId });
-    if (this.features.conflicts) {
-      this.syncEngine.on(pair.pairId, 'conflict', (event) => {
-        this.archiveConflict(event).catch((err) => {
-          log.warn(`[AppDataGroup:${this.groupId}] conflict archive failed:`, err);
-        });
-      });
-    }
     this.trackSyncErrors(id, pair.pairId);
     this._backends = [...this._backends.filter(b => b.id !== id), desc];
     log.log(`[AppDataGroup:${this.groupId}] addBackend: ${id} (${type}) connected, pair=${pair.pairId}`);
