@@ -123,6 +123,7 @@ import {
   normalizeTombstonePath,
   purgeTombstonedTree,
   serializeTombstone,
+  writeFileOverwrite,
   TombstoneStore,
   VersionStore,
   ConflictStore,
@@ -825,7 +826,7 @@ export class ConfigRepo implements IConfigRepo {
     const tombstoneBytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const tombstonePath = tombstonePathFor(normalizedPath, TOMBSTONES_DIR);
     await this.ensureDir(tombstonePath);
-    await this.cachedFS.writeFile(tombstonePath, tombstoneBytes);
+    await writeFileOverwrite(this.cachedFS, tombstonePath, tombstoneBytes);
   }
 
   /**

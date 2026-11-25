@@ -211,6 +211,38 @@ function toBytes(raw: any): Uint8Array {
   return new Uint8Array(raw);
 }
 
+/**
+ * 覆盖写一个 `.meta` 文件。
+ *
+ * 某些后端（StoreFS / RemoteStorage / WebDAV）的 `writeFile` 在文件已存在时
+ * 仍会走「新建」路径，后端侧返回 `EEXIST`（"file already exists"）。
+ * 墓碑 / 版本 / 冲突这类文件天然会被重复写（例如同一个后端被再次移除），
+ * 所以这里显式做「失败 → unlink → 再写」的兜底。
+ */
+export async function writeFileOverwrite(fs: MetaFS, path: string, data: any): Promise<void> {
+  const bytes = toBytes(data);
+  try {
+    await fs.writeFile(path, bytes);
+    return;
+  } catch (err) {
+    if (!isAlreadyExistsError(err)) throw err;
+  }
+  try {
+    await fs.unlink(path);
+  } catch {
+    /* 文件可能已被别人删掉 */
+  }
+  await fs.writeFile(path, bytes);
+}
+
+/** 后端把「文件已存在」报成 EEXIST / EEXIST 文案两种形态。 */
+function isAlreadyExistsError(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | null;
+  if (!e) return false;
+  if (e.code === 'EEXIST') return true;
+  return /file already exists|already exists|文件已存在/i.test(String(e.message ?? ''));
+}
+
 /** Create every parent directory of `filePath`. mkdir is idempotent. */
 export async function ensureParentDir(fs: MetaFS, filePath: string): Promise<void> {
   const parts = filePath.split('/').filter(Boolean);
@@ -247,7 +279,7 @@ async function readText(fs: MetaFS, path: string): Promise<string | null> {
 
 async function writeJson(fs: MetaFS, path: string, value: unknown): Promise<void> {
   await ensureParentDir(fs, path);
-  await fs.writeFile(path, new TextEncoder().encode(JSON.stringify(value, null, 2)));
+  await writeFileOverwrite(fs, path, new TextEncoder().encode(JSON.stringify(value, null, 2)));
 }
 
 async function existsSafe(fs: MetaFS, path: string): Promise<boolean> {
@@ -699,7 +731,8 @@ export class TombstoneStore {
     const bytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const p = this.pathFor(tombstone.path);
     await ensureParentDir(this.fs, p);
-    await this.fs.writeFile(p, bytes);
+    // 同一路径的墓碑可能已存在（再次删除同一后端 / 目录），这里必须覆盖。
+    await writeFileOverwrite(this.fs, p, bytes);
   }
 
   /** Persist an updated tombstone (confirmations) when it still exists. */
@@ -707,7 +740,7 @@ export class TombstoneStore {
     const bytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const p = this.pathFor(tombstone.path);
     if (!(await existsSafe(this.fs, p))) return;
-    await this.fs.writeFile(p, bytes);
+    await writeFileOverwrite(this.fs, p, bytes);
   }
 
   /** Delete a tombstone. */
