@@ -195,7 +195,7 @@ export const DATA_GROUP_DEFAULT_FEATURES: SyncGroupFeatures = {
 // Small fs helpers (work with backend instances and SyncableFS alike)
 // ---------------------------------------------------------------------------
 
-type MetaFS = {
+export type MetaFS = {
   readFile(path: string, encoding?: string): Promise<any>;
   writeFile(path: string, data: any): Promise<void>;
   readdir(path: string): Promise<string[]>;
@@ -218,8 +218,19 @@ function toBytes(raw: any): Uint8Array {
  * 仍会走「新建」路径，后端侧返回 `EEXIST`（"file already exists"）。
  * 墓碑 / 版本 / 冲突这类文件天然会被重复写（例如同一个后端被再次移除），
  * 所以这里显式做「失败 → unlink → 再写」的兜底。
+ *
+ * 还有一种更糟的形态：目录 listing 里已有该名字，但实例的 inode 索引里没有
+ * （`exists()/stat()/unlink()` 全部报 ENOENT，只有 `createFile` 报 EEXIST）。
+ * 这种「幽灵条目」靠 unlink 删不掉，于是重试仍然 EEXIST。此时由调用方决定：
+ * 墓碑这类「文件存在即代表删除已登记」的语义可以 `ignorePersistentEexist`
+ * 直接当成功，其它需要真实覆盖内容的（版本记录等）仍然抛错。
  */
-export async function writeFileOverwrite(fs: MetaFS, path: string, data: any): Promise<void> {
+export async function writeFileOverwrite(
+  fs: MetaFS,
+  path: string,
+  data: any,
+  options: { ignorePersistentEexist?: boolean } = {},
+): Promise<void> {
   const bytes = toBytes(data);
   try {
     await fs.writeFile(path, bytes);
@@ -232,7 +243,16 @@ export async function writeFileOverwrite(fs: MetaFS, path: string, data: any): P
   } catch {
     /* 文件可能已被别人删掉 */
   }
-  await fs.writeFile(path, bytes);
+  try {
+    await fs.writeFile(path, bytes);
+  } catch (err) {
+    if (isAlreadyExistsError(err) && options.ignorePersistentEexist) {
+      // 幽灵条目：删不掉、也建不了；已有同名文件即视为目标状态已达成。
+      log.warn(`[zen-fs-config] writeFileOverwrite: 同名文件无法覆盖，按已存在处理 ${path}`);
+      return;
+    }
+    throw err;
+  }
 }
 
 /** 后端把「文件已存在」报成 EEXIST / EEXIST 文案两种形态。 */
@@ -732,7 +752,9 @@ export class TombstoneStore {
     const p = this.pathFor(tombstone.path);
     await ensureParentDir(this.fs, p);
     // 同一路径的墓碑可能已存在（再次删除同一后端 / 目录），这里必须覆盖。
-    await writeFileOverwrite(this.fs, p, bytes);
+    // 幽灵条目（listing 有名字但索引里没有）删不掉，按「已存在」处理：
+    // 墓碑语义就是「这个路径被删过」，已经存在即目标已达成。
+    await writeFileOverwrite(this.fs, p, bytes, { ignorePersistentEexist: true });
   }
 
   /** Persist an updated tombstone (confirmations) when it still exists. */
@@ -740,7 +762,7 @@ export class TombstoneStore {
     const bytes = new TextEncoder().encode(serializeTombstone(tombstone));
     const p = this.pathFor(tombstone.path);
     if (!(await existsSafe(this.fs, p))) return;
-    await writeFileOverwrite(this.fs, p, bytes);
+    await writeFileOverwrite(this.fs, p, bytes, { ignorePersistentEexist: true });
   }
 
   /** Delete a tombstone. */

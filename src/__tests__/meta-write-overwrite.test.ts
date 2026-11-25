@@ -72,4 +72,31 @@ describe('writeFileOverwrite', () => {
       writeFileOverwrite(fs, '/.meta/tombstones/c.json', new TextEncoder().encode('{}')),
     ).rejects.toThrow(/disk full/);
   });
+
+  it('幽灵条目（删不掉又建不了）：墓碑语义下按已存在处理', async () => {
+    // 目录 listing 里有名字，但索引里没有：exists/stat/unlink 全是 ENOENT，
+    // 只有 createFile 报 EEXIST —— 线上 removeBackend 的真实形态。
+    const ghost = {
+      async writeFile() {
+        const err: any = new Error('file already exists');
+        err.code = 'EEXIST';
+        throw err;
+      },
+      async readFile() { throw new Error('ENOENT'); },
+      async readdir() { return []; },
+      async mkdir() { return undefined; },
+      async unlink() { throw new Error('ENOENT'); },
+    } as unknown as MetaFS;
+
+    await expect(
+      writeFileOverwrite(ghost, '/.meta/tombstones/g.json', new TextEncoder().encode('{}'), {
+        ignorePersistentEexist: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    // 需要真实覆盖内容的场景仍然要抛
+    await expect(
+      writeFileOverwrite(ghost, '/.meta/tombstones/g.json', new TextEncoder().encode('{}')),
+    ).rejects.toThrow(/already exists/);
+  });
 });
