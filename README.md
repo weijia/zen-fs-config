@@ -232,6 +232,36 @@ const summary = await result.whenReplicasReady?.();
 - No pair is created before verification succeeds. That removes the "create then tear down on conflict" window (and any need to gate syncing behind a flag); the price is that consumers must honour the two signals.
 - `dispose()` and `flush()` await the background setup, so a late pair can never attach to a disposed engine and `flush()` never runs against zero pairs.
 
+## V2 entry point: `connectV2()`
+
+`connectV2()` is the small app-facing surface. The legacy `connect()` stays available and is called internally; V2 does not create a second connection pool.
+
+```typescript
+import { connectV2 } from 'zen-fs-config';
+
+const repo = await connectV2('golf');           // AppRepo
+const group = await repo.getDefaultDataGroup(); // existing local group, or local `default`
+
+await group.fs.promises.writeFile('/golf/state.json', json);
+await group.addBackend({
+  type: 'Gitee',
+  options: { owner, repo, token, path: 'golf-data' },
+});
+
+const off = group.onSyncEvent((event) => {
+  if (event.type === 'sync:start') showSyncing(event.backendId);
+  if (event.type === 'sync:end') showDone(event.result);
+});
+```
+
+- `AppRepo` exposes `appId`, `getDefaultDataGroup()`, `listDataGroups()`, and `getDataGroup(id)`.
+- `DataGroup` exposes `id`, `fs`, `addBackend()`, `flush()`, `deleteFile()`, `onSyncEvent()`.
+- `listDataGroups()` returns lightweight `{ id, name, hasRemote }` entries; `getDataGroup(id)` only loads an existing group.
+- `flush()` syncs all pairs now and returns one result per `pairId`; `deleteFile(path)` goes through the tombstone path so a deletion cannot be resurrected by the next sync.
+- The default group is the first group already on this device (`default` first, otherwise the first one); an empty local `default` is created only when no group exists.
+- `connectV2()` does not accept `dataBackends`; data backends belong to a `DataGroup`.
+- `onSyncEvent()` currently forwards `sync:start` / `sync:end` / `sync:error` / `conflict`. Per-file `sync:progress` needs upstream `zen-fs-sync` support and is not faked.
+
 ## App data group path semantics
 
 `dataGroup.fs` exposes the **logical root of the data group** (the application's data directory). It is not a view of one backend's physical root.

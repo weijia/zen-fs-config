@@ -339,7 +339,11 @@ export interface BackendSyncState {
  * 里的计数过滤自己关心的变更；`sync:error` 只在整轮抛错时发。
  */
 export interface SyncGroupSyncEvent {
-  type: 'sync:end' | 'sync:error';
+  /**
+   * `sync:progress` 由未来的 zen-fs-sync 逐文件进度回调提供；当前上游没有，
+   * 库不会伪造这个事件。
+   */
+  type: 'sync:start' | 'sync:progress' | 'sync:end' | 'sync:error' | 'conflict';
   /** 事件所属组的类型。 */
   groupKind: SyncGroupKind;
   /** 配置组固定为 `config`；数据组为其 groupId。 */
@@ -352,6 +356,18 @@ export interface SyncGroupSyncEvent {
   result?: SyncResult;
   /** `sync:error` 时的错误消息。 */
   error?: string;
+  /**
+   * 逐文件进度。上游 `zen-fs-sync` 尚未提供，保留字段供后续透传。
+   * 调用方不能假设它一定存在，也不能据此伪造百分比。
+   */
+  progress?: {
+    processed: number;
+    total?: number;
+    currentPath?: string;
+    phase?: string;
+  };
+  /** `conflict` 时的上游冲突详情。 */
+  conflict?: unknown;
 }
 
 

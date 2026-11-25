@@ -67,6 +67,38 @@ export {
 } from './connect';
 export type { GroupProbeState, GroupProbeResult } from './connect';
 
+// Public V2 API — small app-facing surface on top of the same connection.
+export {
+  connectV2,
+  connectionToAppRepo,
+  getUiConnection,
+  ConnectV2Error,
+  ConnectFailedError,
+  ConfigNotReadyError,
+  InvalidBackendError,
+  BackendAlreadyExistsError,
+  BackendEndpointConflictError,
+  BackendIdentityError,
+  DataGroupCreateError,
+  DataGroupBackendError,
+  DataGroupNotFoundError,
+  DataGroupOperationError,
+} from './api-v2';
+export type {
+  AppRepo,
+  DataGroup,
+  DataGroupInfo,
+  DataBackendInput,
+  AddBackendResult,
+  DataGroupSyncEvent,
+  DataGroupSyncProgress,
+  DataGroupSyncResult,
+  DataGroupFlushResult,
+  ConfigBackendInput,
+  ConnectV2Options,
+  UiConnection,
+} from './api-v2';
+
 // Backend registry
 export { registerBackend, unregisterBackend, createBackend, hasBackend, listBackends, getBackendMetadata, listBackendMetadata, getAccountFields, mergeAccountFields, wrapZenFSFileSystem } from './backend-registry';
 export type { BackendFactory, BackendInstance, BackendMetadata, BackendParamDef } from './backend-registry';
