@@ -449,6 +449,28 @@ export interface GroupDescriptor {
 }
 
 /**
+ * `.meta/aliases/{instanceId}.json` — 共享远端根上的成员别名。
+ *
+ * 一个远端根只有一个 canonical 身份（`.meta/group.json` 的 `instanceId`）。
+ * 其它应用的数据组可以显式加入同一个根：各自保留自己的 `instanceId`，
+ * 在该根写一份 alias 文件。绑定阶段同时认 canonical 与 alias，因此不同
+ * `appId` / 不同 `groupId` 的组可以共享同一份数据，而不会互相改写身份。
+ *
+ * alias 文件必须一实例一文件：所有成员并发加入时各写各的文件，不存在
+ * read-modify-write 覆盖；`.meta/group.json` 始终由 canonical 组持有。
+ */
+export interface GroupAliasDescriptor {
+  schemaVersion: 2;
+  kind: 'data';
+  /** 成员组自己的 id（canonical 组的 id 不在这里）。 */
+  id: string;
+  /** 成员组自己的实例身份，同时是文件名。 */
+  instanceId: string;
+  /** 成员所属应用，仅用于界面展示与排查。 */
+  appId?: string;
+}
+
+/**
  * One sync group = a local primary store + zero-or-more remote replicas +
  * the shared `.meta/` metadata area + that group's own backend definitions.
  *
@@ -490,6 +512,14 @@ export interface BackendConflictInfo {
   canAdoptRemoteInstance: boolean;
   /** 允许“把远端 group.json 改写成本组身份”（要求 kind 相同；会影响共享该根的副本）。 */
   canRewriteRemoteIdentity: boolean;
+  /**
+   * 允许“作为 alias 加入这个共享根”：远端已有 data 身份，本组身份也有效。
+   *
+   * 加入只写本组自己的 `.meta/aliases/{instanceId}.json`，不改远端
+   * `.meta/group.json`；canonical 组不受影响。必须由用户显式确认后调用
+   * `resolveBackendConflict(..., 'join-shared-root')`。
+   */
+  canJoinSharedRoot?: boolean;
   unreadable?: boolean;
   error?: string;
 }
@@ -497,7 +527,9 @@ export interface BackendConflictInfo {
 /** 用户确认后的冲突解决动作。 */
 export type BackendConflictResolution =
   | 'adopt-remote-instance'
-  | 'rewrite-remote-identity';
+  | 'rewrite-remote-identity'
+  /** 把本组身份写进远端 `.meta/aliases/`，加入已有数据根（不改 group.json）。 */
+  | 'join-shared-root';
 
 export interface BackendConflictResolutionResult {
   mode: BackendConflictResolution;
@@ -505,6 +537,8 @@ export interface BackendConflictResolutionResult {
   reason?: string;
   /** adopt-remote-instance 成功后应落盘的本地 instanceId。 */
   instanceId?: string;
+  /** join-shared-root 成功后写入的 alias 实例身份。 */
+  aliasInstanceId?: string;
 }
 
 /** `instanceId` 的候选来源：本地描述符 / 共享引导副本 / 某个远端根。 */
@@ -937,7 +971,16 @@ export interface IConfigRepo {
   createAppDataGroup(
     id: string,
     backends: AppDataBackendDescriptor[],
-    options?: { name?: string; features?: Partial<SyncGroupFeatures> },
+    options?: {
+      name?: string;
+      features?: Partial<SyncGroupFeatures>;
+      /**
+       * 允许创建时先接入一个已被其它数据组占用的远端根：不在这里抛错，
+       * 由绑定阶段把冲突交给 UI，用户确认 `join-shared-root` 后再写 alias。
+       * 只放行 data/data 同端点；配置组或读不到身份仍然拒绝。
+       */
+      allowSharedRoot?: boolean;
+    },
   ): Promise<AppDataGroup>;
 
   /** Get an existing data-sync group handle. */

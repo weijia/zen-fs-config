@@ -26,6 +26,7 @@ import type {
   AppDataBackendDescriptor,
   AppDataGroupDescriptor,
   BackendDescriptor,
+  GroupAliasDescriptor,
   GroupDescriptor,
 } from './types';
 
@@ -35,6 +36,7 @@ import type {
 
 const FEATURE_ORDER = ['tombstones', 'versions', 'conflicts', 'configHost', 'appData'] as const;
 const GROUP_DESCRIPTOR_ORDER = ['schemaVersion', 'kind', 'id', 'instanceId', 'profile', 'name', 'features'] as const;
+const GROUP_ALIAS_ORDER = ['schemaVersion', 'kind', 'id', 'instanceId', 'appId'] as const;
 const APP_DATA_GROUP_ORDER = ['id', 'groupType', 'instanceId', 'name', 'features'] as const;
 const BACKEND_ORDER = ['id', 'groupId', 'type', 'options', 'accountBackendId', 'description', 'createdAt'] as const;
 
@@ -103,6 +105,11 @@ function stringify(value: Record<string, unknown>): string {
 export function serializeGroupDescriptor(descriptor: GroupDescriptor): string {
   const { updatedAt: _ignored, ...rest } = descriptor as GroupDescriptor & { updatedAt?: number };
   return stringify(canonicalObject(rest as Record<string, unknown>, GROUP_DESCRIPTOR_ORDER));
+}
+
+/** `.meta/aliases/{instanceId}.json` 的规范化字节。 */
+export function serializeGroupAlias(alias: GroupAliasDescriptor): string {
+  return stringify(canonicalObject(alias as unknown as Record<string, unknown>, GROUP_ALIAS_ORDER));
 }
 
 /** 单个后端描述符（`.meta/backends/{id}.json`）的规范化字节。 */

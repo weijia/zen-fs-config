@@ -3270,7 +3270,12 @@ export class ConfigRepo implements IConfigRepo {
       }
       this.backendConflicts.delete(backendId);
       this.skippedBackends.delete(backendId);
-      return { mode, ok: true, ...(result.instanceId ? { instanceId: result.instanceId } : {}) };
+      return {
+        mode,
+        ok: true,
+        ...(result.instanceId ? { instanceId: result.instanceId } : {}),
+        ...(result.aliasInstanceId ? { aliasInstanceId: result.aliasInstanceId } : {}),
+      };
     } catch (err) {
       return { mode, ok: false, reason: `对齐失败：${(err as Error)?.message ?? String(err)}` };
     } finally {
@@ -3538,14 +3543,18 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
-   * 由端点指纹派生后端 id：同类型 + 同身份参数（不含 token）+ 同组 → 同 id。
-   * 两个节点各自录入同一端点时，文件名一致，不会各写一份。
+   * 由端点指纹派生后端 id：同类型 + 同身份参数（不含 token）→ 同 id。
+   *
+   * 不再混入 groupId：共享同一个远端根的几个应用组，必须落到同一个
+   * `.meta/backends/{id}.json`，否则每个组都会把对方的 backend 当自己的候选，
+   * 在同一根上建出重复同步对。不同组指向同一端点本来就会被共享根校验拦下，
+   * 因此去掉 groupId 不会让非共享组发生文件名碰撞。
    */
   private async deriveAppDataBackendId(
-    groupId: string,
+    _groupId: string,
     descriptor: Pick<AppDataBackendDescriptor, 'type' | 'options'>,
   ): Promise<string> {
-    const fingerprint = `${groupId}:${backendDedupKey({ id: '', type: descriptor.type, options: descriptor.options })}`;
+    const fingerprint = `${descriptor.type}:${backendDedupKey({ id: '', type: descriptor.type, options: descriptor.options })}`;
     const hash = (await sha256(new TextEncoder().encode(fingerprint)))
       .replace(/^sha256:/, '')
       .slice(0, 10);
@@ -3602,9 +3611,14 @@ export class ConfigRepo implements IConfigRepo {
     remote: GroupDescriptor | null,
     backendId: string,
     ownerId: string,
+    options: { allowSharedRoot?: boolean } = {},
   ): void {
     if (!remote) return;
     if (remote.kind === 'data' && remote.id === ownerId) return;
+    if (options.allowSharedRoot && remote.kind === 'data') {
+      // 共享根候选：是不是合法成员交给绑定阶段判定（alias 命中才建对）。
+      return;
+    }
     const who = remote.kind === 'data'
       ? `数据组「${remote.id}」${remote.instanceId ? `（instanceId=${remote.instanceId}）` : ''}`
       : `配置同步组（kind=${remote.kind ?? '未知'}${remote.id ? `，id=${remote.id}` : ''}）`;
@@ -3622,6 +3636,7 @@ export class ConfigRepo implements IConfigRepo {
   private async assertNoSharedRemote(
     backends: AppDataBackendDescriptor[],
     ownerId: string,
+    options: { allowSharedRoot?: boolean } = {},
   ): Promise<void> {
     const candidates = new Set(backends.map((b) => backendDedupKey(b)));
     if (candidates.size === 0) return;
@@ -3635,14 +3650,16 @@ export class ConfigRepo implements IConfigRepo {
       }
     }
 
-    for (const other of await this.listAppDataGroups()) {
-      if (other.id === ownerId) continue;
-      for (const backend of other.backends) {
-        if (candidates.has(backendDedupKey(backend))) {
-          throw new Error(
-            `数据组「${ownerId}」的后端「${backend.id}」与数据组「${other.id}」的后端` +
-            `「${backend.id}」指向同一远端（类型与参数完全相同），请为其中一个组更换 basePath`,
-          );
+    if (!options.allowSharedRoot) {
+      for (const other of await this.listAppDataGroups()) {
+        if (other.id === ownerId) continue;
+        for (const backend of other.backends) {
+          if (candidates.has(backendDedupKey(backend))) {
+            throw new Error(
+              `数据组「${ownerId}」的后端「${backend.id}」与数据组「${other.id}」的后端` +
+              `「${backend.id}」指向同一远端（类型与参数完全相同），请为其中一个组更换 basePath`,
+            );
+          }
         }
       }
     }
@@ -3683,14 +3700,18 @@ export class ConfigRepo implements IConfigRepo {
       } finally {
         try { await instance.dispose?.(); } catch { /* best effort */ }
       }
-      this.assertRemoteNotOwnedByOthers(remote, backend.id, ownerId);
+      this.assertRemoteNotOwnedByOthers(remote, backend.id, ownerId, options);
     }
   }
 
   async createAppDataGroup(
     id: string,
     backends: AppDataBackendDescriptor[],
-    options: { name?: string; features?: Partial<SyncGroupFeatures> } = {},
+    options: {
+      name?: string;
+      features?: Partial<SyncGroupFeatures>;
+      allowSharedRoot?: boolean;
+    } = {},
   ): Promise<AppDataGroup> {
     this.assertNotDisposed();
 
@@ -3711,8 +3732,10 @@ export class ConfigRepo implements IConfigRepo {
       resolvedBackends.push({ ...desc, id: backendId, options: mergedOptions });
     }
 
-    // Cross-group uniqueness: no two groups may share the same remote endpoint.
-    await this.assertNoSharedRemote(resolvedBackends, id);
+    // Cross-group uniqueness: no two groups may share the same remote endpoint
+    // unless the caller explicitly allows a shared root (UI then asks the user
+    // to join as an alias after the ownership conflict is surfaced).
+    await this.assertNoSharedRemote(resolvedBackends, id, options);
 
     // 新建组**不再无条件生成**实例身份：已有登记（引导副本）时沿用它的值，
     // 否则留空交给 init() 的「先读后定」流程（见 GROUP-IDENTITY-INIT.zh-CN.md）。
@@ -4427,7 +4450,21 @@ class AppDataGroupImpl implements AppDataGroup {
       }
       kept.push(desc);
     }
-    this._backends = kept;
+    // 共享根上不同成员可能用不同 backend id 指向同一个端点。`.meta/backends`
+    // 被同步到每个组后，不能让本组建出重复同步对：按端点去重，优先保留本组
+    // 引导副本里已有的 id。
+    const ownIds = new Set(this._backends.map((b) => b.id));
+    const byEndpoint = new Map<string, AppDataBackendDescriptor>();
+    for (const desc of kept) {
+      const key = backendDedupKey(desc);
+      const existing = byEndpoint.get(key);
+      if (!existing) {
+        byEndpoint.set(key, desc);
+        continue;
+      }
+      if (!ownIds.has(existing.id) && ownIds.has(desc.id)) byEndpoint.set(key, desc);
+    }
+    this._backends = Array.from(byEndpoint.values());
     return pruned;
   }
 
@@ -4473,6 +4510,10 @@ class AppDataGroupImpl implements AppDataGroup {
 
     for (const old of (await readBackendMetaDescriptors(this.localFS)) ?? []) {
       if (keep.has(old.id)) continue;
+      // 只删除“本组上一版拓扑里确实有”的 backend。共享根上别的成员写进
+      // `.meta/backends` 的文件不在本组 _backends 里，绝不能在这里删掉——
+      // 否则本组一次 create/replace 会把对方的后端定义从远端清掉。
+      if (!this._backends.some((b) => b.id === old.id)) continue;
       await this.writeTombstoneFor(backendMetaFilePath(old.id));
       await removeBackendMetaDescriptor(this.localFS, old.id);
     }
@@ -4549,6 +4590,7 @@ class AppDataGroupImpl implements AppDataGroup {
         kind: 'data',
         id: this.groupId,
         instanceId: this.instanceId,
+        ...(this.appId ? { appId: this.appId } : {}),
         ...(this.name ? { name: this.name } : {}),
         features: this.features,
       };
@@ -4568,6 +4610,11 @@ class AppDataGroupImpl implements AppDataGroup {
             && result.remote.id === this.groupId,
           // 改写远端：要求 kind 相同（组 id 不同才需要它，代价是动了共享的远端根）。
           canRewriteRemoteIdentity: result.remote ? result.remote.kind === 'data' : false,
+          canJoinSharedRoot:
+            result.remote?.kind === 'data'
+            && isValidGroupInstanceId(result.remote.instanceId)
+            && isValidGroupInstanceId(this.instanceId)
+            && (result.conflict === 'id-mismatch' || result.conflict === 'instance-mismatch'),
           ...(result.unreadable ? { unreadable: true } : {}),
           ...(result.error ? { error: result.error } : {}),
         });
@@ -4817,6 +4864,7 @@ class AppDataGroupImpl implements AppDataGroup {
         kind: 'data',
         id: this.groupId,
         instanceId: this.instanceId,
+        ...(this.appId ? { appId: this.appId } : {}),
         ...(this.name ? { name: this.name } : {}),
         features: this.features,
       };
@@ -4839,7 +4887,12 @@ class AppDataGroupImpl implements AppDataGroup {
       }
       this.backendConflicts.delete(backendId);
       this.skippedBackends.delete(backendId);
-      return { mode, ok: true, ...(result.instanceId ? { instanceId: result.instanceId } : {}) };
+      return {
+        mode,
+        ok: true,
+        ...(result.instanceId ? { instanceId: result.instanceId } : {}),
+        ...(result.aliasInstanceId ? { aliasInstanceId: result.aliasInstanceId } : {}),
+      };
     } catch (err) {
       return { mode, ok: false, reason: `对齐失败：${(err as Error)?.message ?? String(err)}` };
     } finally {
@@ -5545,6 +5598,35 @@ class AppDataGroupImpl implements AppDataGroup {
     await this.ensureIdentityForNewBackend(instance);
     const owned = await this.checkBackendOwnership(instance, id);
     if (owned === 'conflict') {
+      const info = this.backendConflicts.get(id);
+      if (info?.canJoinSharedRoot) {
+        // 共享根候选：保留后端声明，但先不建同步对。UI 会读取
+        // listBackendConflicts() 并提示用户是否 join-shared-root；用户确认后
+        // 写 alias，再刷新页面重新连接。若直接抛错回滚，用户就没有这个入口。
+        const desc: AppDataBackendDescriptor = { id, type, options, description, createdAt: Date.now() };
+        this._backends = [...this._backends.filter((b) => b.id !== id), desc];
+        try {
+          const stale = (await this.tombstones.list()).find((t) => t.path === backendMetaFilePath(id));
+          if (stale) await this.tombstones.remove(stale);
+          await writeBackendMetaDescriptor(this.localFS, desc);
+        } catch (err) {
+          log.warn(`[AppDataGroup:${this.groupId}] addBackend: failed to persist shared-root candidate ${id}:`, err);
+        }
+        try {
+          await this.parent.updateAppDataGroupDescriptor(this.groupId, this._backends, {
+            name: this.name,
+            features: this._declaredFeatures,
+          });
+        } catch (err) {
+          log.warn(`[AppDataGroup:${this.groupId}] addBackend: failed to update bootstrap for ${id}:`, err);
+        }
+        try { await instance.dispose?.(); } catch { /* best effort */ }
+        log.warn(
+          `[AppDataGroup:${this.groupId}] backend ${id} kept as shared-root candidate — ` +
+          `waiting for user to confirm join-shared-root`,
+        );
+        return;
+      }
       const reason = this.skippedBackends.get(id) ?? '远端根属于另一个同步组';
       try { await instance.dispose?.(); } catch { /* best effort */ }
       this.skippedBackends.delete(id);

@@ -17,6 +17,7 @@
 import type {
   AppDataBackendDescriptor,
   ConflictArchive,
+  GroupAliasDescriptor,
   GroupDescriptor,
   SyncGroupFeatures,
   TombstoneMeta,
@@ -28,6 +29,7 @@ import { createLogger } from '@richard432/localstorage-logger';
 import {
   mergeBackendDescriptor,
   serializeBackendDescriptor,
+  serializeGroupAlias,
   serializeGroupDescriptor,
 } from './canonical-json';
 
@@ -41,6 +43,11 @@ export const META_DIR = '/.meta';
 export const GROUP_DESCRIPTOR_FILE = `${META_DIR}/group.json`;
 export const META_BACKENDS_DIR = `${META_DIR}/backends`;
 export const TOMBSTONES_DIR = `${META_DIR}/tombstones`;
+/**
+ * 共享远端根的成员别名目录。一个 alias 一个文件，按 instanceId 命名。
+ * 与 `group.json` 分开，避免多个应用并发加入时 read-modify-write 丢成员。
+ */
+export const ALIASES_DIR = `${META_DIR}/aliases`;
 
 /**
  * 「删除后重建」判定的容差（毫秒）。文件 mtime 比 `deletedAt` 新出这个余量，
@@ -617,6 +624,108 @@ export async function writeGroupDescriptor(fs: MetaFS, descriptor: GroupDescript
   if ((await readText(fs, GROUP_DESCRIPTOR_FILE)) === bytes) return;
   await ensureParentDir(fs, GROUP_DESCRIPTOR_FILE);
   await fs.writeFile(GROUP_DESCRIPTOR_FILE, new TextEncoder().encode(bytes));
+}
+
+// ---------------------------------------------------------------------------
+// Shared-root aliases (`.meta/aliases/{instanceId}.json`)
+// ---------------------------------------------------------------------------
+
+const ALIAS_INSTANCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** alias 文件名直接使用 instanceId，必须先校验 UUID，避免路径逃逸。 */
+export function groupAliasFilePath(instanceId: string): string {
+  if (!ALIAS_INSTANCE_RE.test(instanceId)) {
+    throw new Error(`Invalid group alias instanceId "${instanceId}": must be a UUID`);
+  }
+  return `${ALIASES_DIR}/${instanceId.toLowerCase()}.json`;
+}
+
+function normalizeGroupAlias(value: unknown, expectedInstanceId?: string): GroupAliasDescriptor | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== 'data') return null;
+  if (typeof record.id !== 'string' || record.id.trim() === '') return null;
+  if (typeof record.instanceId !== 'string' || !ALIAS_INSTANCE_RE.test(record.instanceId)) return null;
+  if (expectedInstanceId && record.instanceId.toLowerCase() !== expectedInstanceId.toLowerCase()) return null;
+  return {
+    schemaVersion: 2,
+    kind: 'data',
+    id: record.id,
+    instanceId: record.instanceId.toLowerCase(),
+    ...(typeof record.appId === 'string' && record.appId.trim() ? { appId: record.appId } : {}),
+  };
+}
+
+/** Read one alias by instanceId. Missing/corrupt returns null. */
+export async function readGroupAlias(
+  fs: MetaFS,
+  instanceId: string,
+): Promise<GroupAliasDescriptor | null> {
+  if (!ALIAS_INSTANCE_RE.test(instanceId)) return null;
+  const parsed = await readJson<unknown>(fs, groupAliasFilePath(instanceId));
+  return normalizeGroupAlias(parsed, instanceId);
+}
+
+/**
+ * Read every alias on a shared root.
+ *
+ * 目录不存在 = 尚未共享，返回空数组；目录存在但个别文件损坏时跳过损坏项，
+ * 不让一个坏 alias 把整个根判成可写。
+ */
+export async function readGroupAliases(fs: MetaFS): Promise<GroupAliasDescriptor[]> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(ALIASES_DIR);
+  } catch {
+    return [];
+  }
+  const out: GroupAliasDescriptor[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const instanceId = entry.slice(0, -'.json'.length);
+    if (!ALIAS_INSTANCE_RE.test(instanceId)) continue;
+    try {
+      const alias = await readGroupAlias(fs, instanceId);
+      if (alias) out.push(alias);
+    } catch {
+      /* 单个 alias 读不到：跳过，绑定阶段仍会按 canonical 判定 */
+    }
+  }
+  return out.sort((a, b) => (a.instanceId < b.instanceId ? -1 : a.instanceId > b.instanceId ? 1 : 0));
+}
+
+/**
+ * Write one member alias. Write-once per instanceId:
+ * - 已存在同 instanceId 且 id 相同 → 幂等；
+ * - 已存在同 instanceId 但 id 不同 → 拒绝，绝不覆盖别人的成员记录。
+ */
+export async function writeGroupAlias(
+  fs: MetaFS,
+  alias: GroupAliasDescriptor,
+): Promise<boolean> {
+  const normalized = normalizeGroupAlias(alias);
+  if (!normalized) throw new Error('Invalid group alias descriptor');
+  const path = groupAliasFilePath(normalized.instanceId);
+  const raw = await readText(fs, path);
+  if (raw !== null) {
+    let existing: GroupAliasDescriptor | null = null;
+    try {
+      existing = normalizeGroupAlias(JSON.parse(raw), normalized.instanceId);
+    } catch {
+      existing = null; // corrupt → replace with the good copy
+    }
+    if (existing && existing.id !== normalized.id) {
+      throw new Error(
+        `Alias ${normalized.instanceId} already belongs to data group "${existing.id}", ` +
+        `cannot overwrite it with "${normalized.id}"`,
+      );
+    }
+  }
+  const bytes = serializeGroupAlias(normalized);
+  if (raw === bytes) return false;
+  await ensureParentDir(fs, path);
+  await writeFileOverwrite(fs, path, new TextEncoder().encode(bytes));
+  return true;
 }
 
 // ---------------------------------------------------------------------------

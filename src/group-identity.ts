@@ -16,9 +16,9 @@
  * 连接前拒绝建对。
  */
 
-import { readGroupDescriptorStrict, writeGroupDescriptor } from './group-meta';
+import { readGroupDescriptorStrict, writeGroupDescriptor, readGroupAlias, readGroupAliases, writeGroupAlias } from './group-meta';
 import { createLogger } from '@richard432/localstorage-logger';
-import type { GroupDescriptor, SyncGroupKind } from './types';
+import type { GroupAliasDescriptor, GroupDescriptor, SyncGroupKind } from './types';
 
 const log = createLogger('zen-fs-config:group-identity');
 
@@ -52,6 +52,8 @@ export interface GroupIdentity {
   kind: SyncGroupKind;
   id: string;
   instanceId: string;
+  /** 数据组所属应用，写入 alias 文件时用于展示；配置组忽略。 */
+  appId?: string;
   name?: string;
   /** 组能力位；认领老仓库时一并写入，避免与本地描述符产生字节差异。 */
   features?: GroupDescriptor['features'];
@@ -247,6 +249,8 @@ export interface IdentityBindingResult {
   remote: RemoteIdentitySnapshot | null;
   local: GroupIdentity;
   conflict?: IdentityConflictReason;
+  /** 命中方式：canonical（group.json）或 alias（.meta/aliases）。 */
+  matchedVia?: 'canonical' | 'alias';
   /** 远端读不到（网络 / 权限），区别于“空仓库”。 */
   unreadable?: boolean;
   error?: string;
@@ -340,7 +344,22 @@ export async function bindRemoteGroupIdentityDetailed(
 
   if (isValidGroupInstanceId(current)) {
     if (current === localInstanceId) {
-      return { state: 'match', remote: snapshot, local: identity };
+      return { state: 'match', remote: snapshot, local: identity, matchedVia: 'canonical' };
+    }
+    // 共享根：成员各自保留自己的 instanceId，在 `.meta/aliases/<instanceId>.json`
+    // 里登记。canonical 组永远不需要 alias，因此这里只查本组自己的文件。
+    const alias = await readGroupAlias(remoteFS, localInstanceId);
+    if (
+      alias
+      && snapshot?.kind === 'data'
+      && alias.kind === identity.kind
+      && alias.id === identity.id
+    ) {
+      log.log(
+        `[GroupIdentity] joined shared root as alias (remote ${summarizeIdentity(snapshot)}, ` +
+        `alias ${identity.id}/${localInstanceId})`,
+      );
+      return { state: 'match', remote: snapshot, local: identity, matchedVia: 'alias' };
     }
     const reason: IdentityConflictReason =
       snapshot?.id && snapshot.id !== identity.id ? 'id-mismatch' : 'instance-mismatch';
@@ -349,6 +368,16 @@ export async function bindRemoteGroupIdentityDetailed(
         `(remote ${summarizeIdentity(snapshot)}, this group ${summarizeIdentity(identity)}) — sync pair NOT created`,
     );
     return { state: 'conflict', remote: snapshot, local: identity, conflict: reason };
+  }
+
+  // 没有 canonical 身份、却已经有 alias 文件：这是一个不完整的共享根，
+  // 不能把本组认领成 canonical（否则会把已有成员的成员表架空）。
+  if ((await readGroupAliases(remoteFS)).length > 0) {
+    log.warn(
+      `[GroupIdentity] remote root has aliases but no canonical instanceId — ` +
+      `refusing to claim it (this group ${summarizeIdentity(identity)})`,
+    );
+    return { state: 'conflict', remote: snapshot, local: identity, conflict: 'instance-mismatch' };
   }
 
   // 老仓库 / 空仓库：没有实例身份 → 由先到者认领，之后归属固定。
@@ -385,7 +414,9 @@ export type IdentityResolutionMode =
   /** 只把本地实例身份对齐成远端的 instanceId（要求 kind 与 id 相同）。 */
   | 'adopt-remote-instance'
   /** 把远端 `group.json` 改写成本组的 kind/id/instanceId（要求 kind 相同）。 */
-  | 'rewrite-remote-identity';
+  | 'rewrite-remote-identity'
+  /** 把本组写成远端根的 alias 成员，保留两侧身份，不改 `group.json`。 */
+  | 'join-shared-root';
 
 export interface IdentityResolutionResult {
   mode: IdentityResolutionMode;
@@ -393,6 +424,8 @@ export interface IdentityResolutionResult {
   reason?: string;
   /** adopt-remote-instance 成功后应落盘到本地的 instanceId。 */
   instanceId?: string;
+  /** join-shared-root 成功后写入的 alias 实例身份。 */
+  aliasInstanceId?: string;
   remote?: RemoteIdentitySnapshot | null;
 }
 
@@ -416,6 +449,41 @@ export async function resolveRemoteIdentity(
     return { mode, ok: false, reason: `远端描述符读不到：${(err as Error)?.message ?? String(err)}` };
   }
   const snapshot = snapshotOf(remote);
+
+  if (mode === 'join-shared-root') {
+    if (identity.kind !== 'data' || snapshot?.kind !== 'data') {
+      return {
+        mode,
+        ok: false,
+        reason: `只有 data 组可以加入共享根（远端 kind=${snapshot?.kind ?? '?'}，本组 kind=${identity.kind}）`,
+        remote: snapshot,
+      };
+    }
+    const remoteInstanceId = snapshot.instanceId;
+    if (!isValidGroupInstanceId(remoteInstanceId)) {
+      return { mode, ok: false, reason: '远端没有 canonical 实例身份，不能作为共享根加入', remote: snapshot };
+    }
+    if (!isValidGroupInstanceId(identity.instanceId)) {
+      return { mode, ok: false, reason: '本组 instanceId 无效，不能写 alias', remote: snapshot };
+    }
+    const alias: GroupAliasDescriptor = {
+      schemaVersion: 2,
+      kind: 'data',
+      id: identity.id,
+      instanceId: identity.instanceId,
+      ...(identity.appId ? { appId: identity.appId } : {}),
+    };
+    try {
+      await writeGroupAlias(remoteFS, alias);
+    } catch (err) {
+      return { mode, ok: false, reason: `写 alias 失败：${(err as Error)?.message ?? String(err)}`, remote: snapshot };
+    }
+    log.log(
+      `[GroupIdentity] joined shared root as alias ${identity.id}/${identity.instanceId} ` +
+      `(canonical ${summarizeIdentity(snapshot)})`,
+    );
+    return { mode, ok: true, aliasInstanceId: identity.instanceId, remote: snapshot };
+  }
 
   if (mode === 'adopt-remote-instance') {
     const remoteInstanceId = snapshot?.instanceId;
