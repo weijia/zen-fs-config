@@ -56,7 +56,10 @@ const REMOTE_ID = '44444444-4444-4444-8444-444444444444';
 describe('config group identity candidates (fresh read)', () => {
   it('本地已定身份时，async 回读仍能带出远端不同的值，并标记待裁决', async () => {
     const repo: any = await createConfigRepo('candid-1', { nodeId: 'c1' });
-    const local = await repo.ensureGroupInstanceId();
+    // 本地身份只能来自「显式初始化」或已有描述符：没有后端时 ensureGroupInstanceId
+    // 按新契约不再凭空生成（见确定性身份改造）。
+    await repo.ensureGroupType('config-sync');
+    const local = repo.getGroupInstanceId();
     expect(local).toBeTruthy();
 
     // 远端根属于同一个配置组（kind=config · id=config），但身份被别处写成了另一个值
@@ -95,7 +98,8 @@ describe('config group identity candidates (fresh read)', () => {
 
   it('远端与本地一致时不标记待裁决', async () => {
     const repo: any = await createConfigRepo('candid-2', { nodeId: 'c2' });
-    const local = await repo.ensureGroupInstanceId();
+    await repo.ensureGroupType('config-sync');
+    const local = repo.getGroupInstanceId();
 
     const inst = await createBackend({ type: 'IdRemote', options: { label: 'cfg-2' } });
     remotes.set('cfg-2', inst);

@@ -56,8 +56,8 @@ import {
 import { createLogger } from '@richard432/localstorage-logger';
 import {
   bindRemoteGroupIdentityDetailed,
+  deriveGroupInstanceId,
   isValidGroupInstanceId,
-  newGroupInstanceId,
   pickInstanceId,
   resolveRemoteIdentity,
   summarizeIdentity,
@@ -542,6 +542,13 @@ export class ConfigRepo implements IConfigRepo {
    * `instanceId`，不一致就不建同步对 —— 两个不同的同步组永不互相同步。
    */
   private instanceId?: string;
+  /**
+   * 配置组的 profile 名（缺省 `config`）。身份按它确定性派生；
+   * 一个远端根只承载一个 profile，因此不改变任何目录结构。
+   */
+  private profile: string;
+  /** 调用方是否显式传了 profile（否则沿用描述符里的值）。 */
+  private profileExplicit = false;
   /** 配置组身份的候选（本地 + 每个后端根），供界面展示。 */
   private identityCandidates: IdentityCandidate[] = [];
   /** 候选互相矛盾：需要用户裁决，绝不由库层自动择一。 */
@@ -576,12 +583,15 @@ export class ConfigRepo implements IConfigRepo {
     onConflict?: (conflict: ConflictInfo) => Promise<unknown | null>,
     pollIntervalMs?: number,
     cacheOptions?: CacheOptions,
+    profile?: string,
   ) {
     this.appId = appId;
     this.nodeId = nodeId;
     this.primaryBackendId = primaryBackendId;
     this.cachedFS = cachedFS;
     this.serializer = serializer;
+    this.profile = (profile ?? 'config').trim() || 'config';
+    this.profileExplicit = typeof profile === 'string' && profile.trim() !== '';
     this.syncEngine = new ZenFSSync();
     this.replicaBackends = new Map();
     this.onConflictCallback = onConflict;
@@ -2638,6 +2648,20 @@ export class ConfigRepo implements IConfigRepo {
     const desc: BackendDescriptor = { id, type, options, description };
     await this.writeBackendDescriptor(desc);
 
+    // 身份必须在建对之前定好并绑定这个根：没有 descriptor 时不会算 backendCount，
+    // 所以这一步放在写描述符之后。冲突就回滚描述符并报错，绝不把别人的根接进来。
+    const owned = await this.bindBackendIdentity(instance, id);
+    if (owned === 'conflict') {
+      const reason = this.skippedBackends.get(id) ?? '远端根属于另一个同步组';
+      try {
+        await this.cachedFS.unlink(this.backendFilePath(id));
+        await this.unlinkVersionSidecar(this.cachedFS, this.backendFilePath(id));
+      } catch { /* best effort */ }
+      try { await instance.dispose?.(); } catch { /* best effort */ }
+      this.skippedBackends.delete(id);
+      throw new Error(`无法接入后端 "${id}"：${reason}`);
+    }
+
     // Register as replica with tombstone hooks
     const pair = this.syncEngine.addPair(
       this.fullFS,
@@ -2858,6 +2882,8 @@ export class ConfigRepo implements IConfigRepo {
       } catch { /* treat as absent */ }
       const known = pickInstanceId(existing);
       existingFeatures = existing?.features ?? CONFIG_GROUP_FEATURES;
+      // profile 以显式参数为准；未显式传时沿用描述符里记录的值（老部署没有就是 config）。
+      if (!this.profileExplicit && existing?.profile) this.profile = existing.profile.trim() || 'config';
 
       if (known) {
         this.instanceId = known;
@@ -2867,6 +2893,26 @@ export class ConfigRepo implements IConfigRepo {
         const collected = await this.collectConfigIdentityCandidates(kind, id);
         this.identityCandidates = collected.candidates;
         const distinct = collected.distinct;
+
+        // 一个后端都没接：身份无意义，先不设。等接入第一个后端（或用户显式设置）
+        // 时再按 profile 派生 —— 这正是「本地启动不预置 instanceId」的落地点，
+        // 也是新设备能沿用远端老身份（而不是先占一个本地身份）的前提。
+        if (!distinct.length && collected.backendCount === 0) {
+          this.instanceId = undefined;
+          this.configIdentityUnsettled = false;
+          log.log(
+            `[ConfigRepo] no backend configured — group instanceId left unset (profile "${this.profile}")`,
+          );
+          existingFeatures = existingFeatures ?? CONFIG_GROUP_FEATURES;
+          return {
+            kind,
+            id,
+            instanceId: '',
+            ...(this.name ? { name: this.name } : {}),
+            ...(existingFeatures ? { features: existingFeatures } : {}),
+          };
+        }
+
         // 「有后端但一个都读不到」≠「哪里都没有身份」：这时生成并落盘只会给远端根
         // 引入一个新值，之后必然判成 instance-mismatch。宁可本轮不分配身份，
         // 也不写本地描述符、不碰任何远端（等网络恢复或用户在界面上裁决）。
@@ -2887,7 +2933,7 @@ export class ConfigRepo implements IConfigRepo {
           };
         }
 
-        const assigned = distinct[0] ?? newGroupInstanceId();
+        const assigned = distinct[0] ?? deriveGroupInstanceId('config', { profile: this.profile });
         this.instanceId = assigned;
         this.configIdentityUnsettled = distinct.length > 1;
         if (this.configIdentityUnsettled) {
@@ -2897,7 +2943,10 @@ export class ConfigRepo implements IConfigRepo {
           );
         }
         if (!distinct.length) {
-          log.log(`[ConfigRepo] no identity anywhere (local/remote all empty) — generated ${assigned}`);
+          log.log(
+            `[ConfigRepo] no identity anywhere (local/remote all empty) — ` +
+              `derived ${assigned} from profile "${this.profile}"`,
+          );
         }
         try {
           await writeGroupDescriptor(this.cachedFS, {
@@ -2905,6 +2954,7 @@ export class ConfigRepo implements IConfigRepo {
             kind: existing?.kind ?? kind,
             id: existing?.id ?? id,
             instanceId: assigned,
+            profile: this.profile,
             ...((existing?.name ?? this.name) ? { name: (existing?.name ?? this.name) as string } : {}),
             features: existing?.features ?? CONFIG_GROUP_FEATURES,
           });
@@ -3062,7 +3112,7 @@ export class ConfigRepo implements IConfigRepo {
   ): Promise<SetGroupInstanceIdResult> {
     const roots: GroupInstanceIdRootResult[] = [];
     if (!isValidGroupInstanceId(instanceId)) {
-      return { ok: false, reason: '不是合法的 UUID v4', roots };
+      return { ok: false, reason: '不是合法的 UUID', roots };
     }
     const previous = this.instanceId;
     this.instanceId = instanceId;
@@ -3072,6 +3122,7 @@ export class ConfigRepo implements IConfigRepo {
         kind: 'config',
         id: CONFIG_GROUP_ID,
         instanceId,
+        profile: this.profile,
         ...(this.name ? { name: this.name } : {}),
         features: CONFIG_GROUP_FEATURES,
       });
@@ -3107,6 +3158,7 @@ export class ConfigRepo implements IConfigRepo {
             kind: 'config',
             id: CONFIG_GROUP_ID,
             instanceId,
+            profile: this.profile,
             ...(this.name ? { name: this.name } : {}),
             features: CONFIG_GROUP_FEATURES,
           });
@@ -3206,6 +3258,7 @@ export class ConfigRepo implements IConfigRepo {
             kind: identity.kind,
             id: identity.id,
             instanceId: this.instanceId,
+            ...(identity.kind === 'config' ? { profile: this.profile } : {}),
             ...(this.name ? { name: this.name } : {}),
             features: CONFIG_GROUP_FEATURES,
           });
@@ -3239,12 +3292,13 @@ export class ConfigRepo implements IConfigRepo {
     // would produce needless sync churn).
     const existingDescriptor = await readGroupDescriptor(this.cachedFS);
     if (!existingDescriptor) {
-      this.instanceId = newGroupInstanceId();
+      this.instanceId = deriveGroupInstanceId('config', { profile: this.profile });
       await writeGroupDescriptor(this.cachedFS, {
         schemaVersion: 2,
         kind: 'config',
         id: CONFIG_GROUP_ID,
         instanceId: this.instanceId,
+        profile: this.profile,
         ...(this.name ? { name: this.name } : {}),
         features: CONFIG_GROUP_FEATURES,
       });
@@ -3257,6 +3311,7 @@ export class ConfigRepo implements IConfigRepo {
         schemaVersion: 2,
         kind: 'config',
         id: existingDescriptor.id ?? CONFIG_GROUP_ID,
+        ...(existingDescriptor.profile ? { profile: existingDescriptor.profile } : {}),
         ...(name ? { name } : {}),
         features: existingDescriptor.features ?? CONFIG_GROUP_FEATURES,
       });
@@ -3266,16 +3321,17 @@ export class ConfigRepo implements IConfigRepo {
     if (knownInstanceId) {
       this.instanceId = knownInstanceId;
     } else if (!this.instanceId) {
-      this.instanceId = newGroupInstanceId();
+      this.instanceId = deriveGroupInstanceId('config', { profile: this.profile });
       await writeGroupDescriptor(this.cachedFS, {
         schemaVersion: 2,
         kind: existingDescriptor?.kind ?? 'config',
         id: existingDescriptor?.id ?? CONFIG_GROUP_ID,
         instanceId: this.instanceId,
+        profile: this.profile,
         ...((existingDescriptor?.name ?? this.name) ? { name: (existingDescriptor?.name ?? this.name) as string } : {}),
         ...(existingDescriptor?.features ? { features: existingDescriptor.features } : {}),
       });
-      log.log(`[ConfigRepo] assigned group instanceId ${this.instanceId} (kind=${existingDescriptor?.kind ?? 'config'})`);
+      log.log(`[ConfigRepo] assigned group instanceId ${this.instanceId} (kind=${existingDescriptor?.kind ?? 'config'}, profile=${this.profile})`);
     }
     log.log('[ConfigRepo] group descriptor ensured');
     // 标记已停写，遗留的那份只剩副作用：配置组同步会把它推回每个远端根，于是
@@ -3786,7 +3842,8 @@ export class ConfigRepo implements IConfigRepo {
       schemaVersion: 2,
       kind: 'config',
       id: CONFIG_GROUP_ID,
-      instanceId: identity.instanceId,
+      ...(identity.instanceId ? { instanceId: identity.instanceId } : {}),
+      profile: this.profile,
       name: normalized,
       features: CONFIG_GROUP_FEATURES,
     });
@@ -4398,10 +4455,16 @@ class AppDataGroupImpl implements AppDataGroup {
       if (provisional) {
         this.instanceId = provisional;
       } else if (prepared.length > 0) {
-        // 有远端根（哪怕全为空）才需要身份去认领它们 —— 生成一次。
-        this.instanceId = newGroupInstanceId();
+        // 有远端根（哪怕全为空）才需要身份去认领它们 —— 按 appId + groupId
+        // 确定性派生：任何设备为同一个数据组算出的都是同一个值，谁先到都能
+        // 直接认领，不需要「先到者赢」的竞态处理。
+        this.instanceId = deriveGroupInstanceId('data', {
+          appId: this.appId,
+          groupId: this.groupId,
+        });
         log.log(
-          `[AppDataGroup:${this.groupId}] no identity anywhere (local / bootstrap / remote all empty) — generated ${this.instanceId}`,
+          `[AppDataGroup:${this.groupId}] no identity anywhere (local / bootstrap / remote all empty) — ` +
+            `derived ${this.instanceId} from appId+groupId`,
         );
       } else {
         // 一个后端都没有：身份无意义，先不设；首个后端加入时再决定。
@@ -4442,7 +4505,7 @@ class AppDataGroupImpl implements AppDataGroup {
   ): Promise<SetGroupInstanceIdResult> {
     const roots: GroupInstanceIdRootResult[] = [];
     if (!isValidGroupInstanceId(instanceId)) {
-      return { ok: false, reason: '不是合法的 UUID v4', roots };
+      return { ok: false, reason: '不是合法的 UUID', roots };
     }
 
     this.instanceId = instanceId;
@@ -5221,6 +5284,43 @@ class AppDataGroupImpl implements AppDataGroup {
     );
   }
 
+  /**
+   * 动态加入第一个后端时的身份定夺（只在 `instanceId` 为空时执行）。
+   * 顺序：本地 `.meta/group.json` → 该远端根已有身份 → 确定性派生。
+   * 已有随机身份的老组因此会被沿用，不会因为「后加后端」被换成派生值。
+   */
+  private async ensureIdentityForNewBackend(instance: any): Promise<void> {
+    if (this.instanceId) return;
+    let candidate: string | undefined;
+    try {
+      candidate = pickInstanceId(await readGroupDescriptor(this.localFS));
+    } catch { /* absent */ }
+    if (!candidate) {
+      try {
+        const remote = await readGroupDescriptorStrict(instance);
+        if (remote?.kind === 'data' && remote.id === this.groupId) {
+          candidate = pickInstanceId(remote);
+        }
+      } catch { /* 读不到：不猜，按派生兜底（绑定阶段会再判一次） */ }
+    }
+    if (!candidate) {
+      candidate = deriveGroupInstanceId('data', { appId: this.appId, groupId: this.groupId });
+    }
+    this.instanceId = candidate;
+    try {
+      await writeGroupDescriptor(this.localFS, {
+        schemaVersion: 2,
+        kind: 'data',
+        id: this.groupId,
+        instanceId: candidate,
+        ...(this.name ? { name: this.name } : {}),
+        features: this.features,
+      });
+    } catch (err) {
+      log.warn(`[AppDataGroup:${this.groupId}] failed to persist first-backend instanceId:`, err);
+    }
+  }
+
   async addBackend(
     id: string,
     type: string,
@@ -5237,6 +5337,18 @@ class AppDataGroupImpl implements AppDataGroup {
 
     log.log(`[AppDataGroup:${this.groupId}] addBackend: creating ${id} (${type})...`);
     const instance = await createBackend({ type, options });
+
+    // 第一次加后端才定身份：先看本地描述符，再看这个根是否已有身份（老组的随机值
+    // 必须沿用），都没有才按 appId+groupId 派生。定完先绑根，冲突就不建对。
+    await this.ensureIdentityForNewBackend(instance);
+    const owned = await this.checkBackendOwnership(instance, id);
+    if (owned === 'conflict') {
+      const reason = this.skippedBackends.get(id) ?? '远端根属于另一个同步组';
+      try { await instance.dispose?.(); } catch { /* best effort */ }
+      this.skippedBackends.delete(id);
+      throw new Error(`无法接入后端 "${id}"：${reason}`);
+    }
+
     const syncable = backendToSyncableFS(instance, `${type}(${id})`);
 
     const localSyncable = backendToSyncableFS(this.localFS, `local(${this.groupId})`);
@@ -5509,6 +5621,7 @@ export async function createConfigRepo(
       ...(isValidGroupInstanceId(declaredIdentity.instanceId)
         ? { instanceId: declaredIdentity.instanceId }
         : {}),
+      profile: declaredIdentity.profile?.trim() || options.profile?.trim() || 'config',
       ...(declaredIdentity.name ? { name: declaredIdentity.name } : {}),
       features: CONFIG_GROUP_FEATURES,
     });
@@ -5546,7 +5659,7 @@ export async function createConfigRepo(
   // Step 3: Create temp repo for meta operations (nodeId not yet known)
   // -------------------------------------------------------------------
   const tempRepo = new ConfigRepo(
-    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs, cacheOptions,
+    appId, '', LOCAL_IDB_BACKEND_ID, cachedFS, createSerializerChain(), undefined, options.syncPollIntervalMs, cacheOptions, options.profile,
   );
 
   // -------------------------------------------------------------------
@@ -5634,6 +5747,7 @@ export async function createConfigRepo(
     options.onConflict,
     options.syncPollIntervalMs,
     cacheOptions,
+    options.profile,
   );
 
   // Hydrate the unified handle's display name from the descriptor.

@@ -44,9 +44,11 @@ export {
   summarizeIdentity,
   shortInstanceId,
   newGroupInstanceId,
+  deriveGroupInstanceId,
   isValidGroupInstanceId,
 } from './group-identity';
 export type {
+  DerivedIdentityInput,
   GroupIdentity,
   IdentityBindingResult,
   IdentityConflictReason,

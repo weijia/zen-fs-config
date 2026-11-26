@@ -310,6 +310,7 @@ export async function connect(
     const repo = await createConfigRepo(appId, {
       idbStoreName: options.idbStoreName,
       nodeId: options.nodeId,
+      profile: options.profile,
       primaryBackendId: options.primaryBackendId,
       folderPath: options.folderPath,
       cache: options.cache,
@@ -404,6 +405,7 @@ export async function connect(
           deferReplicaSetup,
           idbStoreName: options.idbStoreName,
           nodeId: options.nodeId,
+          profile: options.profile,
           primaryBackendId: options.primaryBackendId,
           folderPath: options.folderPath,
           cache: options.cache,
@@ -414,6 +416,7 @@ export async function connect(
       : {
           idbStoreName: options.idbStoreName,
           nodeId: options.nodeId,
+          profile: options.profile,
           folderPath: options.folderPath,
           serializer: options.serializer,
           onConflict: options.onConflict,

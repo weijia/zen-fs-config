@@ -90,7 +90,7 @@
 
 | 路径                                                             | 写入方                   | 当前是否参与同步                                                | 说明                                                      |
 | -------------------------------------------------------------- | --------------------- | ------------------------------------------------------- | ------------------------------------------------------- |
-| `/.meta/group.json`                                            | 身份流程（建对 / 认领 / 对齐）    | **否**（永久排除）                                             | `schemaVersion/kind/id/instanceId/name/features`；不含后端列表 |
+| `/.meta/group.json`                                            | 身份流程（建对 / 认领 / 对齐）    | **否**（永久排除）                                             | `schemaVersion/kind/id/instanceId/profile/name/features`；不含后端列表 |
 | `/.meta/backends/{id}.json`                                    | 组拓扑增删改                | **是**                                                   | 权威后端全文，含 `options`（凭证）与 `createdAt`                     |
 | `/.meta/tombstones/{encoded}.json`                             | 删除路径                  | **是**                                                   | 删除意图的唯一账本，必须跨端可见                                        |
 | `/.meta/versions/{encoded}.json`                               | `VersionStore.record` | 是（数据组 `features.versions` 开启时）                          | `{version, hash, author, timestamp}`                    |

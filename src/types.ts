@@ -209,6 +209,15 @@ export interface ConfigRepoOptions {
   nodeId?: string;
 
   /**
+   * 配置组的 profile 名。缺省 `config`。
+   *
+   * 身份按 profile 确定性派生（`config:<profile>`），所以多个应用共享同一个
+   * 配置组时，只要 profile 与远端根相同，各端算出的 instanceId 都相同。
+   * 一个远端根只能承载一个 profile。
+   */
+  profile?: string;
+
+  /**
    * Cache configuration for replica backends.
    *
    * - **Default** (omitted): Caching is enabled with `IdbCacheStore`
@@ -409,6 +418,13 @@ export interface GroupDescriptor {
   instanceId?: string;
   /** User-editable display name. */
   name?: string;
+  /**
+   * 配置组的 profile 名（仅 `kind=config`）。缺省 `config`。
+   *
+   * 一个远端根只承载一个 profile；身份按 profile 派生，因此多个应用共享同一个
+   * 配置组（同一 profile、同一远端根）时算出的 instanceId 天然一致。
+   */
+  profile?: string;
   features?: Partial<SyncGroupFeatures>;
   /**
    * @deprecated 不再写入、读取侧忽略。时间戳写进随同步走的内容会形成
@@ -674,6 +690,11 @@ export interface ConnectOptions {
   folderPath?: string;
   /** Node identifier. Auto-detected if not provided. */
   nodeId?: string;
+  /**
+   * 配置组的 profile 名。缺省 `config`（见 `GroupDescriptor.profile`）。
+   * 只影响配置组的确定性身份，不改变任何目录结构。
+   */
+  profile?: string;
   /**
    * Cache configuration for replica backends. Omit for the default
    * (`IdbCacheStore`, persists across reloads); pass `false` to disable; pass a

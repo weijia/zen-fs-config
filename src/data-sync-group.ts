@@ -48,7 +48,7 @@ import {
 import {
   bindRemoteGroupIdentity,
   isValidGroupInstanceId,
-  newGroupInstanceId,
+  deriveGroupInstanceId,
 } from './group-identity';
 import { purgeMtimeSidecars, type PurgeMtimeOptions, type MtimePurgeResult } from './mtime-cleanup';
 import { purgeKeepFiles, type PurgeKeepOptions, type KeepPurgeResult } from './keep-cleanup';
@@ -230,7 +230,7 @@ export class DataSyncGroup implements AppDataGroup {
     _options: SetGroupInstanceIdOptions = {},
   ): Promise<SetGroupInstanceIdResult> {
     if (!isValidGroupInstanceId(instanceId)) {
-      return { ok: false, reason: '不是合法的 UUID v4', roots: [] };
+      return { ok: false, reason: '不是合法的 UUID', roots: [] };
     }
     this.instanceId = instanceId;
     await writeGroupDescriptor(this.localFS, {
@@ -255,7 +255,7 @@ export class DataSyncGroup implements AppDataGroup {
       existing = await readGroupDescriptor(this.localFS);
     } catch { /* absent */ }
     const known = isValidGroupInstanceId(existing?.instanceId) ? existing!.instanceId : undefined;
-    this.instanceId = known ?? newGroupInstanceId();
+    this.instanceId = known ?? deriveGroupInstanceId('data', { appId: this.appId, groupId: this.groupId });
     if (!known) {
       await writeGroupDescriptor(this.localFS, {
         schemaVersion: 2,

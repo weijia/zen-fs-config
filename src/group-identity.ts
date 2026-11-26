@@ -76,9 +76,146 @@ export function newGroupInstanceId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/** 只接受 UUID v4 形态，避免把任意字符串当成身份写进会被同步的内容。 */
+/** 只接受 UUID 形态（v4 随机 / v5 确定性都合法），避免把任意字符串当成身份写进会被同步的内容。 */
 export function isValidGroupInstanceId(value: unknown): value is string {
   return typeof value === 'string' && INSTANCE_ID_RE.test(value.trim());
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic group identity (UUID v5)
+// ---------------------------------------------------------------------------
+
+/**
+ * 命名空间 UUID：只在派生算法内部使用，**不得修改** —— 改一个字节就会让所有
+ * 已按确定性规则建立的组算出另一个身份。
+ */
+const IDENTITY_NAMESPACE = '5f6a2f0c-9a4e-4b6e-8c3f-2c1d9b7a0e11';
+
+/** hex → 16 字节 UUID。 */
+function uuidToBytes(uuid: string): Uint8Array {
+  const hex = uuid.replace(/-/g, '');
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i += 1) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+function utf8Bytes(text: string): Uint8Array {
+  return new TextEncoder().encode(text);
+}
+
+/** 纯 JS SHA-1（不依赖 WebCrypto，保证浏览器 / Node / 测试运行时结果一致）。 */
+function sha1(bytes: Uint8Array): Uint8Array {
+  const ml = bytes.length;
+  const withPad = (((ml + 9 + 63) >> 6) << 6);
+  const block = new Uint8Array(withPad);
+  block.set(bytes);
+  block[ml] = 0x80;
+  const view = new DataView(block.buffer);
+  // 长度按 64 位大端写；这里只支持 < 2^32 字节的输入（足够）。
+  view.setUint32(withPad - 4, ml * 8, false);
+
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+  const w = new Uint32Array(80);
+
+  for (let off = 0; off < withPad; off += 64) {
+    for (let i = 0; i < 16; i += 1) w[i] = view.getUint32(off + i * 4, false);
+    for (let i = 16; i < 80; i += 1) {
+      const x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+      w[i] = ((x << 1) | (x >>> 31)) >>> 0;
+    }
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    for (let i = 0; i < 80; i += 1) {
+      let f: number;
+      let k: number;
+      if (i < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdc;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6;
+      }
+      const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) >>> 0;
+      e = d;
+      d = c;
+      c = ((b << 30) | (b >>> 2)) >>> 0;
+      b = a;
+      a = t;
+    }
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+  }
+
+  const out = new Uint8Array(20);
+  const outView = new DataView(out.buffer);
+  outView.setUint32(0, h0, false);
+  outView.setUint32(4, h1, false);
+  outView.setUint32(8, h2, false);
+  outView.setUint32(12, h3, false);
+  outView.setUint32(16, h4, false);
+  return out;
+}
+
+/** 派生身份的输入：配置组用 `profile`，数据组用 `appId + groupId`。 */
+export interface DerivedIdentityInput {
+  /** 配置组：profile 名（缺省 `config`）；数据组忽略。 */
+  profile?: string;
+  /** 数据组：应用 id；配置组忽略。 */
+  appId?: string;
+  /** 数据组：组 id；配置组忽略。 */
+  groupId?: string;
+}
+
+/**
+ * 确定性组身份（UUID v5）。
+ *
+ * 规则（与 GROUP-IDENTITY-INIT 的「第一期」一致）：
+ *   - 配置组：`config:${profile}`（profile 缺省 `config`），因此同一个远端根
+ *     无论被哪台设备、哪个应用先连上，算出来的身份都相同，不需要再「认领」；
+ *   - 数据组：`data:${appId}:${groupId}`，不同应用的 `default` 不会撞在一起。
+ *
+ * 只在「本地 / 引导副本 / 所有远端根都没有身份」且确实有后端需要认领时使用；
+ * 已有身份（含历史随机 UUID）一律沿用，绝不改写。
+ */
+export function deriveGroupInstanceId(
+  kind: SyncGroupKind,
+  input: DerivedIdentityInput = {},
+): string {
+  const name =
+    kind === 'config'
+      ? `zen-fs-config:v1:config:${(input.profile ?? 'config').trim() || 'config'}`
+      : `zen-fs-config:v1:data:${(input.appId ?? '').trim()}:${(input.groupId ?? '').trim()}`;
+  const ns = uuidToBytes(IDENTITY_NAMESPACE);
+  const msg = new Uint8Array(ns.length + 1);
+  msg.set(ns);
+  msg[ns.length] = 0; // 分隔符，避免不同字段拼接产生歧义
+  const nameBytes = utf8Bytes(name);
+  const all = new Uint8Array(msg.length + nameBytes.length);
+  all.set(msg);
+  all.set(nameBytes, msg.length);
+
+  const digest = sha1(all);
+  const bytes = digest.slice(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /**

@@ -92,13 +92,14 @@ describe('config-sync group layout', () => {
     expect(await exists(repo.rootFS, '/.meta/group-type')).toBe(false);
 
     await repo.addBackend('cfg-b1', 'UnifyRemote', { label: 'cfg-b1' });
-    // 只登记后端不等于「已确定身份」——身份在真正需要时才落盘
-    expect(await exists(repo.rootFS, '/.meta/group.json')).toBe(false);
+    // 接入第一个后端即定身份：本地 `.meta/group.json` 由身份流程写入
+    expect(await exists(repo.rootFS, '/.meta/group.json')).toBe(true);
     const instanceId = await (repo as any).ensureGroupInstanceId();
     const descriptor = JSON.parse(decode(await repo.rootFS.promises.readFile('/.meta/group.json')));
     expect(descriptor.kind).toBe('config');
     expect(descriptor.id).toBe('config');
     expect(descriptor.instanceId).toBe(instanceId);
+    expect(descriptor.profile).toBe('config');
     expect(descriptor.features.configHost).toBe(true);
 
     // Backend descriptors live in `.meta/backends/` only — `.config/backends/`
@@ -290,7 +291,7 @@ describe('identity file is never content-synced', () => {
     await repo.dispose();
   });
 
-  it('接入后端后同步不会把本地 .meta/group.json 推到副本', async () => {
+  it('接入后端时身份文件由身份流程认领写入，内容同步不搬运它', async () => {
     const label = `excl-${Math.random().toString(36).slice(2, 8)}`;
     const repo = await createConfigRepo(`unify-excl-${label}`, { nodeId: 'e1' });
     await (repo as any).ensureGroupInstanceId();
@@ -302,8 +303,11 @@ describe('identity file is never content-synced', () => {
     const remote = remotes.get(label)!;
     // 普通内容照常同步
     expect(await exists(remote as any, '/data/note.txt')).toBe(true);
-    // 身份文件不动 —— 否则身份就成了「谁最后写谁赢」
-    expect(await exists(remote as any, '/.meta/group.json')).toBe(false);
+    // 身份文件由身份流程认领写入，内容同步不参与搬运：本地与远端是同一个身份
+    const local = JSON.parse(decode(await repo.rootFS.promises.readFile('/.meta/group.json')));
+    const remoteDescriptor = JSON.parse(decode(await (remote as any).readFile('/.meta/group.json')));
+    expect(remoteDescriptor.instanceId).toBe(local.instanceId);
+    expect(remoteDescriptor.instanceId).toBe(await (repo as any).ensureGroupInstanceId());
 
     await repo.dispose();
   });
