@@ -306,6 +306,15 @@ export interface AppDataBackendDescriptor {
   createdAt?: number;
 }
 
+/**
+ * 应用数据组后端文件的磁盘结构：
+ * `/.config/app-data-groups/<appId>/backends/<backendId>.json`。
+ * 归属（appId + groupId）由目录与 `groupId` 字段共同决定，一个文件只描述一个端点。
+ */
+export interface AppDataBackendFileDescriptor extends AppDataBackendDescriptor {
+  groupId: string;
+}
+
 /** Descriptor for a data-sync group referenced by a config-sync group. */
 export interface AppDataGroupDescriptor {
   id: string;
@@ -319,6 +328,12 @@ export interface AppDataGroupDescriptor {
   instanceId?: string;
   /** Capability overrides (versions/conflicts are opt-in for data groups). */
   features?: Partial<SyncGroupFeatures>;
+  /**
+   * @deprecated 不再写入描述符文件：后端改存独立文件
+   * `/.config/app-data-groups/<appId>/backends/<backendId>.json`。
+   * 读取时仍兼容旧描述符里的数组，并会在首次加载时迁移成文件。
+   * 运行时 API 返回的对象仍带这份列表，方便调用方直接使用。
+   */
   backends: AppDataBackendDescriptor[];
 }
 

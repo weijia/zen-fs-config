@@ -136,7 +136,8 @@ group wiring instead of syncing the marker.
 │  │  └─ ...
 │  ├─ app-data-groups/                  References to data-sync groups (per app)
 │  │  └─ {appId}/
-│  │     └─ {dataGroupId}.json          { groupType: "data-sync", backends: [...] }
+│  │     └─ {dataGroupId}.json          { groupType: "data-sync", ... }（无 backends）
+│  │     └─ backends/{backendId}.json   应用后端，一文件一端点
 │  ├─ .deleted/                         Tombstones for deletion propagation
 │  │  └─ {encoded-path}.json
 │  └─ .conflicts/                       Conflict archives (safekeeping)

@@ -231,7 +231,7 @@ watch() 触发：
 
 独立 data-sync 入口已从公开 API **移除**（决策 A / T5）。数据组一律经 `ConfigRepo.createAppDataGroup` 创建，且始终归属某个配置同步组。
 
-**权威归属（0.6.0）**：数据组自己的 `.meta/backends/{id}.json` 是后端拓扑的**权威定义**（随数据组同步，任何设备连上任一数据后端即可自描述）；配置同步组的 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json`）降级为**引导副本**，只用于「新设备只有配置组凭据」和「数据组本地还没有 `.meta/backends/`」时的懒迁移回填，回刷时按规范化字节比较、相同则不写。同一 backend id 上「数据组墓碑 vs 描述符条目」冲突时**墓碑优先**。
+**权威归属（0.6.0）**：数据组自己的 `.meta/backends/{id}.json` 是后端拓扑的**权威定义**（随数据组同步，任何设备连上任一数据后端即可自描述）；配置同步组的 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json`）降级为**引导副本**，只含组元信息、不含 `backends` 数组；应用后端拆到 `.config/app-data-groups/{appId}/backends/{backendId}.json`（一文件一端点，带 `groupId`），用于「新设备只有配置组凭据」和「数据组本地还没有 `.meta/backends/`」时发现拓扑。回刷时按规范化字节比较、相同则不写。同一 backend id 上「数据组墓碑 vs 后端文件」冲突时**墓碑优先**。
 
 ### 1.9 统一入口（`connect`）
 

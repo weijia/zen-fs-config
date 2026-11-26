@@ -14,7 +14,7 @@
 ## 0. 结论摘要（TL;DR）
 
 1. **组的统一抽象**：一个同步组 = 本地主存储 + 若干远端副本 + 通用 `.meta/` + 该组自己的后端定义。配置组与数据组是**同一基座上的两个能力位**，不是「配置组 ⊃ 数据组」：配置组 `configHost=true`（能承载 `.config`），数据组 `appData=true`（能被登记为数据组）。详见 §0.1。
-2. **数据组的后端定义是自描述、且为权威**：`.meta/backends/{backendId}.json` 随数据组同步，任何设备连上任意一个数据后端都能读到完整拓扑。配置组的 `.config/app-data-groups/{appId}/{id}.json` 降级为**引导副本**（bootstrap copy），只用于「新设备只有配置组凭据」和「数据组尚未写出自己的 `.meta/backends/`」两种场景，字段 `backends` 长期保留、不删除。
+2. **数据组的后端定义是自描述、且为权威**：`.meta/backends/{backendId}.json` 随数据组同步，任何设备连上任意一个数据后端都能读到完整拓扑。配置组的 `.config/app-data-groups/{appId}/{id}.json` 降级为**引导副本**（bootstrap copy），只含组元信息；后端拆到 `.config/app-data-groups/{appId}/backends/{backendId}.json`（一文件一端点，带 `groupId`），供「新设备只有配置组凭据」和「数据组尚未写出自己的 `.meta/backends/`」时发现拓扑。
 3. **删除靠墓碑，冲突时墓碑优先**：后端删除走「写墓碑 + `unlink`」；若同一 id 既有墓碑又有描述符条目，**墓碑优先**（防止删除被复活）。
 4. **不得把时间/版本写进同步内容**：`updatedAt` 已停止写入（`GroupDescriptor.updatedAt` 标 `@deprecated`，`schemaVersion: 2` 起不写、读侧忽略）；不持久化任何 `backendsRevision`；「是否需要写」用**规范化投影字节比较**，不用哈希、不用递增计数器。详见 §4.4。
 5. **规范化序列化是跨设备一致的前提**：固定字段顺序、`backends` 按 id 排序、`options` 递归按 key 排序、不做本地化/Unicode 归一化、2 空格缩进 + `\n`、UTF-8 无 BOM、结尾不加换行。实现见 [canonical-json.ts](file:///C:/codes/nodejs/zen-fs-config/src/canonical-json.ts)。
@@ -218,7 +218,8 @@ interface SyncGroup {
 | `.meta/group.json` | 通用（每个组各一份） | ✅ 本组自描述 | 是 | `{ schemaVersion, kind, id, name?, features }`；**不写 `updatedAt`** |
 | `.meta/backends/{id}.json` | 通用（每个组各一份） | ✅ **唯一权威** | 是 | 配置组与数据组共用同一位置 |
 | `.config/backends/{id}.json` | 历史位置（0.6.x 及更早） | ❌ 残留 | **否** | 不再读取，仅删除时尽力清理 |
-| `.config/app-data-groups/{appId}/{id}.json` | 配置组专属 | ✅ 登记权威 | **否** | 登记 + 新设备引导；`backends` 字段长期保留 |
+| `.config/app-data-groups/{appId}/{id}.json` | 配置组专属 | ✅ 登记权威 | **否** | 登记 + 新设备引导；只含组元信息 |
+| `.config/app-data-groups/{appId}/backends/{backendId}.json` | 配置组专属 | ✅ 登记权威 | **否** | 应用后端一文件一端点，带 `groupId` |
 | `.meta/app-data-groups/...` | 配置组专属（旧镜像） | ❌ | 否 | 只读兼容，不再写入 |
 | `.meta/tombstones`、`.meta/versions`、`.meta/conflicts` | 通用 | ✅ | **是** | 两组都需要的跨设备删除/版本/冲突依据 |
 | `nodes/`、`shared/` | 配置组专属（内容） | — | 否 | 由配置 API 读写，用户可见 |

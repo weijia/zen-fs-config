@@ -16,6 +16,7 @@ import { writeGroupDescriptor } from '../group-meta';
 const remoteStores = new Map<string, BackendInstance>();
 const GROUP_ID = 'probe';
 const DESC_PATH = `/.config/app-data-groups/probe/${GROUP_ID}.json`;
+const BACKENDS_DIR = `/.config/app-data-groups/probe/backends`;
 
 function tmp(tag: string): string {
   return path.join(
@@ -46,12 +47,50 @@ async function seedRemote(
     { id: 'gitee-real', type: 'Folder', options: { path: tmp(`real-${tag}`) }, description: '', createdAt: 1 },
     { id: 'rs-real', type: 'Folder', options: { path: tmp(`rs-${tag}`) }, description: '', createdAt: 2 },
   ];
-  await mkdirp(remote, ['/.config', '/.config/app-data-groups', '/.config/app-data-groups/probe']);
+  await mkdirp(remote, ['/.config', '/.config/app-data-groups', '/.config/app-data-groups/probe', BACKENDS_DIR]);
   await remote.writeFile(
     DESC_PATH,
-    new TextEncoder().encode(JSON.stringify({ id: GROUP_ID, groupType: 'data-sync', backends }, null, 2)),
+    new TextEncoder().encode(JSON.stringify({ id: GROUP_ID, groupType: 'data-sync' }, null, 2)),
   );
+  for (const backend of backends) {
+    await remote.writeFile(
+      `${BACKENDS_DIR}/${backend.id}.json`,
+      new TextEncoder().encode(JSON.stringify({ ...backend, groupId: GROUP_ID }, null, 2)),
+    );
+  }
   return { label, backends };
+}
+
+async function readRemoteBackends(label: string): Promise<any[]> {
+  const inst: any = remoteStores.get(label)!;
+  let entries: string[] = [];
+  try { entries = await inst.readdir(BACKENDS_DIR); } catch { return []; }
+  const out: any[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const raw = await inst.readFile(`${BACKENDS_DIR}/${entry}`);
+    const parsed = JSON.parse(new TextDecoder().decode(raw));
+    if (parsed?.groupId === GROUP_ID) out.push(parsed);
+  }
+  return out.sort((a, b) => (a.id < b.id ? -1 : 1));
+}
+
+async function readLocalBackends(localDir: string): Promise<any[]> {
+  const fs: any = await createBackend({ type: 'Folder', options: { path: localDir } });
+  try {
+    let entries: string[] = [];
+    try { entries = await fs.readdir(BACKENDS_DIR); } catch { return []; }
+    const out: any[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith('.json')) continue;
+      const raw = await fs.readFile(`${BACKENDS_DIR}/${entry}`);
+      const parsed = JSON.parse(new TextDecoder().decode(raw));
+      if (parsed?.groupId === GROUP_ID) out.push(parsed);
+    }
+    return out.sort((a, b) => (a.id < b.id ? -1 : 1));
+  } finally {
+    await fs.dispose?.();
+  }
 }
 
 async function readRemoteDescriptor(label: string): Promise<any> {
@@ -114,13 +153,17 @@ describe('引导副本守卫：空副本不覆盖远端拓扑', () => {
     await repo.whenReplicasReady();
     await repo.flush();
 
-    expect((await readRemoteDescriptor(label)).backends.map((b: any) => b.id)).toEqual([
+    expect((await readRemoteBackends(label)).map((b: any) => b.id)).toEqual([
       'gitee-real',
       'rs-real',
     ]);
     const healed = await readLocalDescriptor(localDir);
-    expect(healed.backends.map((b: any) => b.id)).toEqual(['gitee-real', 'rs-real']);
-    expect(healed.backends.length).toBe(backends.length);
+    expect(healed.backends).toBeUndefined();
+    expect((await readLocalBackends(localDir)).map((b: any) => b.id)).toEqual([
+      'gitee-real',
+      'rs-real',
+    ]);
+    expect((await readLocalBackends(localDir)).length).toBe(backends.length);
     await repo.dispose();
   });
 
@@ -137,7 +180,7 @@ describe('引导副本守卫：空副本不覆盖远端拓扑', () => {
     await repo.createAppDataGroup(GROUP_ID, []);
     await repo.flush();
 
-    expect((await readRemoteDescriptor(label)).backends.map((b: any) => b.id)).toEqual([
+    expect((await readRemoteBackends(label)).map((b: any) => b.id)).toEqual([
       'gitee-real',
       'rs-real',
     ]);
@@ -158,7 +201,8 @@ describe('引导副本守卫：空副本不覆盖远端拓扑', () => {
     await repo.updateAppDataGroupDescriptor(GROUP_ID, []);
     await repo.flush();
 
-    expect((await readRemoteDescriptor(label)).backends).toEqual([]);
+    expect(await readRemoteBackends(label)).toEqual([]);
+    expect((await readRemoteDescriptor(label)).backends).toBeUndefined();
     await repo.dispose();
   });
 });

@@ -26,6 +26,7 @@ import type {
   SyncGroupKind,
   GroupDescriptor,
   AppDataBackendDescriptor,
+  AppDataBackendFileDescriptor,
   AppDataGroupDescriptor,
   AppDataGroup,
   ConfigSyncGroupDescriptor,
@@ -65,7 +66,7 @@ import {
   type IdentityResolutionMode,
   type IdentityResolutionResult,
 } from './group-identity';
-import { versionPathFor, incrementVersion, writeVersion, readVersion } from './version';
+import { versionPathFor, incrementVersion, writeVersion, readVersion, sha256 } from './version';
 
 /** 把归属校验结果翻译成一句含两侧身份的可展示文案。 */
 function describeConflict(result: {
@@ -129,6 +130,7 @@ import {
   ConflictStore,
 } from './group-meta';
 import {
+  mergeBackendDescriptor,
   mergeDescriptorCreatedAt,
   serializeAppDataGroupDescriptor,
   serializeBackendDescriptor,
@@ -3403,6 +3405,154 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /**
+   * 应用数据组后端文件目录（平铺，不额外套 `<groupId>.backends/`）：
+   * `/.config/app-data-groups/<appId>/backends/`。
+   *
+   * 归属靠文件内的 `groupId` 字段区分：同一 app 下不同组即使后端 id 相同，
+   * 也各用各自的文件，不会在同步时互相覆盖（同一组不同端点同理）。
+   */
+  private appDataBackendsDirPath(): string {
+    return `${APP_DATA_GROUPS_DIR}/${this.appId}/backends`;
+  }
+
+  private appDataBackendFilePath(backendId: string): string {
+    return `${this.appDataBackendsDirPath()}/${backendId}.json`;
+  }
+
+  /** 读本 app 目录下所有后端文件（忽略损坏/非本格式的文件）。 */
+  private async readAppDataBackendFiles(): Promise<AppDataBackendFileDescriptor[]> {
+    const dir = this.appDataBackendsDirPath();
+    let entries: string[];
+    try {
+      entries = await this.cachedFS.readdir(dir);
+    } catch {
+      return [];
+    }
+    const out: AppDataBackendFileDescriptor[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith('.json')) continue;
+      try {
+        const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
+        const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+        if (
+          parsed &&
+          typeof parsed.id === 'string' &&
+          typeof parsed.groupId === 'string' &&
+          typeof parsed.type === 'string' &&
+          parsed.options &&
+          typeof parsed.options === 'object'
+        ) {
+          out.push(parsed as AppDataBackendFileDescriptor);
+        }
+      } catch { /* skip corrupt */ }
+    }
+    return out;
+  }
+
+  /** 读某个数据组声明的全部后端文件（按 id 去重，先到先得）。 */
+  private async readAppDataBackendFilesForGroup(groupId: string): Promise<AppDataBackendDescriptor[]> {
+    const byId = new Map<string, AppDataBackendDescriptor>();
+    for (const file of await this.readAppDataBackendFiles()) {
+      if (file.groupId !== groupId) continue;
+      if (byId.has(file.id)) continue;
+      const { groupId: _groupId, ...desc } = file;
+      byId.set(file.id, desc);
+    }
+    return Array.from(byId.values());
+  }
+
+  /** 幂等写一个后端文件（`createdAt` 取 min，避免两节点互覆盖时间戳）。 */
+  private async writeAppDataBackendFile(
+    groupId: string,
+    descriptor: AppDataBackendDescriptor,
+  ): Promise<void> {
+    const backendPath = this.appDataBackendFilePath(descriptor.id);
+    let existing: AppDataBackendFileDescriptor | null = null;
+    try {
+      const raw = await this.cachedFS.readFile(backendPath);
+      existing = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+    } catch { /* first write */ }
+    if (existing && existing.groupId !== groupId) {
+      // 平铺目录里文件名就是 backend id：别组已占用同一个 id 时不能覆盖，
+      // 否则同步时两组会互相改写。新组应使用端点指纹（内含 groupId）作为 id。
+      throw new Error(
+        `Backend id "${descriptor.id}" is already used by data group "${existing.groupId}" in this app; ` +
+        `choose a different backend id`,
+      );
+    }
+    const merged = mergeBackendDescriptor(
+      existing ?? undefined,
+      { ...descriptor, groupId } as AppDataBackendDescriptor,
+    );
+    const text = serializeBackendDescriptor(merged as AppDataBackendFileDescriptor);
+    const bytes = new TextEncoder().encode(text);
+    if ((await this.readTextIfExists(backendPath)) === text) return;
+    await this.ensureDir(backendPath);
+    await this.cachedFS.writeFile(backendPath, bytes);
+    const version = await incrementVersion(
+      this.fullFS,
+      backendPath,
+      bytes,
+      `${this.appId}/${this.nodeId}`,
+    );
+    await this.writeVersionSidecar(backendPath, version);
+  }
+
+  /**
+   * 用权威后端列表重写本组的后端文件：缺的补齐、多的删除（删除走墓碑）。
+   * 目录是平铺共享的，只处理 `groupId` 属于本组的文件，别组文件不碰。
+   */
+  private async reconcileAppDataBackendFiles(
+    groupId: string,
+    backends: AppDataBackendDescriptor[],
+  ): Promise<void> {
+    const keep = new Set(backends.map(b => b.id));
+    for (const desc of backends) {
+      await this.writeAppDataBackendFile(groupId, desc);
+    }
+    for (const file of await this.readAppDataBackendFiles()) {
+      if (file.groupId !== groupId) continue;
+      if (keep.has(file.id)) continue;
+      await this.deleteFile(this.appDataBackendFilePath(file.id));
+    }
+  }
+
+  /**
+   * 读组后端：新布局（独立文件）优先；旧描述符里还带 `backends` 数组时，
+   * 迁移成文件并回写描述符（去掉数组），让两种布局收敛到同一种。
+   */
+  private async resolveAppDataGroupBackends(
+    id: string,
+    descriptor: AppDataGroupDescriptor | null,
+  ): Promise<AppDataBackendDescriptor[]> {
+    const files = await this.readAppDataBackendFilesForGroup(id);
+    if (files.length > 0) return files;
+    const legacy = descriptor?.backends ?? [];
+    if (legacy.length === 0) return [];
+    for (const desc of legacy) {
+      await this.writeAppDataBackendFile(id, desc);
+    }
+    await this.writeAppDataGroupDescriptorFile(id, descriptor!);
+    log.log(`[ConfigRepo] ${id}: 旧描述符后端数组已迁移为 ${legacy.length} 个独立文件`);
+    return legacy;
+  }
+
+  /**
+   * 由端点指纹派生后端 id：同类型 + 同身份参数（不含 token）+ 同组 → 同 id。
+   * 两个节点各自录入同一端点时，文件名一致，不会各写一份。
+   */
+  private async deriveAppDataBackendId(
+    groupId: string,
+    descriptor: Pick<AppDataBackendDescriptor, 'type' | 'options'>,
+  ): Promise<string> {
+    const fingerprint = `${groupId}:${backendDedupKey({ id: '', type: descriptor.type, options: descriptor.options })}`;
+    const hash = (await sha256(new TextEncoder().encode(fingerprint)))
+      .replace(/^sha256:/, '')
+      .slice(0, 10);
+    return `${descriptor.type}-${hash}`;
+  }
+
+  /**
    * Resolve a backend descriptor's options by merging account fields
    * from the referenced config-sync backend (if accountBackendId is set).
    */
@@ -3553,9 +3703,12 @@ export class ConfigRepo implements IConfigRepo {
     // Resolve account fields for each backend
     const resolvedBackends: AppDataBackendDescriptor[] = [];
     for (const desc of backends) {
-      assertValidBackendId(desc.id);
+      // UI 自动生成的占位 id（与组 id 相同）改为端点指纹：同一端点在任何节点
+      // 都落到同一个文件名；用户显式填写的 id 保持原样，兼容旧配置与测试。
+      const backendId = desc.id === id ? await this.deriveAppDataBackendId(id, desc) : desc.id;
+      assertValidBackendId(backendId);
       const mergedOptions = await this.resolveAppDataBackendOptions(desc);
-      resolvedBackends.push({ ...desc, options: mergedOptions });
+      resolvedBackends.push({ ...desc, id: backendId, options: mergedOptions });
     }
 
     // Cross-group uniqueness: no two groups may share the same remote endpoint.
@@ -3564,6 +3717,12 @@ export class ConfigRepo implements IConfigRepo {
     // 新建组**不再无条件生成**实例身份：已有登记（引导副本）时沿用它的值，
     // 否则留空交给 init() 的「先读后定」流程（见 GROUP-IDENTITY-INIT.zh-CN.md）。
     const registered = await this.readAppDataGroupDescriptor(id).catch(() => null);
+    // 显式新建空组时，如果引导副本或后端文件里已经有拓扑（新设备/清空本页后重连），
+    // 采用已有拓扑而不是写一份空组：否则 reconcile 会把远端既有后端删掉。
+    if (resolvedBackends.length === 0 && registered) {
+      const existingBackends = await this.resolveAppDataGroupBackends(id, registered);
+      if (existingBackends.length > 0) resolvedBackends.push(...existingBackends);
+    }
     const instanceId = pickInstanceId(registered) ?? undefined;
 
     // Create the data-sync group implementation
@@ -3595,6 +3754,11 @@ export class ConfigRepo implements IConfigRepo {
       backends: group.listDeclaredBackends(),
     };
     await this.writeAppDataGroupDescriptorFile(id, descriptor);
+    // 真正的新建空组没有既有拓扑可删；不要在这里 reconcile —— 首轮配置同步可能
+    // 正在把远端后端文件拉到本地，此时按空列表删除会写墓碑，反过来清空远端。
+    if (!(backends.length === 0 && !registered)) {
+      await this.reconcileAppDataBackendFiles(id, group.listDeclaredBackends());
+    }
 
     this.appDataGroups.set(id, group);
     log.log(`[ConfigRepo] createAppDataGroup: "${id}" created`);
@@ -3640,6 +3804,8 @@ export class ConfigRepo implements IConfigRepo {
     if (backends.length === 0) this.explicitEmptyDescriptors.add(id);
     else this.explicitEmptyDescriptors.delete(id);
     await this.writeAppDataGroupDescriptorFile(id, descriptor);
+    // 后端本身写在独立文件里：先补齐/删除文件，再推描述符（描述符不再含数组）。
+    await this.reconcileAppDataBackendFiles(id, backends);
     // 描述符是「引导副本」：它必须尽快与数据组真实拓扑一致，否则远端会留旧值。
     this.scheduleDescriptorPush();
   }
@@ -3717,7 +3883,8 @@ export class ConfigRepo implements IConfigRepo {
     }
     // 权威列表优先取数据组自己的声明（描述符只是引导副本，可能落后）。
     const live = this.appDataGroups.get(groupId);
-    const declared = live?.listDeclaredBackends() ?? descriptor.backends;
+    const declared = live?.listDeclaredBackends()
+      ?? await this.resolveAppDataGroupBackends(groupId, descriptor);
     const index = declared.findIndex((b) => b.id === backendId);
     if (index < 0) {
       throw new Error(`Backend "${backendId}" not found in data group "${groupId}"`);
@@ -3875,10 +4042,11 @@ export class ConfigRepo implements IConfigRepo {
     if (!descriptor) {
       throw new Error(`App data group "${id}" not found`);
     }
+    const backends = await this.resolveAppDataGroupBackends(id, descriptor);
     const group = new AppDataGroupImpl(
       id,
       this.appId,
-      descriptor.backends,
+      backends,
       this.pollIntervalMs,
       this,
       descriptor,
@@ -3933,7 +4101,10 @@ export class ConfigRepo implements IConfigRepo {
           const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
           const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
           if (desc.id && desc.groupType === 'data-sync' && !byId.has(desc.id)) {
-            byId.set(desc.id, desc as AppDataGroupDescriptor);
+            const descriptor = desc as AppDataGroupDescriptor;
+            // 兼容旧描述符：数组仍会被解析出来，新布局从独立文件补齐。
+            descriptor.backends = await this.resolveAppDataGroupBackends(desc.id, descriptor);
+            byId.set(desc.id, descriptor);
           }
         } catch { /* skip corrupt */ }
       }
@@ -3964,8 +4135,10 @@ export class ConfigRepo implements IConfigRepo {
       if ((descriptor.backends?.length ?? 0) > 0) continue;
       if (this.explicitEmptyDescriptors.has(descriptor.id)) continue;
       const descPath = this.appDataGroupFilePath(descriptor.id);
+      const backendsDir = this.appDataBackendsDirPath();
       for (const [replicaId, replica] of this.replicaBackends) {
         let remote: any;
+        let remoteBackends: AppDataBackendDescriptor[] = [];
         try {
           const raw = await withTimeout(
             replica.instance.readFile(descPath),
@@ -3973,13 +4146,28 @@ export class ConfigRepo implements IConfigRepo {
             `${replicaId} 读取引导副本`,
           );
           remote = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
+          // 新布局：后端在独立文件里，描述符本身不再带数组。
+          let entries: string[] = [];
+          try {
+            entries = await replica.instance.readdir(backendsDir);
+          } catch { /* 该副本还没有后端目录 */ }
+          for (const entry of entries) {
+            if (!entry.endsWith('.json')) continue;
+            try {
+              const rawFile = await replica.instance.readFile(`${backendsDir}/${entry}`);
+              const parsed = JSON.parse(new TextDecoder().decode(toUint8Array(rawFile)));
+              if (parsed?.groupId !== descriptor.id) continue;
+              const { groupId: _groupId, ...desc } = parsed;
+              remoteBackends.push(desc);
+            } catch { /* skip corrupt */ }
+          }
         } catch {
           continue; // 该副本没这份描述符 / 读不到：换下一个
         }
         if (!remote || remote.id !== descriptor.id || remote.groupType !== 'data-sync') continue;
-        const remoteBackends: AppDataBackendDescriptor[] = Array.isArray(remote.backends)
-          ? remote.backends
-          : [];
+        if (remoteBackends.length === 0 && Array.isArray(remote.backends)) {
+          remoteBackends = remote.backends;
+        }
         if (remoteBackends.length === 0) continue;
         await this.writeAppDataGroupDescriptorFile(descriptor.id, {
           id: descriptor.id,
@@ -3989,6 +4177,7 @@ export class ConfigRepo implements IConfigRepo {
           ...(remote.features ? { features: remote.features } : {}),
           backends: remoteBackends,
         });
+        await this.reconcileAppDataBackendFiles(descriptor.id, remoteBackends);
         log.warn(
           `[ConfigRepo] ${descriptor.id}: 本地引导副本为空，采用远端拓扑（${remoteBackends.length} 个后端），避免覆盖远端设置`,
         );
@@ -4004,6 +4193,19 @@ export class ConfigRepo implements IConfigRepo {
     if (group) {
       await group.dispose();
       this.appDataGroups.delete(id);
+    }
+
+    // 后端是独立文件：逐个删（每个都写墓碑，远端才会跟着清掉）。
+    // 只删本组（group id 匹配）的文件，同目录其它组的后端不碰。
+    for (const backend of await this.readAppDataBackendFilesForGroup(id)) {
+      const backendPath = this.appDataBackendFilePath(backend.id);
+      try {
+        await this.deleteFile(backendPath);
+      } catch (err) {
+        log.log(`[ConfigRepo] removeAppDataGroup: deleteFile failed for backend "${backend.id}" at ${backendPath}:`, err);
+        try { await this.cachedFS.unlink(backendPath); } catch { /* already gone */ }
+        await this.unlinkVersionSidecar(this.cachedFS, backendPath);
+      }
     }
 
     // Use deleteFile (tombstone) so the deletion propagates to remote

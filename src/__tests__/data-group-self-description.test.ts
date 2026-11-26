@@ -101,7 +101,7 @@ async function countingFS(): Promise<{ fs: any; writes: () => number }> {
 }
 
 describe('canonical serializer', () => {
-  it('is byte-idempotent: serialize(parse(bytes)) === bytes', () => {
+  it('描述符只保留组元信息，不再序列化 backends 数组', () => {
     const bytes = serializeAppDataGroupDescriptor({
       id: 'g1',
       groupType: 'data-sync',
@@ -112,34 +112,29 @@ describe('canonical serializer', () => {
         { id: 'b1', type: 'T', options: { k: 1 } },
       ],
     } as any);
+    const parsed = JSON.parse(bytes);
+    expect(parsed.backends).toBeUndefined();
+    expect(Object.keys(parsed)).toEqual(['id', 'groupType', 'name', 'features']);
     expect(serializeAppDataGroupDescriptor(JSON.parse(bytes))).toBe(bytes);
   });
 
-  it('is order-independent and sorts backends by id / options recursively', () => {
+  it('后端文件序列化对 key 顺序不敏感，并保留 groupId', () => {
     const a = serializeBackendDescriptor({
       id: 'x',
+      groupId: 'g',
       type: 'T',
       options: { b: 1, a: { d: 2, c: 3 } },
-    });
+    } as any);
     const b = serializeBackendDescriptor({
       id: 'x',
+      groupId: 'g',
       type: 'T',
       options: { a: { c: 3, d: 2 }, b: 1 },
-    });
+    } as any);
     expect(a).toBe(b);
-
-    const parsed = JSON.parse(
-      serializeAppDataGroupDescriptor({
-        id: 'g',
-        groupType: 'data-sync',
-        backends: [
-          { id: 'zz', type: 'T', options: { b: 1, a: 2 } },
-          { id: 'aa', type: 'T', options: {} },
-        ],
-      }),
-    );
-    expect(parsed.backends.map((x: any) => x.id)).toEqual(['aa', 'zz']);
-    expect(Object.keys(parsed.backends[1].options)).toEqual(['a', 'b']);
+    const parsed = JSON.parse(a);
+    expect(parsed.groupId).toBe('g');
+    expect(Object.keys(parsed.options)).toEqual(['a', 'b']);
   });
 
   it('never writes updatedAt into group.json', () => {

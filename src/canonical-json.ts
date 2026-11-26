@@ -35,8 +35,8 @@ import type {
 
 const FEATURE_ORDER = ['tombstones', 'versions', 'conflicts', 'configHost', 'appData'] as const;
 const GROUP_DESCRIPTOR_ORDER = ['schemaVersion', 'kind', 'id', 'instanceId', 'profile', 'name', 'features'] as const;
-const APP_DATA_GROUP_ORDER = ['id', 'groupType', 'instanceId', 'name', 'features', 'backends'] as const;
-const BACKEND_ORDER = ['id', 'type', 'options', 'accountBackendId', 'description', 'createdAt'] as const;
+const APP_DATA_GROUP_ORDER = ['id', 'groupType', 'instanceId', 'name', 'features'] as const;
+const BACKEND_ORDER = ['id', 'groupId', 'type', 'options', 'accountBackendId', 'description', 'createdAt'] as const;
 
 // ------------------------------------------------------------------------------------------------------------------------------------------
 // Helpers
@@ -114,7 +114,9 @@ export function serializeBackendDescriptor(
 
 /** 数据组引导描述符（`.config/app-data-groups/**.json`）的规范化字节。 */
 export function serializeAppDataGroupDescriptor(descriptor: AppDataGroupDescriptor): string {
-  return stringify(canonicalObject(descriptor as unknown as Record<string, unknown>, APP_DATA_GROUP_ORDER));
+  // 后端列表已迁到独立文件：描述符只保留组元信息，避免同路径读-改-写互相覆盖。
+  const { backends: _backends, ...meta } = descriptor as AppDataGroupDescriptor & { backends?: unknown };
+  return stringify(canonicalObject(meta as Record<string, unknown>, APP_DATA_GROUP_ORDER));
 }
 
 /**

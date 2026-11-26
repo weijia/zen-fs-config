@@ -29,7 +29,8 @@ describe('引导副本（.config/app-data-groups）与数据组拓扑保持一�
     await tick(60);
 
     const desc = await (repo as any).readAppDataGroupDescriptor('g1');
-    expect(desc.backends.map((b: { id: string }) => b.id).sort()).toEqual(['b1', 'b2']);
+    expect(desc.backends).toBeUndefined();
+    expect((await (repo as any).readAppDataBackendFilesForGroup('g1')).map((b: any) => b.id).sort()).toEqual(['b1', 'b2']);
     expect(flushSpy).toHaveBeenCalled();
 
     await repo.dispose();
@@ -44,7 +45,8 @@ describe('引导副本（.config/app-data-groups）与数据组拓扑保持一�
     await group.removeBackend('b2');
 
     const desc = await (repo as any).readAppDataGroupDescriptor('g2');
-    expect(desc.backends.map((b: { id: string }) => b.id)).toEqual(['b1']);
+    expect(desc.backends).toBeUndefined();
+    expect((await (repo as any).readAppDataBackendFilesForGroup('g2')).map((b: any) => b.id)).toEqual(['b1']);
 
     await repo.dispose();
   });
@@ -66,21 +68,26 @@ describe('引导副本（.config/app-data-groups）与数据组拓扑保持一�
       // 等后台远端段完成：实例身份落进 .meta/group.json，本地库从此固定。
       await (group as any).whenBackendsReady?.();
 
-      // 模拟「历史上改过后端但没回刷」：只改描述符里的 backends，其余（instanceId
-      // 等身份字段）保持原样，因为真实漂移是后端清单落后，不是换了一个组。
+      // 模拟「历史上改过后端但没回刷」：旧描述符里还带着一个过期的 backends 数组。
+      // 新布局以 `backends/*.json` 为权威，这个数组只用于旧文件迁移，不会覆盖文件。
       const existing: AppDataGroupDescriptor = await (repo as any).readAppDataGroupDescriptor('g3');
       const stale: AppDataGroupDescriptor = {
         ...existing,
         backends: [{ id: 'stale-9', type: 'InMemory', options: { label: 'store-old' } }],
       };
-      await (repo as any).writeAppDataGroupDescriptorFile('g3', stale);
+      const descPath = `/.config/app-data-groups/test-desc-app3/g3.json`;
+      await (repo as any).cachedFS.writeFile(
+        descPath,
+        new TextEncoder().encode(JSON.stringify(stale, null, 2)),
+      );
 
       // 丢弃缓存实例，模拟下次打开应用重新 getAppDataGroup
       (repo as any).appDataGroups.delete('g3');
       await repo.getAppDataGroup('g3');
 
       const desc = await (repo as any).readAppDataGroupDescriptor('g3');
-      expect(desc.backends.map((b: { id: string }) => b.id)).toEqual(['real-1']);
+      expect(desc.backends).toBeUndefined();
+      expect((await (repo as any).readAppDataBackendFilesForGroup('g3')).map((b: any) => b.id)).toEqual(['real-1']);
 
       await repo.dispose();
     } finally {
@@ -98,12 +105,18 @@ describe('引导副本（.config/app-data-groups）与数据组拓扑保持一�
       backends: [{ id: 'from-bootstrap', type: 'InMemory', options: { label: 'store-boot' } }],
     };
     await (repo as any).writeAppDataGroupDescriptorFile('g4', descriptor);
+    // 旧描述符数组只用于迁移：写回时被剥离，所以这里直接补一份带数组的原始文件。
+    await (repo as any).cachedFS.writeFile(
+      `/.config/app-data-groups/test-desc-app4/g4.json`,
+      new TextEncoder().encode(JSON.stringify(descriptor, null, 2)),
+    );
 
     const group = await repo.getAppDataGroup('g4');
     // 引导副本被回填进数据组自己的 .meta/backends：声明列表非空，描述符不该被清空
     expect(group.listDeclaredBackends().map((b) => b.id)).toEqual(['from-bootstrap']);
     const desc = await (repo as any).readAppDataGroupDescriptor('g4');
-    expect(desc.backends.map((b: { id: string }) => b.id)).toEqual(['from-bootstrap']);
+    expect(desc.backends).toBeUndefined();
+    expect((await (repo as any).readAppDataBackendFilesForGroup('g4')).map((b: any) => b.id)).toEqual(['from-bootstrap']);
 
     await repo.dispose();
   });

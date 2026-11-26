@@ -208,7 +208,7 @@
 **D2 待定项（现状：A/B/C 已决策，D/E 已由实现落定，无未决项）：**
 
 - **A. 独立 data-sync 是否保留【已决策：废除独立入口】**：数据同步组一律经配置同步组的 `app-data-groups` 纳管创建（见 FR2.1），独立顶层入口（自带 `.meta/backends`、完全脱离 config-sync）**废除**。由此 §8 #4（独立 data-sync "只传 appId 重开"缺口）随之消失——数据组由 config-sync 启动恢复，不再有独立重开路径。代码落地见 §10 T5。
-- **B. 数据组描述符 schema 与权威归属【已决策（0.6.0 修订）】**：配置同步组在 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json`）保存数据同步组的**引导副本**：`{ id, groupType: "data-sync", name?, features?, backends: [{ id, type, options, description?, createdAt?, accountBackendId? }] }`。`backends` 字段**长期保留、不删除**，用于「新设备只有配置组凭据」的引导，以及数据组本地还没有 `.meta/backends/` 时的懒迁移回填。
+- **B. 数据组描述符 schema 与权威归属【已决策（0.7.0 修订）】**：配置同步组在 `.config/app-data-groups/{appId}/{id}.json`（旧镜像 `.meta/app-data-groups/{appId}/{id}.json`）保存数据同步组的**引导副本**，只含组元信息：`{ id, groupType: "data-sync", instanceId?, name?, features? }`，**不再写 `backends` 数组**。应用后端拆成独立文件 `/.config/app-data-groups/{appId}/backends/{backendId}.json`，一个文件一个端点、文件内带 `groupId`；删除写墓碑。旧描述符里的 `backends` 数组仅作兼容，首次读取时迁移成文件并回写去掉该字段。
   - **权威定义在数据组自己的 `.meta/backends/{id}.json`**：任何设备连上任意一个数据后端都能自描述完整拓扑；配置组描述符只是副本，回刷时按规范化字节比较，相同则不写。
   - **冲突规则**：同一 backend id 同时存在「数据组墓碑」和「描述符条目」时，**墓碑优先**（防止删除被复活）。
   - **凭据**：`accountBackendId` 仍指回 config-sync 账户后端以复用凭证；无配置组的独立模式直接把凭据内联进数据组 `.meta/backends/{id}.json`（不做脱敏、不引入本地-only 密钥目录）。

@@ -65,7 +65,8 @@
 ```
 配置同步组 (root = /)
 ├─ /.config/**                     应用/组配置内容
-├─ /.config/app-data-groups/{appId}/{id}.json   引导副本（含内联 backends）
+├─ /.config/app-data-groups/{appId}/{id}.json   引导副本（只含组元信息，无 backends）
+├─ /.config/app-data-groups/{appId}/backends/{backendId}.json  应用后端（一文件一端点，带 groupId）
 ├─ /.meta/group.json               身份（不同步）
 ├─ /.meta/backends/{id}.json       配置组自己的副本后端清单（参与同步）
 └─ 同步对：本地 ↔ 副本后端 A、B、C …
@@ -98,7 +99,8 @@
 | `/.meta/.deleted`、`/.meta/.conflicts`、`/.meta/app-data-groups` | 已停写                   | 是（当普通内容）                                                | `isDeletableLegacyMetaPath()` 允许清理（group-meta.ts:178）   |
 | `/.config/**`                                                  | 仅配置组                  | 仅配置组；数据组完全不看（`CONFIG_ONLY_PREFIXES`，config-repo.ts:262） |                                                         |
 | `/.config/config-sync-group.json`                              | 配置组                   | 是                                                       | 只有显示名（`ConfigSyncGroupDescriptor` 无 `backends`）         |
-| `/.config/app-data-groups/{appId}/{id}.json`                   | 配置组                   | 是                                                       | 引导副本：`id/groupType/instanceId/name/features/backends[]` |
+| `/.config/app-data-groups/{appId}/{id}.json`                   | 配置组                   | 是                                                       | 引导副本：`id/groupType/instanceId/name/features`（无 `backends`） |
+| `/.config/app-data-groups/{appId}/backends/{backendId}.json`   | 配置组                   | 是                                                       | 应用后端：一文件一端点，文件内带 `groupId` |
 | `/.config/backends/{id}.json`                                  | 旧路径                   | 是                                                       | 只做兼容清理（`removeBackendDescriptor`）                       |
 | 业务数据                                                           | 应用                    | 是                                                       |                                                         |
 
@@ -114,7 +116,7 @@
 
 * 权威全文：`/.meta/backends/{id}.json`（组根内）
 
-* 引导副本内联：`/.config/app-data-groups/{appId}/{id}.json` 的 `backends[]`（配置组根内）
+* 独立文件：`/.config/app-data-groups/{appId}/backends/{backendId}.json`（配置组根内，一文件一端点，带 `groupId`）
 
 * `.meta/group.json`：只存身份
 
@@ -391,7 +393,7 @@ const unsubscribe = repo.onSyncEvent((event) => {
 
 2. `await group.init()`
 
-3. 写引导副本 `.config/app-data-groups/{appId}/{id}.json`，内容 `{id, groupType:'data-sync', instanceId, name?, features?, backends: group.listDeclaredBackends()}`
+3. 写引导副本 `.config/app-data-groups/{appId}/{id}.json`，内容 `{id, groupType:'data-sync', instanceId, name?, features?}`；后端逐个写 `app-data-groups/{appId}/backends/{backendId}.json`
 
 4. 注册进 `appDataGroups` map
 
@@ -614,13 +616,13 @@ UI 的「删除组」应走 `ConfigRepo.removeAppDataGroup`（删引导副本 + 
 
 ### 9.6 bootstrap 漂移对账（目前需手工）
 
-比对两处：组根 `/.meta/backends/*.json` 的 id 集合 vs 配置组 `/.config/app-data-groups/{appId}/{id}.json` 的 `backends[].id` 集合。差异含义：
+比对两处：组根 `/.meta/backends/*.json` 的 id 集合 vs 配置组 `/.config/app-data-groups/{appId}/backends/*.json` 里该 `groupId` 的 id 集合。差异含义：
 
 
 
-* 只在 `.meta/` 有 → 该设备已加后端，但引导副本没回刷（新设备发现不到）
+* 只在 `.meta/` 有 → 该设备已加后端，但引导目录没回刷（新设备发现不到）
 
-* 只在引导副本有 → 可能是老数据，或该后端文件被删后未回刷
+* 只在引导目录有 → 可能是老数据，或该后端文件被删后未回刷
 
 
 
