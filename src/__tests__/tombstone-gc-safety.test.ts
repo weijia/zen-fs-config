@@ -102,7 +102,7 @@ async function runTombstonePipeline(repo: any): Promise<void> {
 
 /**
  * 把某一墓碑的 `deletedAt` 往前拨，模拟「墓碑已经在保留期外」。
- * GC 现在要求 deletedAt 距今超过保留期（文件 24h / 占位 10min）。
+ * GC 现在要求 deletedAt 距今超过保留期（文件 7 天 / 占位 10min）。
  */
 async function setTombstoneAge(repo: any, target: string, ageMs: number): Promise<void> {
   const p = tombstonePath('/.meta/tombstones', target);
@@ -115,6 +115,7 @@ async function setTombstoneAge(repo: any, target: string, ageMs: number): Promis
 }
 
 const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
 
 describe('tombstone GC safety', () => {
   it('keeps the tombstone when one of two replicas still holds the path', async () => {
@@ -152,9 +153,9 @@ describe('tombstone GC safety', () => {
 
     await repo.deleteFile(`/${appId}/clean`);
 
-    // GC 现在还要求墓碑超出保留期（24h）：把 deletedAt 往前拨，模拟「已过期」。
+    // GC 现在还要求墓碑超出保留期（7 天）：把 deletedAt 往前拨，模拟「已过期」。
     const dirTarget = `/${appId}/clean`;
-    await setTombstoneAge(repo, dirTarget, 25 * HOUR);
+    await setTombstoneAge(repo, dirTarget, 8 * DAY);
 
     await runTombstonePipeline(repo);
 
@@ -179,13 +180,13 @@ describe('tombstone GC safety', () => {
     const p = tombstonePath('/.meta/tombstones', `/${appId}/retain`);
     expect(await exists(repo.rootFS, p)).toBe(true);
 
-    // 保留期内（23h）仍不回收。
-    await setTombstoneAge(repo, `/${appId}/retain`, 23 * HOUR);
+    // 保留期内（6 天）仍不回收。
+    await setTombstoneAge(repo, `/${appId}/retain`, 6 * DAY);
     await runTombstonePipeline(repo);
     expect(await exists(repo.rootFS, p)).toBe(true);
 
-    // 超过保留期（25h）后才允许 GC。
-    await setTombstoneAge(repo, `/${appId}/retain`, 25 * HOUR);
+    // 超过保留期（8 天）后才允许 GC。
+    await setTombstoneAge(repo, `/${appId}/retain`, 8 * DAY);
     await runTombstonePipeline(repo);
     expect(await exists(repo.rootFS, p)).toBe(false);
 
@@ -209,13 +210,13 @@ describe('tombstone GC safety', () => {
 
     await runTombstonePipeline(repo);
 
-    // 10 分钟（旧占位保留期）远不够：目录墓碑必须按 24h 保留。
+    // 10 分钟（旧占位保留期）远不够：目录墓碑必须按 7 天保留。
     await setTombstoneAge(repo, `/${appId}/ph`, 11 * 60 * 1000);
     await runTombstonePipeline(repo);
     expect(await exists(repo.rootFS, dirTombstone)).toBe(true);
 
-    // 超过 24h 才允许回收。
-    await setTombstoneAge(repo, `/${appId}/ph`, 25 * HOUR);
+    // 超过 7 天才允许回收。
+    await setTombstoneAge(repo, `/${appId}/ph`, 8 * DAY);
     await runTombstonePipeline(repo);
     expect(await exists(repo.rootFS, dirTombstone)).toBe(false);
 
@@ -252,6 +253,36 @@ describe('tombstone GC safety', () => {
     // Nothing was pulled back into the local primary.
     expect(await exists(repo.rootFS, `/${appId}/revive`)).toBe(false);
     expect(await exists(repo.rootFS, `/${appId}/revive/a.txt`)).toBe(false);
+
+    await repo.dispose();
+  });
+
+  it('pulls remote tombstones before the first sync (stale local copy is not pushed back)', async () => {
+    const appId = 'tomb-prefetch';
+    const repo = await createConfigRepo(appId, { nodeId: 'n-prefetch' });
+    await repo.addBackend('replica-pf', 'DirRemote', { label: 'tomb-prefetch' });
+    const replica = (repo as any).replicaBackends.get('replica-pf').instance;
+
+    await mkdirp(repo.rootFS, `/${appId}/pf`);
+    await repo.rootFS.promises.writeFile(`/${appId}/pf/a.txt`, 'a');
+
+    await repo.deleteFile(`/${appId}/pf`);
+    await repo.flush();
+    const tPath = tombstonePath('/.meta/tombstones', `/${appId}/pf`);
+    expect(await exists(replica, tPath)).toBe(true);
+
+    // 模拟「重启/新设备」：本地只有旧副本，墓碑还没被同步拉下来。
+    await repo.rootFS.promises.unlink(tPath);
+    (repo as any).invalidateTombstoneCache();
+    await mkdirp(repo.rootFS, `/${appId}/pf`);
+    await repo.rootFS.promises.writeFile(`/${appId}/pf/a.txt`, 'a');
+
+    // 关键：这一轮同步必须先预取副本上的墓碑，再清掉本地陈旧副本；
+    // 否则 a.txt 会被当成「本地新增」推回副本（删除被复活）。
+    await repo.flush();
+
+    expect(await exists(replica, `/${appId}/pf/a.txt`)).toBe(false);
+    expect(await exists(repo.rootFS, `/${appId}/pf/a.txt`)).toBe(false);
 
     await repo.dispose();
   });

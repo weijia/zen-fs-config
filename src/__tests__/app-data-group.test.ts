@@ -143,6 +143,29 @@ describe('AppDataGroup within ConfigRepo', () => {
     await repo.dispose();
   });
 
+  it('removeAppDataGroup(appId) only touches that appId registration', async () => {
+    const repo = await createConfigRepo('test-adg-cross', { nodeId: 'test-node' });
+    const fs = (repo as any).cachedFS;
+    const base = '/.config/app-data-groups/other-app';
+    await (repo as any).ensureDir(`${base}/backends/g-other-b1.json`);
+    await (repo as any).ensureDir(`${base}/backends/g-keep-b1.json`);
+    await (repo as any).ensureDir(`${base}/g-other.json`);
+    const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
+    await fs.writeFile(`${base}/backends/g-other-b1.json`, enc({ id: 'g-other-b1', groupId: 'g-other', type: 'InMemory', options: {} }));
+    await fs.writeFile(`${base}/backends/g-keep-b1.json`, enc({ id: 'g-keep-b1', groupId: 'g-keep', type: 'InMemory', options: {} }));
+    await fs.writeFile(`${base}/g-other.json`, enc({ id: 'g-other', appId: 'other-app', name: 'g-other', backends: [] }));
+
+    await repo.removeAppDataGroup('g-other', 'other-app');
+
+    expect(await fs.exists(`${base}/g-other.json`)).toBe(false);
+    expect(await fs.exists(`${base}/backends/g-other-b1.json`)).toBe(false);
+    // 同目录其它组的后端不受影响
+    expect(await fs.exists(`${base}/backends/g-keep-b1.json`)).toBe(true);
+    // 本实例自己的组列表不变
+    expect((await repo.listAppDataGroups()).length).toBe(0);
+    await repo.dispose();
+  });
+
   it('createAppDataGroup throws for duplicate id', async () => {
     const repo = await createConfigRepo('test-adg-app7', { nodeId: 'test-node' });
     await repo.createAppDataGroup('dup-group', [

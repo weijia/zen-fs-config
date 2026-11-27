@@ -1032,8 +1032,13 @@ export interface IConfigRepo {
     description?: string,
   ): Promise<AppDataGroup>;
 
-  /** Remove a data-sync group (stops sync, removes descriptor). */
-  removeAppDataGroup(id: string): Promise<void>;
+  /**
+   * Remove a data-sync group (stops sync, removes descriptor).
+   *
+   * @param appId 目标登记所属 appId；默认本实例的 appId。传其它 appId 时只删
+   *   配置仓里该 appId 的登记与引导副本（写墓碑），不会 dispose 别的实例里的组。
+   */
+  removeAppDataGroup(id: string, appId?: string): Promise<void>;
 
   /**
    * List config-sync backends that can be used as account sources

@@ -309,6 +309,14 @@ export const LOCAL_IDB_BACKEND_ID = 'local-idb';
  */
 const TOMBSTONE_RECREATE_SKEW_MS = 3000;
 
+/**
+ * 同步前「预取副本墓碑」的节流间隔。
+ *
+ * 远端墓碑不会秒级变化，但每轮同步都要来得及在快照比对之前看到它们；
+ * 一分钟一次足以覆盖默认 30 分钟的轮询，又不会把 readdir 打成热点。
+ */
+const TOMBSTONE_PREFETCH_INTERVAL_MS = 60 * 1000;
+
 /** Encode a file path into a tombstone filename (no slashes, no dots issue). */
 function tombstoneFileName(filePath: string): string {
   return `${encodeMetaPath(filePath)}.json`;
@@ -535,6 +543,12 @@ export class ConfigRepo implements IConfigRepo {
    * unlink() 是否成功来判定。
    */
   private readonly tombstoneConfirmations = new Map<string, Set<string>>();
+  /**
+   * 上次从副本预取墓碑的时间戳（毫秒）。
+   * 节流用：preSyncHook 每轮都会调用 {@link prefetchReplicaTombstones}，
+   * 但远端墓碑不会秒级变化，一分钟一次足够。
+   */
+  private lastTombstonePrefetchAt = 0;
   /** Per-backend sync state (successful pairs + connect failures). */
   private backendStates = new Map<string, BackendSyncState>();
   /**
@@ -793,6 +807,12 @@ export class ConfigRepo implements IConfigRepo {
       await this.initialSyncPromise;
       this.initialSyncPromise = null;
     }
+    // 0. 先把远端墓碑合并进来（无节流）：priority 高于「本地有什么」。
+    try {
+      await this.prefetchReplicaTombstones();
+    } catch (err) {
+      log.warn('[ConfigRepo] flush tombstone prefetch failed:', err);
+    }
     // 1. Process tombstones: delete actual files on all replicas
     await this.processTombstones();
     // 1b. 「空引导副本」不允许覆盖远端既有拓扑（见 healEmptyBootstrapDescriptors）
@@ -978,6 +998,104 @@ export class ConfigRepo implements IConfigRepo {
   /** Invalidate the tombstone cache — call after tombstones are modified. */
   private invalidateTombstoneCache(): void {
     this.tombstoneCache = null;
+  }
+
+  /**
+   * 把各副本上的墓碑合并进本地，必须早于本轮的快照比对。
+   *
+   * 为什么需要它：墓碑文件本身也是被同步的文件，一个节点在「拿到墓碑」之前
+   * 就已经跑完了 preSyncHook —— 这时它本地没有该路径的墓碑，同步就会把自己
+   * 那份陈旧副本当成「本地新增」推回远端（BiDirectional + source-wins），
+   * 删除被复活。只靠墓碑文件被同步拉下来，永远慢半拍。
+   *
+   * 所以在每轮同步之前先只读地把副本上的 `.meta/tombstones/` 合并到本地：
+   * 合并完成后排除表立刻生效，随后的 processTombstones() 会把本地陈旧副本
+   * 一并清掉，同步再不会把它推上去。
+   *
+   * @param minIntervalMs 节流间隔（0 = 立即执行）。preSyncHook 传 60s。
+   */
+  private async prefetchReplicaTombstones(minIntervalMs = 0): Promise<void> {
+    if (this.disposed || this.replicaBackends.size === 0) return;
+    const now = Date.now();
+    if (minIntervalMs > 0 && now - this.lastTombstonePrefetchAt < minIntervalMs) return;
+    this.lastTombstonePrefetchAt = now;
+
+    let local: TombstoneMeta[];
+    try {
+      local = await this.readTombstones();
+    } catch {
+      return;
+    }
+    const byPath = new Map<string, TombstoneMeta>(local.map((t) => [t.path, t]));
+    let changed = false;
+
+    for (const [replicaId, replica] of this.replicaBackends) {
+      let remote: TombstoneMeta[];
+      try {
+        remote = await readTombstonesFromFs(replica.instance as any, (message) =>
+          log.warn(`[ConfigRepo] prefetch tombstones (${replicaId}): ${message}`));
+      } catch (err) {
+        log.warn(`[ConfigRepo] prefetch tombstones from ${replicaId} failed:`, err);
+        continue;
+      }
+
+      for (const tombstone of remote) {
+        if (!tombstone.path) continue;
+        const tombstonePath = tombstonePathFor(tombstone.path, TOMBSTONES_DIR);
+        const prev = byPath.get(tombstone.path);
+
+        // 本地没有 → 直接补一条（远端删除意图比本地副本更权威）。
+        if (!prev) {
+          byPath.set(tombstone.path, tombstone);
+          try {
+            await this.ensureDir(tombstonePath);
+            await writeFileOverwrite(
+              this.cachedFS,
+              tombstonePath,
+              new TextEncoder().encode(serializeTombstone(tombstone)),
+            );
+            changed = true;
+          } catch (err) {
+            log.warn(`[ConfigRepo] prefetch tombstone write failed for ${tombstone.path}:`, err);
+          }
+          continue;
+        }
+
+        // 已有 → 合并确认集合，保留更早的 deletedAt（更早的删除才是真正的删除）。
+        const merged: TombstoneMeta = {
+          ...prev,
+          deletedAt: Math.min(prev.deletedAt, tombstone.deletedAt),
+          confirmedBy: Array.from(new Set([...prev.confirmedBy, ...tombstone.confirmedBy])),
+        };
+        // 同一路径既有文件墓碑又有目录墓碑时，目录墓碑语义更强。
+        if (isDirectoryTombstone(tombstone) && !isDirectoryTombstone(prev)) {
+          merged.type = 'directory';
+        }
+        const dirty =
+          merged.deletedAt !== prev.deletedAt ||
+          merged.confirmedBy.length !== prev.confirmedBy.length ||
+          (merged.type === 'directory' && prev.type !== 'directory');
+        if (!dirty) continue;
+        byPath.set(tombstone.path, merged);
+        try {
+          await writeFileOverwrite(
+            this.cachedFS,
+            tombstonePath,
+            new TextEncoder().encode(serializeTombstone(merged)),
+          );
+          changed = true;
+        } catch (err) {
+          log.warn(`[ConfigRepo] prefetch tombstone merge failed for ${tombstone.path}:`, err);
+        }
+      }
+    }
+
+    if (changed) {
+      // 墓碑集合变了 → 排除表必须立刻重建，否则本轮同步仍会放过这些路径。
+      this.invalidateTombstoneCache();
+      await this.readTombstones();
+      log.log('[ConfigRepo] prefetchReplicaTombstones: merged remote tombstones');
+    }
   }
 
   /**
@@ -1451,6 +1569,14 @@ export class ConfigRepo implements IConfigRepo {
     this.syncEngine.unwatchAll();
     // 首次同步同样遵守「空引导副本只升不降」：否则启动那一刻就会把远端拓扑抹平。
     await this.healEmptyBootstrapDescriptors();
+    // 启动时先把远端墓碑拉平（无节流），再让首轮 syncAll 做快照比对：
+    // 顺序反了的话，本地陈旧副本会被当成「新增」推回远端，删除被复活。
+    try {
+      await this.prefetchReplicaTombstones();
+      await this.processTombstones();
+    } catch (err) {
+      log.warn('[ConfigRepo] initial tombstone prefetch failed:', err);
+    }
     await this.syncEngine.syncAll();
     await this.readAllBackendDescriptors();
     await this.processTombstones();
@@ -2057,6 +2183,11 @@ export class ConfigRepo implements IConfigRepo {
             filter: this.syncFilter,
             preSyncHook: async () => {
               try {
+                this.invalidateTombstoneCache();
+                // 先合并远端墓碑，再按合并后的删除意图清理本地/副本残留。
+                // 不这样做的话，本轮同步会把「本地有、远端已被删」的陈旧副本
+                // 当成新增推回去（manifest 里没有墓碑就先跑快照比对）。
+                await this.prefetchReplicaTombstones(TOMBSTONE_PREFETCH_INTERVAL_MS);
                 this.invalidateTombstoneCache();
                 await this.processTombstones();
               } catch (err) {
@@ -2736,6 +2867,10 @@ export class ConfigRepo implements IConfigRepo {
         filter: this.syncFilter,
         preSyncHook: async () => {
           try {
+            this.invalidateTombstoneCache();
+            // 新建/重建副本时也先把它的墓碑合并进来，免得这次首同步把本地
+            // 陈旧副本推上去（见 prefetchReplicaTombstones 的注释）。
+            await this.prefetchReplicaTombstones(TOMBSTONE_PREFETCH_INTERVAL_MS);
             this.invalidateTombstoneCache();
             await this.processTombstones();
           } catch (err) {
@@ -3434,13 +3569,13 @@ export class ConfigRepo implements IConfigRepo {
   // -----------------------------------------------------------------------
 
   /** Path for a single app data group descriptor: .config/app-data-groups/{appId}/{id}.json */
-  private appDataGroupFilePath(id: string): string {
-    return `${APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
+  private appDataGroupFilePath(id: string, appId = this.appId): string {
+    return `${APP_DATA_GROUPS_DIR}/${appId}/${id}.json`;
   }
 
   /** Legacy descriptor path: .meta/app-data-groups/{appId}/{id}.json */
-  private legacyAppDataGroupFilePath(id: string): string {
-    return `${LEGACY_APP_DATA_GROUPS_DIR}/${this.appId}/${id}.json`;
+  private legacyAppDataGroupFilePath(id: string, appId = this.appId): string {
+    return `${LEGACY_APP_DATA_GROUPS_DIR}/${appId}/${id}.json`;
   }
 
   /**
@@ -3477,17 +3612,17 @@ export class ConfigRepo implements IConfigRepo {
    * 归属靠文件内的 `groupId` 字段区分：同一 app 下不同组即使后端 id 相同，
    * 也各用各自的文件，不会在同步时互相覆盖（同一组不同端点同理）。
    */
-  private appDataBackendsDirPath(): string {
-    return `${APP_DATA_GROUPS_DIR}/${this.appId}/backends`;
+  private appDataBackendsDirPath(appId = this.appId): string {
+    return `${APP_DATA_GROUPS_DIR}/${appId}/backends`;
   }
 
-  private appDataBackendFilePath(backendId: string): string {
-    return `${this.appDataBackendsDirPath()}/${backendId}.json`;
+  private appDataBackendFilePath(backendId: string, appId = this.appId): string {
+    return `${this.appDataBackendsDirPath(appId)}/${backendId}.json`;
   }
 
   /** 读本 app 目录下所有后端文件（忽略损坏/非本格式的文件）。 */
-  private async readAppDataBackendFiles(): Promise<AppDataBackendFileDescriptor[]> {
-    const dir = this.appDataBackendsDirPath();
+  private async readAppDataBackendFiles(appId = this.appId): Promise<AppDataBackendFileDescriptor[]> {
+    const dir = this.appDataBackendsDirPath(appId);
     let entries: string[];
     try {
       entries = await this.cachedFS.readdir(dir);
@@ -3516,9 +3651,12 @@ export class ConfigRepo implements IConfigRepo {
   }
 
   /** 读某个数据组声明的全部后端文件（按 id 去重，先到先得）。 */
-  private async readAppDataBackendFilesForGroup(groupId: string): Promise<AppDataBackendDescriptor[]> {
+  private async readAppDataBackendFilesForGroup(
+    groupId: string,
+    appId = this.appId,
+  ): Promise<AppDataBackendDescriptor[]> {
     const byId = new Map<string, AppDataBackendDescriptor>();
-    for (const file of await this.readAppDataBackendFiles()) {
+    for (const file of await this.readAppDataBackendFiles(appId)) {
       if (file.groupId !== groupId) continue;
       if (byId.has(file.id)) continue;
       const { groupId: _groupId, ...desc } = file;
@@ -4270,19 +4408,29 @@ export class ConfigRepo implements IConfigRepo {
     }
   }
 
-  async removeAppDataGroup(id: string): Promise<void> {
+  /**
+   * 删除一个数据组的登记（`.config/app-data-groups/{appId}/{id}.json` + 该组
+   * 在配置仓的后端描述符）。
+   *
+   * @param appId 目标登记所属的 appId，默认为本实例的 appId。传其它 appId 时
+   *   只删配置仓里那份登记与引导副本，不会（也无法）去 dispose 另一个
+   *   appId 实例里的组句柄 —— 调用方应优先走实例注册表，让实例自己刷新。
+   */
+  async removeAppDataGroup(id: string, appId = this.appId): Promise<void> {
     this.assertNotDisposed();
 
-    const group = this.appDataGroups.get(id);
-    if (group) {
-      await group.dispose();
-      this.appDataGroups.delete(id);
+    if (appId === this.appId) {
+      const group = this.appDataGroups.get(id);
+      if (group) {
+        await group.dispose();
+        this.appDataGroups.delete(id);
+      }
     }
 
     // 后端是独立文件：逐个删（每个都写墓碑，远端才会跟着清掉）。
     // 只删本组（group id 匹配）的文件，同目录其它组的后端不碰。
-    for (const backend of await this.readAppDataBackendFilesForGroup(id)) {
-      const backendPath = this.appDataBackendFilePath(backend.id);
+    for (const backend of await this.readAppDataBackendFilesForGroup(id, appId)) {
+      const backendPath = this.appDataBackendFilePath(backend.id, appId);
       try {
         await this.deleteFile(backendPath);
       } catch (err) {
@@ -4295,7 +4443,7 @@ export class ConfigRepo implements IConfigRepo {
     // Use deleteFile (tombstone) so the deletion propagates to remote
     // replicas (e.g. the config-sync repo on Gitee) and is NOT resurrected
     // by sync pulling the still-existing remote descriptor back.
-    for (const descPath of [this.appDataGroupFilePath(id), this.legacyAppDataGroupFilePath(id)]) {
+    for (const descPath of [this.appDataGroupFilePath(id, appId), this.legacyAppDataGroupFilePath(id, appId)]) {
       try {
         await this.deleteFile(descPath);
       } catch (err) {
@@ -4304,7 +4452,7 @@ export class ConfigRepo implements IConfigRepo {
         await this.unlinkVersionSidecar(this.cachedFS, descPath);
       }
     }
-    log.log(`[ConfigRepo] removeAppDataGroup: "${id}" removed`);
+    log.log(`[ConfigRepo] removeAppDataGroup: "${appId}/${id}" removed`);
   }
 
   async listAccountBackends(): Promise<BackendDescriptor[]> {
@@ -4391,6 +4539,8 @@ class AppDataGroupImpl implements AppDataGroup {
   private static readonly PERMANENT_SYNC_EXCLUSIONS = [...CONFIG_ONLY_PREFIXES, GROUP_DESCRIPTOR_FILE];
   private readonly tombstoneExcludePrefixes: string[] = [...AppDataGroupImpl.PERMANENT_SYNC_EXCLUSIONS];
   private readonly syncFilter: SyncFilter = { excludePrefixes: this.tombstoneExcludePrefixes };
+  /** 上次从数据后端预取墓碑的时间戳（节流用，见 prefetchRemoteTombstones）。 */
+  private lastTombstonePrefetchAt = 0;
 
   constructor(
     groupId: string,
@@ -5413,11 +5563,80 @@ class AppDataGroupImpl implements AppDataGroup {
   /** Delete tombstoned files on local + every connected backend before/after sync. */
   private async runTombstonePass(stage: string): Promise<void> {
     try {
+      // 先合并远端墓碑：数据组的墓碑同样是被同步的文件，若等到同步拉下来，
+      // 本轮快照比对已经把本地陈旧副本当成「新增」推回远端了（删除复活）。
+      await this.prefetchRemoteTombstones(TOMBSTONE_PREFETCH_INTERVAL_MS);
       await this.tombstones.process(this.tombstoneTargets());
       // 墓碑集合变了 → 同步排除表跟着更新（与配置组 refreshSyncExclusions 同规则）。
       this.refreshSyncExclusions(await this.tombstones.list());
     } catch (err) {
       log.warn(`[AppDataGroup:${this.groupId}] ${stage} tombstone pass failed:`, err);
+    }
+  }
+
+  /**
+   * 把各数据后端上的墓碑合并进本地 `.meta/tombstones/`。
+   *
+   * 与配置组的 `ConfigRepo.prefetchReplicaTombstones` 同一目的、同一合并规则：
+   * 远端删除意图优先于本地副本，先合并再让 `process()` 清掉陈旧数据，避免
+   * 「本地有、别处已删」的文件被这一轮同步写回后端。
+   */
+  private async prefetchRemoteTombstones(minIntervalMs = 0): Promise<void> {
+    if (this.disposed || this.dataBackends.size === 0) return;
+    const now = Date.now();
+    if (minIntervalMs > 0 && now - this.lastTombstonePrefetchAt < minIntervalMs) return;
+    this.lastTombstonePrefetchAt = now;
+
+    let local: TombstoneMeta[];
+    try {
+      local = await this.tombstones.list();
+    } catch {
+      return;
+    }
+    const byPath = new Map<string, TombstoneMeta>(local.map((t) => [t.path, t]));
+    let changed = false;
+
+    for (const [backendId, backend] of this.dataBackends) {
+      let remote: TombstoneMeta[];
+      try {
+        remote = await readTombstonesFromFs(backend.instance, (message) =>
+          log.warn(`[AppDataGroup:${this.groupId}] prefetch tombstones (${backendId}): ${message}`));
+      } catch (err) {
+        log.warn(`[AppDataGroup:${this.groupId}] prefetch tombstones from ${backendId} failed:`, err);
+        continue;
+      }
+
+      for (const tombstone of remote) {
+        if (!tombstone.path) continue;
+        const prev = byPath.get(tombstone.path);
+        if (!prev) {
+          byPath.set(tombstone.path, tombstone);
+          await this.tombstones.write(tombstone);
+          changed = true;
+          continue;
+        }
+        const merged: TombstoneMeta = {
+          ...prev,
+          deletedAt: Math.min(prev.deletedAt, tombstone.deletedAt),
+          confirmedBy: Array.from(new Set([...prev.confirmedBy, ...tombstone.confirmedBy])),
+        };
+        if (isDirectoryTombstone(tombstone) && !isDirectoryTombstone(prev)) {
+          merged.type = 'directory';
+        }
+        const dirty =
+          merged.deletedAt !== prev.deletedAt ||
+          merged.confirmedBy.length !== prev.confirmedBy.length ||
+          (merged.type === 'directory' && prev.type !== 'directory');
+        if (!dirty) continue;
+        byPath.set(tombstone.path, merged);
+        await this.tombstones.write(merged);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.refreshSyncExclusions(await this.tombstones.list());
+      log.log(`[AppDataGroup:${this.groupId}] prefetchRemoteTombstones: merged remote tombstones`);
     }
   }
 

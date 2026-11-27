@@ -61,10 +61,12 @@ const RECREATE_AFTER_DELETE_SKEW_MS = 3000;
  * 以及应用侧仍然留着的副本。墓碑一旦被提前删掉，滞后端会把自己快照里的旧文件
  * 当成「本地新增」持续推回后端，删除就被复活了。
  *
- * 保留期必须长于任一客户端的一个轮询周期（pollIntervalMs 默认 30 分钟），
- * 这里取 24 小时作为稳妥值。
+ * 保留期必须长于任一客户端的一个轮询周期（pollIntervalMs 默认 30 分钟）；多设备
+ * 场景下还要覆盖「某台机器几天没开机」的常态，因此取 7 天：一台设备离线超过一周
+ * 后才可能把它自己的旧副本推回来。只覆盖一周内的滞后端，更长的离线设备仍需要
+ * 人工清理（墓碑已不存在，系统无从判断那是「旧副本」而不是「新文件」）。
  */
-export const TOMBSTONE_RETENTION_MS = 24 * 60 * 60 * 1000;
+export const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /**
  * 占位类墓碑（`.keep` / `.keep.mtime` / `.mtime` 侧车）的最短保留期。
  * 它们不承载用户数据，被提前回收最多让空目录短暂复活，下一轮 tombstone pass
@@ -72,7 +74,7 @@ export const TOMBSTONE_RETENTION_MS = 24 * 60 * 60 * 1000;
  */
 export const TOMBSTONE_PLACEHOLDER_RETENTION_MS = 10 * 60 * 1000;
 
-/** 该墓碑适用的保留期：占位类用短保留，其余用 24h。 */
+/** 该墓碑适用的保留期：占位类用短保留，其余用 7 天。 */
 export function tombstoneRetentionMs(tombstonePath: string): number {
   if (
     tombstonePath.endsWith('.mtime') ||
