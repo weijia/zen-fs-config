@@ -584,6 +584,12 @@ export class ConfigRepo implements IConfigRepo {
    */
   private explicitEmptyDescriptors = new Set<string>();
   /**
+   * 描述符文件路径 → 已确认在远端不存在。目录清单按 ETag 复用，删除不会
+   * 改变 ETag，所以清单会长期保留已删除的文件名；这里记住 404 结果，
+   * 避免每次 `listAppDataGroups()` 都为同一批死文件再发一次 GET。
+   */
+  private missingDescriptorFiles = new Set<string>();
+  /**
    * Tracks the background initial sync started by createConfigRepo().
    * `flush()` and `dispose()` will await this if it hasn't completed yet,
    * preventing concurrent syncEngine.syncAll() calls.
@@ -4319,8 +4325,13 @@ export class ConfigRepo implements IConfigRepo {
       }
       for (const entry of entries) {
         if (!entry.endsWith('.json')) continue;
+        const filePath = `${dir}/${entry}`;
+        // 目录清单可能比事实旧（缓存按 ETag 复用，删除不会改变 ETag），
+        // 于是已删除的描述符会被反复重新读取、每次一个 404 请求。
+        // 读到一次 404 就记下来，本会话内不再重试。
+        if (this.missingDescriptorFiles.has(filePath)) continue;
         try {
-          const raw = await this.cachedFS.readFile(`${dir}/${entry}`);
+          const raw = await this.cachedFS.readFile(filePath);
           const desc = JSON.parse(new TextDecoder().decode(toUint8Array(raw)));
           if (desc.id && desc.groupType === 'data-sync' && !byId.has(desc.id)) {
             const descriptor = desc as AppDataGroupDescriptor;
@@ -4328,7 +4339,13 @@ export class ConfigRepo implements IConfigRepo {
             descriptor.backends = await this.resolveAppDataGroupBackends(desc.id, descriptor);
             byId.set(desc.id, descriptor);
           }
-        } catch { /* skip corrupt */ }
+        } catch (err) {
+          // 只有「确实不存在」才缓存；其它错误（网络/鉴权）下次仍应重试。
+          const code = (err as { code?: string } | null)?.code;
+          if (code === 'ENOENT' || (err instanceof Error && /not\s*found/i.test(err.message))) {
+            this.missingDescriptorFiles.add(filePath);
+          }
+        }
       }
     }
     return Array.from(byId.values());
