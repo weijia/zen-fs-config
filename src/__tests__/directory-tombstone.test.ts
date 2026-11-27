@@ -199,4 +199,37 @@ describe('directory tombstones', () => {
     // 这里只校验判定函数对目录墓碑的输入形态没问题（type 不参与判定）。
     expect(isDirectoryTombstone({ ...dirTombstone, deletedAt: 1 })).toBe(true);
   });
+
+  it('ignores synthetic directory mtime — only child mtimes prove a re-creation', async () => {
+    // 模拟 GiteeFS：目录 inode 的 mtime 是「建索引时刻」，每次重挂载都会变成
+    // now；真实的写入时间只在子文件上。旧判定会因此把删除前就存在的目录当成
+    // 「删除后重建」，把墓碑过期掉、残留永远删不掉。
+    const local = await createBackend({ type: 'InMemory', options: { label: 'synth-local' } });
+    const target = await createBackend({ type: 'InMemory', options: { label: 'synth-target' } });
+    for (const fs of [local, target]) {
+      await fs.mkdir('/data/old', { recursive: true } as any).catch(() => undefined);
+      await fs.writeFile('/data/old/a.txt', 'a');
+    }
+
+    const fsAny: any = local;
+    const origStat = fsAny.stat.bind(fsAny);
+    fsAny.stat = async (p: string) => {
+      const s: any = await origStat(p);
+      if (p.startsWith('/data/old/')) {
+        // 子文件是删除之前写入的：真实 mtime 远早于 deletedAt。
+        return { ...s, mtimeMs: Date.now() - 60_000, isDirectory: () => false, mode: s.mode };
+      }
+      return s; // 目录自身保持「现在」的合成 mtime
+    };
+
+    const store = new TombstoneStore(local, 'local:g');
+    await store.write({ ...dirTombstone, path: '/data/old', deletedAt: Date.now() - 5_000 });
+
+    await store.process([{ id: 'target', fs: target }]);
+
+    expect(await local.exists('/data/old')).toBe(false);
+    expect(await target.exists('/data/old/a.txt')).toBe(false);
+    // 墓碑没有被误判为「路径重建」而撤销，仍保留到保留期结束 / GC。
+    expect((await store.list()).length).toBe(1);
+  });
 });

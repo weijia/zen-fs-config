@@ -965,9 +965,52 @@ export class TombstoneStore {
    * 本来就旧，用副本判定既不可靠又会掩盖真正的删除传播。
    */
   private async wasRecreatedAfterDeletion(tombstone: TombstoneMeta): Promise<boolean> {
+    // 目录自身的 mtime 不可信：从远端拉回来的目录，其 mtime 可能来自后端合成的
+    // 「建索引时刻」（GiteeFS 就是这样），而不是真实写入时间。目录墓碑一律看
+    // 其下数据项的 mtime，只剩 `.keep` / `.mtime` / `.version` 占位时视为残留，
+    // 不算重建。
+    if (isDirectoryTombstone(tombstone)) {
+      return this.dirHasEntryNewerThan(this.fs, tombstone.path, tombstone.deletedAt);
+    }
     const mtimeMs = await this.mtimeOf(this.fs, tombstone.path);
     if (mtimeMs === null) return false;
     return mtimeMs > tombstone.deletedAt + RECREATE_AFTER_DELETE_SKEW_MS;
+  }
+
+  private async dirHasEntryNewerThan(
+    fs: any,
+    dirPath: string,
+    deletedAt: number,
+    depth = 0,
+  ): Promise<boolean> {
+    let names: string[];
+    try {
+      names = await fs.readdir(dirPath);
+    } catch {
+      return false; // 目录不存在 → 不是重建
+    }
+    for (const name of names) {
+      const childPath = `${dirPath}/${name}`;
+      if (isHiddenPlaceholderPath(childPath) || childPath.endsWith('.version')) continue;
+      let inode: any;
+      try {
+        inode = await fs.stat(childPath);
+      } catch {
+        continue;
+      }
+      const isChildDir =
+        typeof inode?.isDirectory === 'function'
+          ? inode.isDirectory()
+          : !!(inode && ((inode.mode ?? 0) & 0o170000) === 0o040000);
+      if (isChildDir) {
+        if (depth < 4 && (await this.dirHasEntryNewerThan(fs, childPath, deletedAt, depth + 1))) {
+          return true;
+        }
+        continue;
+      }
+      if (Number(inode?.mtimeMs ?? 0) > deletedAt + RECREATE_AFTER_DELETE_SKEW_MS) return true;
+    }
+    return false;
   }
 
   private async mtimeOf(fs: any, filePath: string): Promise<number | null> {

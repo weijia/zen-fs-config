@@ -1035,7 +1035,16 @@ export class ConfigRepo implements IConfigRepo {
       surfaces.push({ label: id, fs: replica.instance as TreeFS });
     }
 
+    const isDirTombstone = isDirectoryTombstone(tombstone);
     for (const surface of surfaces) {
+      if (isDirTombstone) {
+        // 目录自身的 mtime 不可信：GiteeFS 建索引时把所有条目（含目录）的
+        // mtimeMs 都写成 Date.now()，stat() 又只对普通文件回填真实 mtime。
+        // 于是「删除前就存在的旧目录」在页面重挂载后会被误判成「删除后重建」，
+        // 目录墓碑被提前撤销、远端残留永远删不掉。这里只看其下数据项的 mtime。
+        if (await this.dirHasEntryNewerThan(surface.fs, tombstone.path, tombstone.deletedAt)) return true;
+        continue;
+      }
       let mtimeMs: number;
       try {
         const inode = await surface.fs.stat(tombstone.path);
@@ -1046,6 +1055,58 @@ export class ConfigRepo implements IConfigRepo {
       if (mtimeMs > tombstone.deletedAt + TOMBSTONE_RECREATE_SKEW_MS) return true;
     }
     return false;
+  }
+
+  /**
+   * 目录墓碑专用：目录下是否存在「删除之后写入」的真实数据项。
+   *
+   * 只递归看普通文件，不看目录 inode 的 mtime；`.keep` / `.mtime` / `.version`
+   * 这些后端元数据每轮同步都可能被重写，不能当作重建证据。目录里只剩占位
+   * 文件时返回 false —— 那属于待清理残留，不是用户重建。
+   */
+  private async dirHasEntryNewerThan(
+    fs: any,
+    dirPath: string,
+    deletedAt: number,
+    depth = 0,
+  ): Promise<boolean> {
+    let names: string[];
+    try {
+      names = await fs.readdir(dirPath);
+    } catch {
+      return false; // 目录不存在 → 不是重建
+    }
+    for (const name of names) {
+      const childPath = `${dirPath}/${name}`;
+      if (this.isBackendMetadataPath(childPath)) continue;
+      let inode: any;
+      try {
+        inode = await fs.stat(childPath);
+      } catch {
+        continue;
+      }
+      const childIsDir =
+        typeof inode?.isDirectory === 'function'
+          ? inode.isDirectory()
+          : !!(inode && ((inode.mode ?? 0) & 0o170000) === 0o040000);
+      if (childIsDir) {
+        if (depth < 4 && (await this.dirHasEntryNewerThan(fs, childPath, deletedAt, depth + 1))) {
+          return true;
+        }
+        continue;
+      }
+      if (Number(inode?.mtimeMs ?? 0) > deletedAt + TOMBSTONE_RECREATE_SKEW_MS) return true;
+    }
+    return false;
+  }
+
+  /** 后端内部元数据：不作为「删除后重建」的证据。 */
+  private isBackendMetadataPath(filePath: string): boolean {
+    return (
+      filePath.endsWith('/.keep') ||
+      isMtimeSidecar(filePath) ||
+      filePath.endsWith('.version')
+    );
   }
 
   /**
